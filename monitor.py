@@ -1,0 +1,1271 @@
+#!/usr/bin/env python3
+"""
+OKX AI short-term trading assistant V1.
+
+Scope:
+    - Monitor BTC-USDT-SWAP and ETH-USDT-SWAP only.
+    - Provide analysis and suggestions only.
+    - No auto order, no martingale, no grid.
+
+Install:
+    pip install python-okx
+
+Optional AI:
+    pip install openai
+    export OPENAI_API_KEY="..."
+    export AI_MODEL="gpt-5.5"
+
+Optional push:
+    export TELEGRAM_BOT_TOKEN="..."
+    export TELEGRAM_CHAT_ID="..."
+    export WECOM_WEBHOOK_URL="..."
+    export WECHAT_WEBHOOK_URL="..."
+
+Production tuning:
+    export RETRY_TIMES=3
+    export PUSH_COOLDOWN_SECONDS=900
+    export LOG_MAX_BYTES=10485760
+    export VOLUME_MULTIPLIER=2.0
+    export OI_CHANGE_PCT_15M=5.0
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional, Tuple
+
+try:
+    import okx.MarketData as MarketData
+    import okx.PublicData as PublicData
+except ImportError as exc:
+    print("Missing dependency: python-okx. Install it with: pip install python-okx")
+    raise SystemExit(1) from exc
+
+
+# AI短线助手V1的固定范围：只做BTC/ETH USDT永续，不做现货和其他币种。
+SUPPORTED_INSTRUMENTS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
+
+# 多周期K线用于判断短线趋势结构：
+# 1m看即时波动，5m看短线节奏，15m看交易方向，1H看上一级趋势。
+BAR_CHANNELS = ("1m", "5m", "15m", "1H")
+DEFAULT_INTERVAL_SECONDS = 5
+DEFAULT_PUSH_SCORE = 80
+DEFAULT_AI_MODEL = "gpt-5.5"
+OKX_BASE_URL = "https://www.okx.com"
+DEFAULT_RETRY_TIMES = 3
+DEFAULT_RETRY_BACKOFF_SECONDS = 1.5
+DEFAULT_PUSH_COOLDOWN_SECONDS = 900
+DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024
+WARMUP_MINUTES = 15
+
+# 不同类型数据使用不同缓存时间，降低OKX REST请求量，减少限频风险。
+# ticker仍保持接近5秒刷新；K线、OI、资金费率、多空比可以低频更新。
+CACHE_TTL_SECONDS = {
+    "ticker": 5,
+    "candles": 15,
+    "open_interest": 60,
+    "funding_rate": 60,
+    "long_short_ratio": 60,
+}
+
+# 日志使用JSON Lines格式，一行一条分析记录，便于后续导入数据库或做回测统计。
+LOG_FILE = Path(__file__).with_name("okx_ai_monitor.log")
+
+
+@dataclass
+class SignalConfig:
+    # 当前1m成交量超过最近20根1m均量的倍数，超过即认为放量。
+    volume_multiplier: float = 2.0
+
+    # 15分钟内OI变化超过该百分比，认为合约持仓量发生异动。
+    oi_change_pct_15m: float = 5.0
+
+    # 资金费率绝对值过高时，说明市场单边拥挤，可能存在回调或逼空风险。
+    funding_abs_threshold: float = 0.0008
+
+    # 资金费率短时间快速变化，也会作为资金情绪异常信号。
+    funding_change_threshold: float = 0.0003
+
+    # 多头或空头占比超过75%，认为市场情绪极端。
+    long_short_extreme: float = 0.75
+
+
+@dataclass
+class RuntimeConfig:
+    # 网络请求失败后的重试次数，解决偶发超时、临时DNS异常等问题。
+    retry_times: int = DEFAULT_RETRY_TIMES
+
+    # 重试退避基础秒数，第N次失败会等待 retry_backoff * N 秒。
+    retry_backoff: float = DEFAULT_RETRY_BACKOFF_SECONDS
+
+    # 同币种、同方向、同类信号的推送冷却时间，避免重复轰炸。
+    push_cooldown_seconds: int = DEFAULT_PUSH_COOLDOWN_SECONDS
+
+    # 单个日志文件最大字节数，超过后轮转成 .1 文件。
+    log_max_bytes: int = DEFAULT_LOG_MAX_BYTES
+
+
+def now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ms_to_text(ts_ms: Any) -> str:
+    try:
+        return datetime.fromtimestamp(int(ts_ms) / 1000).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return "-"
+
+
+def to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value in (None, ""):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def okx_data(response: Dict[str, Any]) -> List[Any]:
+    # OKX SDK返回一般是 {"code": "0", "data": [...], "msg": ""}。
+    # 这里统一抽取data，避免每个调用点重复判断code和data类型。
+    if not isinstance(response, dict):
+        return []
+    if response.get("code") not in (None, "0"):
+        return []
+    data = response.get("data") or []
+    return data if isinstance(data, list) else []
+
+
+def retry_call(label: str, func: Any, retry_times: int, retry_backoff: float) -> Any:
+    # 所有外部网络调用统一走这里，避免单次网络抖动导致整轮分析失败。
+    last_error: Optional[Exception] = None
+    for attempt in range(1, retry_times + 1):
+        try:
+            return func()
+        except Exception as exc:
+            last_error = exc
+            if attempt >= retry_times:
+                break
+            sleep_seconds = retry_backoff * attempt
+            print(f"[{now_text()}] {label} failed, retry {attempt}/{retry_times}: {exc}")
+            time.sleep(sleep_seconds)
+    raise RuntimeError(f"{label} failed after {retry_times} retries: {last_error}")
+
+
+def http_get_json(
+    path: str,
+    params: Dict[str, str],
+    retry_times: int = DEFAULT_RETRY_TIMES,
+    retry_backoff: float = DEFAULT_RETRY_BACKOFF_SECONDS,
+) -> Dict[str, Any]:
+    # python-okx没有覆盖所有Rubik统计接口，所以多空比这里直接用标准库请求。
+    def request() -> Dict[str, Any]:
+        query = urllib.parse.urlencode(params)
+        url = f"{OKX_BASE_URL}{path}?{query}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "okx-ai-short-term-assistant/1.0",
+            },
+        )
+        try:
+            response = urllib.request.urlopen(req, timeout=10)
+        except urllib.error.HTTPError as exc:
+            # Rubik统计接口在部分网络/IP/地区会返回403。多空比是辅助数据，
+            # 403时直接降级为空数据，不影响价格、K线、OI、资金费率等主流程。
+            if exc.code == 403:
+                return {"code": "403", "data": [], "msg": "Forbidden"}
+            raise
+        with response:
+            return json.loads(response.read().decode("utf-8"))
+
+    return retry_call(path, request, retry_times, retry_backoff)
+
+
+def http_post_json(
+    url: str,
+    payload: Dict[str, Any],
+    retry_times: int = DEFAULT_RETRY_TIMES,
+    retry_backoff: float = DEFAULT_RETRY_BACKOFF_SECONDS,
+) -> None:
+    # Telegram、企业微信、微信机器人都可以用JSON POST形式推送。
+    def request() -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            response.read()
+
+    retry_call("push-webhook", request, retry_times, retry_backoff)
+
+
+def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    # AI有时会在JSON外包一层说明文字或Markdown代码块。
+    # 这里尽量提取第一个完整JSON对象，解析失败则交给本地规则兜底。
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:].strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        parsed = json.loads(cleaned[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def candle_to_dict(raw: List[Any]) -> Dict[str, Any]:
+    # OKX K线原始格式是数组：
+    # [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
+    # 转成dict后，后面的趋势判断、AI输入和日志都会更清晰。
+    return {
+        "time": ms_to_text(raw[0]) if len(raw) > 0 else "-",
+        "open": to_float(raw[1]) if len(raw) > 1 else 0.0,
+        "high": to_float(raw[2]) if len(raw) > 2 else 0.0,
+        "low": to_float(raw[3]) if len(raw) > 3 else 0.0,
+        "close": to_float(raw[4]) if len(raw) > 4 else 0.0,
+        "volume": to_float(raw[5]) if len(raw) > 5 else 0.0,
+        "confirmed": str(raw[8]) if len(raw) > 8 else "0",
+    }
+
+
+def trend_from_candles(candles: List[Dict[str, Any]], lookback: int = 5) -> str:
+    # V1使用轻量趋势判断：比较最近收盘价和lookback窗口最后一根收盘价。
+    # 生产版可以替换为EMA、MACD、ATR、结构高低点等更完整的趋势模型。
+    if len(candles) < 2:
+        return "unknown"
+    sample = candles[:lookback]
+    latest = sample[0]["close"]
+    oldest = sample[-1]["close"]
+    if latest > oldest:
+        return "up"
+    if latest < oldest:
+        return "down"
+    return "flat"
+
+
+def symbol_ccy(inst_id: str) -> str:
+    return inst_id.split("-")[0]
+
+
+def compact_candles(candles: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    # 给AI看的K线证据：保留最近limit根的时间、OHLC、成交量、是否确认。
+    # 这样AI可以独立复核趋势和放量，而不是只相信程序给出的结论。
+    return [
+        {
+            "time": item.get("time"),
+            "open": item.get("open"),
+            "high": item.get("high"),
+            "low": item.get("low"),
+            "close": item.get("close"),
+            "volume": item.get("volume"),
+            "confirmed": item.get("confirmed"),
+        }
+        for item in candles[:limit]
+    ]
+
+
+def history_tail(history: Deque[Tuple[float, float]], limit: int) -> List[Dict[str, Any]]:
+    # 给AI看的时间序列证据，用于复核OI和资金费率变化是否可信。
+    return [
+        {
+            "time": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+            "value": value,
+        }
+        for ts, value in list(history)[-limit:]
+    ]
+
+
+def env_float(name: str, default: float) -> float:
+    return to_float(os.getenv(name), default)
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+class OkxAiShortTermAssistant:
+    """OKX短线助手主类。
+
+    这个类串起完整流程：
+    采集OKX数据 -> 检测异常信号 -> 规则评分 -> 可选AI分析 -> 可选推送 -> 写日志。
+    """
+
+    def __init__(
+        self,
+        instruments: List[str],
+        interval: int,
+        flag: str,
+        ai_enabled: bool,
+        push_enabled: bool,
+        push_score: int,
+        dry_run_ai: bool,
+        config: SignalConfig,
+        runtime_config: RuntimeConfig,
+    ) -> None:
+        self.instruments = instruments
+        self.interval = interval
+        self.flag = flag
+        self.ai_enabled = ai_enabled
+        self.push_enabled = push_enabled
+        self.push_score = push_score
+        self.dry_run_ai = dry_run_ai
+        self.config = config
+        self.runtime_config = runtime_config
+
+        # OKX官方SDK接口：
+        # MarketData负责价格和K线，PublicData负责OI、资金费率等公共合约数据。
+        self.market_api = MarketData.MarketAPI(flag=flag)
+        self.public_api = PublicData.PublicAPI(flag=flag)
+
+        # OI和资金费率需要计算“15分钟内变化”，所以本地保存最近一段时间的采样值。
+        # maxlen=240在5秒轮询下大约可保存20分钟数据。
+        self.oi_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=240))
+        self.funding_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=240))
+
+        # REST缓存用于降低请求量。例如OI、资金费率、多空比不必每5秒都请求。
+        # key -> (timestamp, value)
+        self.cache: Dict[str, Tuple[float, Any]] = {}
+
+        # 推送冷却状态。key通常由币种、方向、信号类型组成。
+        self.last_push_at: Dict[str, float] = {}
+
+    def collect_snapshot(self, inst_id: str) -> Dict[str, Any]:
+        # 每轮对一个币种生成一份完整快照snapshot。
+        # 后面的信号检测、评分、AI Prompt和日志都只依赖这个结构，方便后续替换数据源。
+
+        # 获取最新价、买一价、卖一价。
+        ticker = self._get_ticker(inst_id)
+
+        # 每个周期取21根K线：当前K线 + 最近20根，用于计算均量和趋势。
+        candles = {bar: self._get_candles(inst_id, bar) for bar in BAR_CHANNELS}
+
+        # 获取当前成交量取、均量。
+        volume = self._volume_stats(candles["1m"])
+
+        # 获取合约OI持仓量。
+        open_interest = self._get_open_interest(inst_id)
+
+        # 获取合约资金费率。
+        funding_rate = self._get_funding_rate(inst_id)
+
+        # 获取多空比
+        long_short = self._get_long_short_ratio(inst_id)
+
+        # 记录当前OI和资金费率，用于下一轮计算15分钟变化。
+        self._remember_metric(self.oi_history[inst_id], open_interest)
+        self._remember_metric(self.funding_history[inst_id], funding_rate)
+
+        return {
+            "time": now_text(),
+            "inst_id": inst_id,
+            "price": ticker.get("last", 0.0),
+            "best_bid": ticker.get("bid_px", 0.0),
+            "best_ask": ticker.get("ask_px", 0.0),
+            "candles": candles,
+            "volume": volume,
+            "open_interest": open_interest,
+            "oi_change_pct_15m": self._change_pct_last_minutes(self.oi_history[inst_id], 15),
+            "oi_warmup_ready": self._history_ready(self.oi_history[inst_id], WARMUP_MINUTES),
+            "funding_rate": funding_rate,
+            "funding_change": self._change_last_minutes(self.funding_history[inst_id], 15),
+            "funding_warmup_ready": self._history_ready(self.funding_history[inst_id], WARMUP_MINUTES),
+            "long_short_ratio": long_short,
+        }
+
+    def detect_signals(self, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+        # 信号检测模块只判断“是否值得进一步分析”，不直接决定下单方向。
+        # 触发信号后，系统才会把结构化数据交给AI分析，从而降低AI调用成本。
+        signals = []
+        volume = snapshot["volume"]
+        long_ratio = snapshot["long_short_ratio"].get("long_ratio", 0.0)
+        short_ratio = snapshot["long_short_ratio"].get("short_ratio", 0.0)
+        funding_rate = snapshot["funding_rate"]
+        funding_change = snapshot["funding_change"]
+        oi_change = snapshot["oi_change_pct_15m"]
+
+        if volume["multiplier"] >= self.config.volume_multiplier:
+            # 放量通常代表短时间交易活跃度提高，但方向需要结合K线和OI判断。
+            signals.append({
+                "type": "volume_spike",
+                "desc": f"1m volume multiplier {volume['multiplier']:.2f}x",
+            })
+
+        if snapshot.get("oi_warmup_ready") and abs(oi_change) >= self.config.oi_change_pct_15m:
+            # OI变化表示合约持仓量变化，配合价格可以判断新开仓或平仓压力。
+            signals.append({
+                "type": "oi_change",
+                "desc": f"15m OI change {oi_change:.2f}%",
+            })
+
+        if abs(funding_rate) >= self.config.funding_abs_threshold:
+            # 资金费率过热说明多空某一侧过于拥挤，追单风险会提高。
+            signals.append({
+                "type": "funding_hot",
+                "desc": f"funding rate {funding_rate:.6f}",
+            })
+
+        if snapshot.get("funding_warmup_ready") and abs(funding_change) >= self.config.funding_change_threshold:
+            # 资金费率快速变化代表市场情绪在短时间内切换。
+            signals.append({
+                "type": "funding_fast_change",
+                "desc": f"15m funding change {funding_change:.6f}",
+            })
+
+        if long_ratio >= self.config.long_short_extreme:
+            # 多头占比过高，继续做多的拥挤风险会提高。
+            signals.append({
+                "type": "long_short_extreme",
+                "desc": f"long ratio {long_ratio:.2%}",
+            })
+        elif short_ratio >= self.config.long_short_extreme:
+            # 空头占比过高，继续做空的拥挤风险会提高。
+            signals.append({
+                "type": "long_short_extreme",
+                "desc": f"short ratio {short_ratio:.2%}",
+            })
+
+        return signals
+
+    def score_snapshot(self, snapshot: Dict[str, Any], signals: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # 评分系统满分100分：
+        # 趋势评分最高50分，资金评分最高30分，风险评分最高20分。
+        # 评分用于“是否推送”和“建议强弱”，不是自动交易指令。
+        trends = {
+            "1m": trend_from_candles(snapshot["candles"]["1m"]),
+            "5m": trend_from_candles(snapshot["candles"]["5m"]),
+            "15m": trend_from_candles(snapshot["candles"]["15m"]),
+            "1H": trend_from_candles(snapshot["candles"]["1H"]),
+        }
+
+        up_count = sum(1 for item in trends.values() if item == "up")
+        down_count = sum(1 for item in trends.values() if item == "down")
+        direction = "观望"
+        if up_count >= 3:
+            # 多数周期向上，方向倾向做多。
+            direction = "做多"
+        elif down_count >= 3:
+            # 多数周期向下，方向倾向做空。
+            direction = "做空"
+
+        # 趋势评分：周期越一致，趋势分越高；15m和1H同向额外加分。
+        trend_score = 30 + max(up_count, down_count) * 10
+        if trends["15m"] == trends["1H"] and trends["15m"] != "unknown":
+            trend_score += 10
+        trend_score = min(trend_score, 50)
+
+        funding = snapshot["funding_rate"]
+        oi_change = snapshot["oi_change_pct_15m"]
+        volume_mult = snapshot["volume"]["multiplier"]
+
+        # 资金评分：放量、OI变化、资金费率不过热都会提高资金评分。
+        capital_score = 20
+        if volume_mult >= 1.5:
+            capital_score += 8
+        if abs(oi_change) >= 2:
+            capital_score += 7
+        if abs(funding) < self.config.funding_abs_threshold:
+            capital_score += 5
+        capital_score = min(capital_score, 30)
+
+        risk_score = 20
+        long_ratio = snapshot["long_short_ratio"].get("long_ratio", 0.0)
+        short_ratio = snapshot["long_short_ratio"].get("short_ratio", 0.0)
+        if abs(funding) >= self.config.funding_abs_threshold:
+            # 资金费率过热，扣风险分。
+            risk_score -= 8
+        if max(long_ratio, short_ratio) >= self.config.long_short_extreme:
+            # 多空比极端，扣风险分。
+            risk_score -= 6
+        if direction == "做多" and short_count_greater(trends):
+            risk_score -= 4
+        risk_score = max(risk_score, 0)
+
+        total = max(0, min(100, trend_score + capital_score + risk_score))
+
+        # V1用当前价格的固定百分比生成入场、止损、止盈。
+        # 生产版建议改成基于ATR、前高前低、订单簿流动性和支撑阻力位。
+        entry, stop_loss, take_profit = self._suggest_levels(snapshot["price"], direction)
+
+        return {
+            "trend_score": trend_score,
+            "capital_score": capital_score,
+            "risk_score": risk_score,
+            "total_score": total,
+            "direction": direction,
+            "entry": entry,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "risk_level": self._risk_level(total, signals),
+            "trends": trends,
+        }
+
+    def analyze_with_ai(
+        self,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        score: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        # AI模块只在触发信号后由run_once调用。
+        # 如果没有开启AI、没有安装openai包、没有配置Key或请求失败，都会回退到本地规则分析。
+        if not self.ai_enabled:
+            return self._local_analysis(snapshot, signals, score)
+
+        if self.dry_run_ai:
+            # dry-run用于调试：可以看到发给AI的数据，但不会产生真实API费用。
+            payload = self._ai_payload(snapshot, signals, score)
+            return {
+                "provider": "dry-run",
+                "content": "AI dry-run enabled. Payload prepared but not sent.",
+                "payload": payload,
+            }
+
+        try:
+            from openai import OpenAI
+        except ImportError:
+            return {
+                "provider": "local",
+                "content": "openai package is not installed; fallback to local analysis.",
+                "fallback": self._local_analysis(snapshot, signals, score),
+            }
+
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return {
+                "provider": "local",
+                "content": "OPENAI_API_KEY is not configured; fallback to local analysis.",
+                "fallback": self._local_analysis(snapshot, signals, score),
+            }
+
+        client = OpenAI(api_key=api_key)
+        model = os.getenv("AI_MODEL", DEFAULT_AI_MODEL)
+        prompt = self._ai_prompt(snapshot, signals, score)
+
+        try:
+            # 使用OpenAI Responses API，让AI基于结构化行情数据输出中文分析。
+            response = client.responses.create(
+                model=model,
+                input=prompt,
+                temperature=0.2,
+            )
+            output_text = getattr(response, "output_text", str(response))
+            parsed = extract_json_object(output_text)
+            valid, errors = self._validate_ai_result(parsed)
+            return {
+                "provider": "openai",
+                "model": model,
+                "content": output_text,
+                "parsed": parsed,
+                "valid_json": valid,
+                "validation_errors": errors,
+                "fallback": None if valid else self._local_analysis(snapshot, signals, score),
+            }
+        except Exception as exc:
+            return {
+                "provider": "local",
+                "content": f"AI request failed: {exc}; fallback to local analysis.",
+                "fallback": self._local_analysis(snapshot, signals, score),
+            }
+
+    def push_if_needed(
+        self,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        score: Dict[str, Any],
+        analysis: Dict[str, Any],
+    ) -> None:
+        # 推送模块只关心综合评分是否达到阈值。
+        # 默认80分以上推送，70分以下只记录不推送，避免提醒过多。
+        if not signals:
+            return
+
+        if score["total_score"] < self.push_score:
+            return
+
+        push_key = self._push_key(snapshot, signals, score)
+        if self._in_push_cooldown(push_key):
+            print(f"[{now_text()}] push skipped by cooldown: {push_key}")
+            return
+
+        message = self._format_push_message(snapshot, signals, score, analysis)
+        print(message)
+        if not self.push_enabled:
+            self.last_push_at[push_key] = time.time()
+            return
+
+        self._push_telegram(message)
+        self._push_webhook(os.getenv("WECOM_WEBHOOK_URL"), message)
+        self._push_webhook(os.getenv("WECHAT_WEBHOOK_URL"), message)
+        self.last_push_at[push_key] = time.time()
+
+    def log_result(
+        self,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        score: Dict[str, Any],
+        analysis: Dict[str, Any],
+    ) -> None:
+        # 每一轮都会写日志，即使不触发信号也记录。
+        # 这些日志后续可以用于统计信号质量、优化阈值、做复盘。
+        record = {
+            "time": snapshot["time"],
+            "inst_id": snapshot["inst_id"],
+            "price": snapshot["price"],
+            "open_interest": snapshot["open_interest"],
+            "oi_change_pct_15m": snapshot["oi_change_pct_15m"],
+            "oi_warmup_ready": snapshot["oi_warmup_ready"],
+            "funding_rate": snapshot["funding_rate"],
+            "funding_change": snapshot["funding_change"],
+            "funding_warmup_ready": snapshot["funding_warmup_ready"],
+            "long_short_ratio": snapshot["long_short_ratio"],
+            "signals": signals,
+            "score": score,
+            "analysis": analysis,
+        }
+        self._rotate_log_if_needed()
+        with LOG_FILE.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def run_once(self) -> None:
+        # 单轮执行：遍历所有支持币种，完成采集、检测、评分、分析、推送、日志。
+        for inst_id in self.instruments:
+            try:
+                # 采集所有基础数据的快照
+                snapshot = self.collect_snapshot(inst_id)
+                # 检测异常信号，通过阈值判断是否有关注的信号产生
+                signals = self.detect_signals(snapshot)
+                # 计算综合评分
+                score = self.score_snapshot(snapshot, signals)
+
+                # 只有触发信号才调用AI；否则用本地规则输出简要分析，节省AI成本。
+                analysis = self.analyze_with_ai(snapshot, signals, score) if signals else self._local_analysis(snapshot, signals, score)
+
+                # 打印终端摘要
+                self._print_console(snapshot, signals, score, analysis)
+                # 推送判断与处理
+                self.push_if_needed(snapshot, signals, score, analysis)
+                # 记录JSON日志
+                self.log_result(snapshot, signals, score, analysis)
+            except Exception as exc:
+                print(f"[{now_text()}] {inst_id} collect/analyze failed: {exc}")
+
+    def run_forever(self, runtime: int) -> None:
+        # 主循环：默认永久运行；runtime>0时，到指定秒数自动退出。
+        started = time.time()
+        while True:
+            self.run_once()
+            if runtime > 0 and time.time() - started >= runtime:
+                print(f"Runtime {runtime}s reached; exit.")
+                break
+            time.sleep(self.interval)
+
+    def _cached(self, key: str, ttl_seconds: int, loader: Any) -> Any:
+        # 通用缓存：未过期直接返回缓存值，过期后重新加载。
+        cached = self.cache.get(key)
+        if cached and time.time() - cached[0] < ttl_seconds:
+            return cached[1]
+        value = loader()
+        self.cache[key] = (time.time(), value)
+        return value
+
+    def _okx_call(self, label: str, func: Any) -> Any:
+        # OKX SDK调用统一套重试，降低临时网络故障影响。
+        return retry_call(
+            label,
+            func,
+            self.runtime_config.retry_times,
+            self.runtime_config.retry_backoff,
+        )
+
+    def _get_ticker(self, inst_id: str) -> Dict[str, float]:
+        # 获取最新价、买一价、卖一价。
+        response = self._cached(
+            f"ticker:{inst_id}",
+            CACHE_TTL_SECONDS["ticker"],
+            lambda: self._okx_call("ticker", lambda: self.market_api.get_ticker(instId=inst_id)),
+        )
+        data = okx_data(response)
+        item = data[0] if data else {}
+        return {
+            "last": to_float(item.get("last")),
+            "bid_px": to_float(item.get("bidPx")),
+            "ask_px": to_float(item.get("askPx")),
+        }
+
+    def _get_candles(self, inst_id: str, bar: str) -> List[Dict[str, Any]]:
+        # 每个周期取21根K线：当前K线 + 最近20根，用于计算均量和趋势。
+        response = self._cached(
+            f"candles:{inst_id}:{bar}",
+            CACHE_TTL_SECONDS["candles"],
+            lambda: self._okx_call(
+                f"candles-{bar}",
+                lambda: self.market_api.get_candlesticks(instId=inst_id, bar=bar, limit="21"),
+            ),
+        )
+        data = okx_data(response)
+        return [candle_to_dict(row) for row in data if isinstance(row, list)]
+
+    def _get_open_interest(self, inst_id: str) -> float:
+        # 获取合约Open Interest。OI上涨通常说明有新仓进入市场。
+        response = self._cached(
+            f"open_interest:{inst_id}",
+            CACHE_TTL_SECONDS["open_interest"],
+            lambda: self._okx_call(
+                "open-interest",
+                lambda: self.public_api.get_open_interest(instType="SWAP", instId=inst_id),
+            ),
+        )
+        data = okx_data(response)
+        item = data[0] if data else {}
+        return to_float(item.get("oi")) or to_float(item.get("oiCcy"))
+
+    def _get_funding_rate(self, inst_id: str) -> float:
+        # 获取当前资金费率。正费率通常表示多头付费给空头，负费率相反。
+        response = self._cached(
+            f"funding_rate:{inst_id}",
+            CACHE_TTL_SECONDS["funding_rate"],
+            lambda: self._okx_call(
+                "funding-rate",
+                lambda: self.public_api.get_funding_rate(instId=inst_id),
+            ),
+        )
+        data = okx_data(response)
+        item = data[0] if data else {}
+        return to_float(item.get("fundingRate"))
+
+    def _get_long_short_ratio(self, inst_id: str) -> Dict[str, float]:
+        # 获取多空账户比。OKX返回的是long/short ratio，
+        # 这里换算成多头占比和空头占比，便于判断是否超过75%。
+        try:
+            response = self._cached(
+                f"long_short_ratio:{inst_id}",
+                CACHE_TTL_SECONDS["long_short_ratio"],
+                lambda: http_get_json(
+                    "/api/v5/rubik/stat/contracts/long-short-account-ratio",
+                    {"ccy": symbol_ccy(inst_id), "period": "5m"},
+                    self.runtime_config.retry_times,
+                    self.runtime_config.retry_backoff,
+                ),
+            )
+            data = okx_data(response)
+            item = data[0] if data else []
+            ratio = to_float(item[1] if len(item) > 1 else 0.0)
+        except Exception:
+            ratio = 0.0
+
+        long_ratio = ratio / (ratio + 1.0) if ratio > 0 else 0.0
+        short_ratio = 1.0 - long_ratio if long_ratio > 0 else 0.0
+        return {
+            "long_short_ratio": ratio,
+            "long_ratio": long_ratio,
+            "short_ratio": short_ratio,
+            "available": ratio > 0,
+        }
+
+    def _volume_stats(self, candles_1m: List[Dict[str, Any]]) -> Dict[str, float]:
+        # 当前成交量取最新1m K线成交量，均量取后面20根。
+        # multiplier越大，说明当前交易活跃度相对近期越异常。
+        current = candles_1m[0]["volume"] if candles_1m else 0.0
+        previous = [item["volume"] for item in candles_1m[1:21]]
+        average = sum(previous) / len(previous) if previous else 0.0
+        multiplier = current / average if average > 0 else 0.0
+        return {
+            "current": current,
+            "average_20": average,
+            "multiplier": multiplier,
+        }
+
+    def _remember_metric(self, history: Deque[Tuple[float, float]], value: float) -> None:
+        # 保存一条时间序列采样，格式为(timestamp, value)。
+        history.append((time.time(), value))
+
+    def _change_pct_last_minutes(self, history: Deque[Tuple[float, float]], minutes: int) -> float:
+        # 计算最近N分钟百分比变化，例如15分钟OI变化。
+        old_value = self._old_value(history, minutes)
+        if old_value <= 0 or not history:
+            return 0.0
+        return (history[-1][1] - old_value) / old_value * 100
+
+    def _change_last_minutes(self, history: Deque[Tuple[float, float]], minutes: int) -> float:
+        # 计算最近N分钟绝对变化，例如资金费率变化。
+        old_value = self._old_value(history, minutes)
+        if not history:
+            return 0.0
+        return history[-1][1] - old_value
+
+    def _old_value(self, history: Deque[Tuple[float, float]], minutes: int) -> float:
+        # 找到N分钟前附近的旧值。刚启动不足N分钟时，会退化为最早采样值。
+        if not history:
+            return 0.0
+        threshold = time.time() - minutes * 60
+        candidate = history[0][1]
+        for ts, value in history:
+            if ts >= threshold:
+                return candidate
+            candidate = value
+        return candidate
+
+    def _history_ready(self, history: Deque[Tuple[float, float]], minutes: int) -> bool:
+        # OI和资金费率变化类信号需要完整观察窗口。
+        # 刚启动不足15分钟时不触发“15分钟变化”类信号，避免误报。
+        if len(history) < 2:
+            return False
+        return history[-1][0] - history[0][0] >= minutes * 60
+
+    def _suggest_levels(self, price: float, direction: str) -> Tuple[str, str, str]:
+        # V1的价位建议是演示规则：
+        # 做多：止损放在当前价下方，止盈放在上方。
+        # 做空：止损放在当前价上方，止盈放在下方。
+        if price <= 0 or direction == "观望":
+            return "-", "-", "-"
+        if direction == "做多":
+            return (
+                f"{price * 0.998:.2f} - {price * 1.002:.2f}",
+                f"{price * 0.992:.2f}",
+                f"{price * 1.012:.2f} / {price * 1.020:.2f}",
+            )
+        return (
+            f"{price * 0.998:.2f} - {price * 1.002:.2f}",
+            f"{price * 1.008:.2f}",
+            f"{price * 0.988:.2f} / {price * 0.980:.2f}",
+        )
+
+    def _risk_level(self, total_score: int, signals: List[Dict[str, Any]]) -> str:
+        # 风险等级综合评分和高风险信号。资金费率过热直接提高风险等级。
+        risk_signal_types = {item["type"] for item in signals}
+        if total_score < 70 or "funding_hot" in risk_signal_types:
+            return "高"
+        if total_score < 80 or "long_short_extreme" in risk_signal_types:
+            return "中"
+        return "低"
+
+    def _validate_ai_result(self, parsed: Optional[Dict[str, Any]]) -> Tuple[bool, List[str]]:
+        # AI输出必须包含固定字段，否则不直接信任，转用本地规则兜底。
+        required = {
+            "trend",
+            "risk",
+            "suggestion",
+            "direction",
+            "entry",
+            "stop_loss",
+            "take_profit",
+            "risk_level",
+            "score_comment",
+            "rule_audit",
+            "reasons",
+        }
+        if not parsed:
+            return False, ["AI output is not a JSON object"]
+
+        errors = []
+        missing = sorted(required - set(parsed.keys()))
+        if missing:
+            errors.append(f"missing fields: {missing}")
+
+        if parsed.get("direction") not in ("做多", "做空", "观望"):
+            errors.append("direction must be 做多/做空/观望")
+
+        if parsed.get("risk_level") not in ("低", "中", "高"):
+            errors.append("risk_level must be 低/中/高")
+
+        if not isinstance(parsed.get("reasons"), list):
+            errors.append("reasons must be a list")
+
+        rule_audit = parsed.get("rule_audit")
+        if not isinstance(rule_audit, dict):
+            errors.append("rule_audit must be an object")
+        else:
+            for key in ("overall", "score_consistency", "warnings"):
+                if key not in rule_audit:
+                    errors.append(f"rule_audit missing {key}")
+
+        return not errors, errors
+
+    def _ai_payload(
+        self,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        score: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        # 发送给AI的数据分成三层：
+        # 1. raw_evidence：原始证据，让AI能复核趋势、放量、OI/funding变化。
+        # 2. computed_indicators：程序已经算好的指标。
+        # 3. rule_outputs：程序触发的信号和评分，让AI审查是否可信。
+        inst_id = snapshot["inst_id"]
+        return {
+            "instrument": inst_id,
+            "snapshot_time": snapshot["time"],
+            "raw_evidence": {
+                "market": {
+                    "current_price": snapshot["price"],
+                    "best_bid": snapshot["best_bid"],
+                    "best_ask": snapshot["best_ask"],
+                },
+                "candles": {
+                    "1m": compact_candles(snapshot["candles"]["1m"], 21),
+                    "5m": compact_candles(snapshot["candles"]["5m"], 12),
+                    "15m": compact_candles(snapshot["candles"]["15m"], 12),
+                    "1H": compact_candles(snapshot["candles"]["1H"], 12),
+                },
+                "oi_history": history_tail(self.oi_history[inst_id], 180),
+                "funding_history": history_tail(self.funding_history[inst_id], 180),
+            },
+            "computed_indicators": {
+                "volume": snapshot["volume"],
+                "open_interest": snapshot["open_interest"],
+                "oi_change_pct_15m": snapshot["oi_change_pct_15m"],
+                "oi_warmup_ready": snapshot["oi_warmup_ready"],
+                "funding_rate": snapshot["funding_rate"],
+                "funding_change_15m": snapshot["funding_change"],
+                "funding_warmup_ready": snapshot["funding_warmup_ready"],
+                "long_short_ratio": snapshot["long_short_ratio"],
+            },
+            "rule_thresholds": {
+                "volume_multiplier": self.config.volume_multiplier,
+                "oi_change_pct_15m": self.config.oi_change_pct_15m,
+                "funding_abs_threshold": self.config.funding_abs_threshold,
+                "funding_change_threshold": self.config.funding_change_threshold,
+                "long_short_extreme": self.config.long_short_extreme,
+                "push_score": self.push_score,
+            },
+            "rule_outputs": {
+                "signals": signals,
+                "score": score,
+                "signal_evidence": self._signal_evidence(snapshot, signals),
+            },
+        }
+
+    def _signal_evidence(
+        self,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        # 把每个信号的“当前值 vs 阈值”写清楚，AI可以据此审查信号是否合理。
+        evidence = []
+        signal_types = {item["type"] for item in signals}
+
+        if "volume_spike" in signal_types:
+            evidence.append({
+                "type": "volume_spike",
+                "current": snapshot["volume"]["multiplier"],
+                "threshold": self.config.volume_multiplier,
+                "valid_by_rule": snapshot["volume"]["multiplier"] >= self.config.volume_multiplier,
+                "detail": snapshot["volume"],
+            })
+
+        if "oi_change" in signal_types:
+            evidence.append({
+                "type": "oi_change",
+                "current": snapshot["oi_change_pct_15m"],
+                "threshold": self.config.oi_change_pct_15m,
+                "warmup_ready": snapshot["oi_warmup_ready"],
+                "valid_by_rule": snapshot["oi_warmup_ready"] and abs(snapshot["oi_change_pct_15m"]) >= self.config.oi_change_pct_15m,
+            })
+
+        if "funding_hot" in signal_types:
+            evidence.append({
+                "type": "funding_hot",
+                "current": snapshot["funding_rate"],
+                "threshold": self.config.funding_abs_threshold,
+                "valid_by_rule": abs(snapshot["funding_rate"]) >= self.config.funding_abs_threshold,
+            })
+
+        if "funding_fast_change" in signal_types:
+            evidence.append({
+                "type": "funding_fast_change",
+                "current": snapshot["funding_change"],
+                "threshold": self.config.funding_change_threshold,
+                "warmup_ready": snapshot["funding_warmup_ready"],
+                "valid_by_rule": snapshot["funding_warmup_ready"] and abs(snapshot["funding_change"]) >= self.config.funding_change_threshold,
+            })
+
+        if "long_short_extreme" in signal_types:
+            long_short = snapshot["long_short_ratio"]
+            evidence.append({
+                "type": "long_short_extreme",
+                "current_long_ratio": long_short.get("long_ratio", 0.0),
+                "current_short_ratio": long_short.get("short_ratio", 0.0),
+                "threshold": self.config.long_short_extreme,
+                "available": long_short.get("available", False),
+                "valid_by_rule": long_short.get("available", False) and max(
+                    long_short.get("long_ratio", 0.0),
+                    long_short.get("short_ratio", 0.0),
+                ) >= self.config.long_short_extreme,
+            })
+
+        return evidence
+
+    def _ai_prompt(
+        self,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        score: Dict[str, Any],
+    ) -> str:
+        # Prompt明确约束AI：只做分析，不自动下单，不承诺收益，并要求固定字段。
+        payload = self._ai_payload(snapshot, signals, score)
+        return (
+            "你是欧易OKX USDT永续合约短线交易分析助手，只分析BTC-USDT-SWAP和ETH-USDT-SWAP。"
+            "你的任务是根据实时行情、多周期K线、成交量、OI、资金费率、多空比和本地规则评分，"
+            "先审计程序规则结果是否可信，再输出短线交易观察建议。\n\n"
+            "硬性限制：\n"
+            "1. 只提供分析和风险提示，不允许表示系统会自动下单。\n"
+            "2. 不允许承诺收益，不允许使用稳赚、必涨、必跌等确定性表述。\n"
+            "3. 如果数据不足、信号矛盾、预热未完成或风险过高，direction必须选择观望。\n"
+            "4. 如果long_short_ratio.available=false，需要说明多空比不可用，不要凭空编造多空比。\n"
+            "5. 如果oi_warmup_ready=false或funding_warmup_ready=false，需要降低对15分钟变化类指标的权重。\n\n"
+            "分析步骤：\n"
+            "1. 规则审计：根据raw_evidence和signal_evidence，判断程序触发的signals是否有原始数据支持。\n"
+            "2. 趋势：分别根据K线原始数据判断1m、5m、15m、1H方向，说明短线和上级周期是否共振。\n"
+            "3. 量能：复核当前1m成交量相对20根均量是否真的放量，放量是否支持当前方向。\n"
+            "4. OI：根据oi_history和oi_change_pct_15m判断OI变化是否可信，代表新增仓位、平仓或暂时无有效结论。\n"
+            "5. 资金费率：根据funding_history、funding_rate、funding_change_15m判断是否过热或快速变化。\n"
+            "6. 多空比：若available=true，判断是否极端；若available=false，明确说明不可用并降低该项权重。\n"
+            "7. 风险：结合止损距离、资金费率、趋势冲突、信号数量、预热状态给出风险等级。\n"
+            "8. 建议：方向只能是做多、做空、观望。入场、止损、止盈可参考rule_outputs.score，但可以保守修正。\n\n"
+            "必须只输出一个合法JSON对象，不要输出Markdown代码块，不要输出JSON以外的解释。"
+            "JSON字段必须完全包含：\n"
+            "{\n"
+            '  "trend": {\n'
+            '    "summary": "一句话趋势结论",\n'
+            '    "timeframes": {"1m": "...", "5m": "...", "15m": "...", "1H": "..."},\n'
+            '    "conflict": "是否存在周期冲突"\n'
+            "  },\n"
+            '  "risk": "风险分析，说明资金费率/OI/多空比/预热状态",\n'
+            '  "suggestion": "简短交易建议和执行注意事项",\n'
+            '  "direction": "做多/做空/观望",\n'
+            '  "entry": "建议入场区间，观望时填-",\n'
+            '  "stop_loss": "建议止损，观望时填-",\n'
+            '  "take_profit": "建议止盈，观望时填-",\n'
+            '  "risk_level": "低/中/高",\n'
+            '  "score_comment": "对本地综合评分是否可信的说明",\n'
+            '  "rule_audit": {\n'
+            '    "overall": "规则结果可信/部分可信/不可信",\n'
+            '    "volume_signal_valid": true,\n'
+            '    "oi_signal_valid": true,\n'
+            '    "funding_signal_valid": true,\n'
+            '    "long_short_signal_valid": true,\n'
+            '    "score_consistency": "综合评分与原始证据是否一致",\n'
+            '    "warnings": ["规则审计警告"]\n'
+            "  },\n"
+            '  "reasons": ["理由1", "理由2", "理由3"]\n'
+            "}\n\n"
+            f"输入数据：{json.dumps(payload, ensure_ascii=False)}"
+        )
+
+    def _local_analysis(
+        self,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        score: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        # 本地规则分析是AI不可用时的兜底，也用于未触发信号时的简短输出。
+        reasons = [item["desc"] for item in signals] or ["未触发强信号，按规则保持观察。"]
+        content = {
+            "trend": score["trends"],
+            "risk": f"风险等级：{score['risk_level']}",
+            "suggestion": "仅供观察，不构成投资建议。",
+            "direction": score["direction"],
+            "entry": score["entry"],
+            "stop_loss": score["stop_loss"],
+            "take_profit": score["take_profit"],
+            "risk_level": score["risk_level"],
+            "reasons": reasons,
+        }
+        return {"provider": "local-rule", "content": content}
+
+    def _format_push_message(
+        self,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        score: Dict[str, Any],
+        analysis: Dict[str, Any],
+    ) -> str:
+        # 把分析结果整理成适合聊天工具阅读的文本。
+        reason_text = "; ".join(item["desc"] for item in signals) or "规则评分达到推送阈值"
+        return (
+            f"[OKX AI短线助手]\n"
+            f"币种: {snapshot['inst_id']}\n"
+            f"价格: {snapshot['price']}\n"
+            f"综合评分: {score['total_score']}\n"
+            f"方向: {score['direction']}\n"
+            f"入场位: {score['entry']}\n"
+            f"止损位: {score['stop_loss']}\n"
+            f"止盈位: {score['take_profit']}\n"
+            f"风险等级: {score['risk_level']}\n"
+            f"分析理由: {reason_text}\n"
+            f"AI/规则分析: {json.dumps(analysis, ensure_ascii=False)}"
+        )
+
+    def _push_key(
+        self,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        score: Dict[str, Any],
+    ) -> str:
+        # 同币种、同方向、同信号组合视为同一类提醒，进入冷却窗口。
+        signal_types = ",".join(sorted(item["type"] for item in signals)) or "score-only"
+        return f"{snapshot['inst_id']}:{score['direction']}:{signal_types}"
+
+    def _in_push_cooldown(self, push_key: str) -> bool:
+        last_at = self.last_push_at.get(push_key, 0.0)
+        return time.time() - last_at < self.runtime_config.push_cooldown_seconds
+
+    def _push_telegram(self, message: str) -> None:
+        # Telegram推送需要Bot Token和Chat ID。
+        token = os.getenv("TELEGRAM_BOT_TOKEN")
+        chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        if not token or not chat_id:
+            return
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        try:
+            http_post_json(
+                url,
+                {"chat_id": chat_id, "text": message},
+                self.runtime_config.retry_times,
+                self.runtime_config.retry_backoff,
+            )
+        except Exception as exc:
+            print(f"Telegram push failed: {exc}")
+
+    def _push_webhook(self, url: Optional[str], message: str) -> None:
+        # 企业微信和微信机器人通常都支持类似的Webhook JSON格式。
+        if not url:
+            return
+        try:
+            http_post_json(
+                url,
+                {"msgtype": "text", "text": {"content": message}},
+                self.runtime_config.retry_times,
+                self.runtime_config.retry_backoff,
+            )
+        except Exception as exc:
+            print(f"Webhook push failed: {exc}")
+
+    def _rotate_log_if_needed(self) -> None:
+        # 简单日志轮转：超过大小就把当前日志替换为 .1。
+        # 生产版可以接入logrotate或保留多份历史文件。
+        try:
+            if not LOG_FILE.exists() or LOG_FILE.stat().st_size < self.runtime_config.log_max_bytes:
+                return
+            backup = LOG_FILE.with_suffix(LOG_FILE.suffix + ".1")
+            if backup.exists():
+                backup.unlink()
+            LOG_FILE.replace(backup)
+        except Exception as exc:
+            print(f"log rotation failed: {exc}")
+
+    def _print_console(
+        self,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        score: Dict[str, Any],
+        analysis: Dict[str, Any],
+    ) -> None:
+        # 控制台输出每轮核心摘要，方便命令行观察运行效果。
+        signal_text = ", ".join(item["desc"] for item in signals) if signals else "none"
+        print(
+            f"[{snapshot['time']}] {snapshot['inst_id']} "
+            f"price={snapshot['price']} score={score['total_score']} "
+            f"dir={score['direction']} risk={score['risk_level']} signals={signal_text}"
+        )
+        if signals:
+            print(f"analysis={json.dumps(analysis, ensure_ascii=False)}")
+
+
+def short_count_greater(trends: Dict[str, str]) -> bool:
+    # 判断多周期中下跌周期是否多于上涨周期。
+    return sum(1 for item in trends.values() if item == "down") > sum(1 for item in trends.values() if item == "up")
+
+
+def parse_instruments(value: str) -> List[str]:
+    # V1只允许客户需求中的两个永续合约，避免误传现货或其他合约。
+    instruments = [item.strip().upper() for item in value.split(",") if item.strip()]
+    unsupported = [item for item in instruments if item not in SUPPORTED_INSTRUMENTS]
+    if unsupported:
+        raise argparse.ArgumentTypeError(f"Unsupported instruments: {unsupported}. V1 only supports {SUPPORTED_INSTRUMENTS}")
+    return instruments or list(SUPPORTED_INSTRUMENTS)
+
+
+def parse_args() -> argparse.Namespace:
+    # 命令行参数也都可以用环境变量替代，方便服务器部署。
+    parser = argparse.ArgumentParser(description="OKX AI short-term trading assistant V1")
+    parser.add_argument(
+        "--inst-ids",
+        type=parse_instruments,
+        default=parse_instruments(os.getenv("OKX_INST_IDS", ",".join(SUPPORTED_INSTRUMENTS))),
+        help="Comma-separated instruments. V1: BTC-USDT-SWAP,ETH-USDT-SWAP",
+    )
+    parser.add_argument("--interval", type=int, default=int(os.getenv("OKX_INTERVAL", str(DEFAULT_INTERVAL_SECONDS))))
+    parser.add_argument("--runtime", type=int, default=int(os.getenv("OKX_RUNTIME", "0")))
+    parser.add_argument("--flag", default=os.getenv("OKX_FLAG", "0"), choices=("0", "1"))
+    parser.add_argument("--ai", action="store_true", default=os.getenv("AI_ENABLED", "0") == "1")
+    parser.add_argument("--dry-run-ai", action="store_true", default=os.getenv("AI_DRY_RUN", "0") == "1")
+    parser.add_argument("--push", action="store_true", default=os.getenv("PUSH_ENABLED", "0") == "1")
+    parser.add_argument("--push-score", type=int, default=int(os.getenv("PUSH_SCORE", str(DEFAULT_PUSH_SCORE))))
+    parser.add_argument("--retry-times", type=int, default=env_int("RETRY_TIMES", DEFAULT_RETRY_TIMES))
+    parser.add_argument("--retry-backoff", type=float, default=env_float("RETRY_BACKOFF_SECONDS", DEFAULT_RETRY_BACKOFF_SECONDS))
+    parser.add_argument("--push-cooldown", type=int, default=env_int("PUSH_COOLDOWN_SECONDS", DEFAULT_PUSH_COOLDOWN_SECONDS))
+    parser.add_argument("--log-max-bytes", type=int, default=env_int("LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES))
+    parser.add_argument("--volume-multiplier", type=float, default=env_float("VOLUME_MULTIPLIER", 2.0))
+    parser.add_argument("--oi-change-pct-15m", type=float, default=env_float("OI_CHANGE_PCT_15M", 5.0))
+    parser.add_argument("--funding-threshold", type=float, default=env_float("FUNDING_ABS_THRESHOLD", 0.0008))
+    parser.add_argument("--funding-change-threshold", type=float, default=env_float("FUNDING_CHANGE_THRESHOLD", 0.0003))
+    parser.add_argument("--long-short-extreme", type=float, default=env_float("LONG_SHORT_EXTREME", 0.75))
+    return parser.parse_args()
+
+
+def main() -> int:
+    # 程序入口：解析参数，创建助手实例，进入循环。
+    args = parse_args()
+    assistant = OkxAiShortTermAssistant(
+        instruments=args.inst_ids,
+        interval=max(args.interval, 1),
+        flag=args.flag,
+        ai_enabled=args.ai,
+        push_enabled=args.push,
+        push_score=args.push_score,
+        dry_run_ai=args.dry_run_ai,
+        config=SignalConfig(
+            volume_multiplier=args.volume_multiplier,
+            oi_change_pct_15m=args.oi_change_pct_15m,
+            funding_abs_threshold=args.funding_threshold,
+            funding_change_threshold=args.funding_change_threshold,
+            long_short_extreme=args.long_short_extreme,
+        ),
+        runtime_config=RuntimeConfig(
+            retry_times=max(args.retry_times, 1),
+            retry_backoff=max(args.retry_backoff, 0.1),
+            push_cooldown_seconds=max(args.push_cooldown, 0),
+            log_max_bytes=max(args.log_max_bytes, 1024 * 1024),
+        ),
+    )
+    try:
+        assistant.run_forever(args.runtime)
+    except KeyboardInterrupt:
+        print("Stopped.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

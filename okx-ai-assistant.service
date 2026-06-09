@@ -1,0 +1,16 @@
+[Unit]
+Description=OKX AI Short-Term Trading Assistant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/cicvd_tbox_sdk/app/lpm-process/source/okx_ai_assistant_deploy
+ExecStart=/data/cicvd_tbox_sdk/app/lpm-process/source/okx_ai_assistant_deploy/run.sh
+Restart=always
+RestartSec=10
+StandardOutput=append:/data/cicvd_tbox_sdk/app/lpm-process/source/okx_ai_assistant_deploy/logs/systemd.out.log
+StandardError=append:/data/cicvd_tbox_sdk/app/lpm-process/source/okx_ai_assistant_deploy/logs/systemd.err.log
+
+[Install]
+WantedBy=default.target
