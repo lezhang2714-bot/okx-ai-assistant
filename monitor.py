@@ -7,16 +7,24 @@ Scope:
     - Provide analysis and suggestions only.
     - No auto order, no martingale, no grid.
 
+<<<<<<< Updated upstream
 Optional AI:
+=======
+Install:
+    pip install python-okx
+
+Optional AI (OpenAI / DeepSeek):
+>>>>>>> Stashed changes
     pip install openai
-    export OPENAI_API_KEY="..."
-    export AI_MODEL="gpt-5.5"
+    export AI_API_KEY="..."           # 或 OPENAI_API_KEY
+    export AI_BASE_URL="https://api.deepseek.com"  # DeepSeek; OpenAI留空
+    export AI_MODEL="deepseek-chat"   # 或 gpt-4o
 
 Optional push:
     export TELEGRAM_BOT_TOKEN="..."
     export TELEGRAM_CHAT_ID="..."
     export WECOM_WEBHOOK_URL="..."
-    export WECHAT_WEBHOOK_URL="..."
+    export WECHAT_SEND_KEY="..."       # Server酱 SendKey，推送到个人微信
 
 Production tuning:
     export RETRY_TIMES=3
@@ -53,9 +61,9 @@ SUPPORTED_INSTRUMENTS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
 # 多周期K线用于判断短线趋势结构：
 # 1m看即时波动，5m看短线节奏，15m看交易方向，1H看上一级趋势。
 BAR_CHANNELS = ("1m", "5m", "15m", "1H")
-DEFAULT_INTERVAL_SECONDS = 5
+DEFAULT_INTERVAL_SECONDS = 600
 DEFAULT_PUSH_SCORE = 80
-DEFAULT_AI_MODEL = "gpt-5.5"
+DEFAULT_AI_MODEL = "deepseek-chat"
 OKX_BASE_URL = "https://www.okx.com"
 DEFAULT_RETRY_TIMES = 3
 DEFAULT_RETRY_BACKOFF_SECONDS = 1.5
@@ -481,6 +489,7 @@ class OkxAiShortTermAssistant:
             direction = "做空"
 
         # 趋势评分：周期越一致，趋势分越高；15m和1H同向额外加分。
+        #待优化
         trend_score = 30 + max(up_count, down_count) * 10
         if trends["15m"] == trends["1H"] and trends["15m"] != "unknown":
             trend_score += 10
@@ -506,14 +515,14 @@ class OkxAiShortTermAssistant:
         if abs(funding) >= self.config.funding_abs_threshold:
             # 资金费率过热，扣风险分。
             risk_score -= 8
-        if max(long_ratio, short_ratio) >= self.config.long_short_extreme:
+        if max(long_ratio, short_ratio) >= self.config.long_short_extreme:#调整
             # 多空比极端，扣风险分。
             risk_score -= 6
         if direction == "做多" and short_count_greater(trends):
             risk_score -= 4
         risk_score = max(risk_score, 0)
 
-        total = max(0, min(100, trend_score + capital_score + risk_score))
+        total = max(0, min(100, trend_score + capital_score + risk_score))#综合评分
 
         # V1用当前价格的固定百分比生成入场、止损、止盈。
         # 生产版建议改成基于ATR、前高前低、订单簿流动性和支撑阻力位。
@@ -553,7 +562,6 @@ class OkxAiShortTermAssistant:
                 "content": "AI dry-run enabled. Payload prepared but not sent.",
                 "payload": payload,
             }
-
         try:
             from openai import OpenAI
         except ImportError:
@@ -563,30 +571,32 @@ class OkxAiShortTermAssistant:
                 "fallback": self._local_analysis(snapshot, signals, score),
             }
 
-        api_key = os.getenv("OPENAI_API_KEY")
+        api_key = os.getenv("AI_API_KEY","sk-aefc7a633ce3471ab1acaccaa9814ce3") or os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("AI_BASE_URL", "https://api.deepseek.com")
+        model = os.getenv("AI_MODEL", "deepseek-chat")
+
         if not api_key:
             return {
                 "provider": "local",
-                "content": "OPENAI_API_KEY is not configured; fallback to local analysis.",
+                "content": "AI_API_KEY or OPENAI_API_KEY is not configured; fallback to local analysis.",
                 "fallback": self._local_analysis(snapshot, signals, score),
             }
 
-        client = OpenAI(api_key=api_key)
-        model = os.getenv("AI_MODEL", DEFAULT_AI_MODEL)
+        client = OpenAI(api_key=api_key, base_url=base_url)
         prompt = self._ai_prompt(snapshot, signals, score)
 
         try:
-            # 使用OpenAI Responses API，让AI基于结构化行情数据输出中文分析。
-            response = client.responses.create(
+            # 使用 Chat Completions API，兼容 OpenAI 和 DeepSeek。
+            response = client.chat.completions.create(
                 model=model,
-                input=prompt,
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
             )
-            output_text = getattr(response, "output_text", str(response))
+            output_text = response.choices[0].message.content
             parsed = extract_json_object(output_text)
             valid, errors = self._validate_ai_result(parsed)
             return {
-                "provider": "openai",
+                "provider": "deepseek" if "deepseek" in base_url else "openai",
                 "model": model,
                 "content": output_text,
                 "parsed": parsed,
@@ -595,6 +605,7 @@ class OkxAiShortTermAssistant:
                 "fallback": None if valid else self._local_analysis(snapshot, signals, score),
             }
         except Exception as exc:
+            print(f"[{now_text()}] AI analysis failed: {exc}")
             return {
                 "provider": "local",
                 "content": f"AI request failed: {exc}; fallback to local analysis.",
@@ -610,26 +621,27 @@ class OkxAiShortTermAssistant:
     ) -> None:
         # 推送模块只关心综合评分是否达到阈值。
         # 默认80分以上推送，70分以下只记录不推送，避免提醒过多。
-        if not signals:
-            return
+        # if not signals:
+        #     return
 
-        if score["total_score"] < self.push_score:
-            return
+        # if score["total_score"] < self.push_score:
+        #     return
 
         push_key = self._push_key(snapshot, signals, score)
-        if self._in_push_cooldown(push_key):
-            print(f"[{now_text()}] push skipped by cooldown: {push_key}")
-            return
+        # if self._in_push_cooldown(push_key):
+        #     print(f"[{now_text()}] push skipped by cooldown: {push_key}")
+        #     return
 
         message = self._format_push_message(snapshot, signals, score, analysis)
+        print("----------------------------------------------\n")
         print(message)
-        if not self.push_enabled:
-            self.last_push_at[push_key] = time.time()
-            return
+        # if not self.push_enabled:
+        #     self.last_push_at[push_key] = time.time()
+        #     return
 
         self._push_telegram(message)
         self._push_webhook(os.getenv("WECOM_WEBHOOK_URL"), message)
-        self._push_webhook(os.getenv("WECHAT_WEBHOOK_URL"), message)
+        self._push_serverchan(os.getenv("WECHAT_SEND_KEY","SCT361954Tfk2ZEcU9hXFfFNrdwAaeSBn5"), snapshot, signals, score, analysis)
         self.last_push_at[push_key] = time.time()
 
     def log_result(
@@ -681,6 +693,7 @@ class OkxAiShortTermAssistant:
                 # 本地综合评分，包括：各项打分、总分、建议、操作区间、风险等级、K线趋势；
                 score = self.score_snapshot(snapshot, signals)
 
+<<<<<<< Updated upstream
                 # 有信号产生则进行AI分析，节省AI成本；否则，进行本地分析（本地分析结果封装成AI返回格式）
                 analysis = self.analyze_with_ai(snapshot, signals, score) if signals else self._local_analysis(snapshot, signals, score)
 
@@ -691,6 +704,16 @@ class OkxAiShortTermAssistant:
                 self.push_if_needed(snapshot, signals, score, analysis)
                 
                 # 记录JSON日志到文件
+=======
+                # 只有触发信号才调用AI；否则用本地规则输出简要分析，节省AI成本。
+                # analysis = self.analyze_with_ai(snapshot, signals, score) if signals else self._local_analysis(snapshot, signals, score)
+                analysis = self.analyze_with_ai(snapshot, signals, score)
+                # 打印终端摘要
+                # self._print_console(snapshot, signals, score, analysis)
+                # 推送判断与处理
+                self.push_if_needed(snapshot, signals, score, analysis)
+                # # 记录JSON日志
+>>>>>>> Stashed changes
                 self.log_result(snapshot, signals, score, analysis)
 
             except Exception as exc:
@@ -943,6 +966,7 @@ class OkxAiShortTermAssistant:
             "risk_level",
             "score_comment",
             "rule_audit",
+            "prediction",
             "reasons",
         }
         if not parsed:
@@ -969,6 +993,19 @@ class OkxAiShortTermAssistant:
             for key in ("overall", "score_consistency", "warnings"):
                 if key not in rule_audit:
                     errors.append(f"rule_audit missing {key}")
+
+        prediction = parsed.get("prediction")
+        if not isinstance(prediction, dict):
+            errors.append("prediction must be an object")
+        else:
+            for key in ("short_term", "mid_term", "target_price", "confidence",
+                        "key_support", "key_resistance", "bias"):
+                if key not in prediction:
+                    errors.append(f"prediction missing {key}")
+            if prediction.get("confidence") not in ("低", "中", "高"):
+                errors.append("prediction.confidence must be 低/中/高")
+            if prediction.get("bias") not in ("偏多", "偏空", "震荡"):
+                errors.append("prediction.bias must be 偏多/偏空/震荡")
 
         return not errors, errors
 
@@ -1112,7 +1149,9 @@ class OkxAiShortTermAssistant:
             "5. 资金费率：根据funding_history、funding_rate、funding_change_15m判断是否过热或快速变化。\n"
             "6. 多空比：若available=true，判断是否极端；若available=false，明确说明不可用并降低该项权重。\n"
             "7. 风险：结合止损距离、资金费率、趋势冲突、信号数量、预热状态给出风险等级。\n"
-            "8. 建议：方向只能是做多、做空、观望。入场、止损、止盈可参考rule_outputs.score，但可以保守修正。\n\n"
+            "8. 建议：方向只能是做多、做空、观望。入场、止损、止盈可参考rule_outputs.score，但可以保守修正。\n"
+            "9. 预测：基于当前多周期K线结构、量价关系、OI变化和资金费率，预测未来5分钟和15-60分钟的走势方向、"
+            "目标价位、关键支撑和压力位。预测必须给出置信度，置信度低时必须说明不确定因素。\n\n"
             "必须只输出一个合法JSON对象，不要输出Markdown代码块，不要输出JSON以外的解释。"
             "JSON字段必须完全包含：\n"
             "{\n"
@@ -1138,6 +1177,16 @@ class OkxAiShortTermAssistant:
             '    "score_consistency": "综合评分与原始证据是否一致",\n'
             '    "warnings": ["规则审计警告"]\n'
             "  },\n"
+            '  "prediction": {\n'
+            '    "short_term": "未来5分钟走势预测及理由",\n'
+            '    "mid_term": "未来15-60分钟走势预测及理由",\n'
+            '    "target_price": "预测目标价位，观望时填-",\n'
+            '    "confidence": "低/中/高",\n'
+            '    "key_support": "当前关键支撑位",\n'
+            '    "key_resistance": "当前关键压力位",\n'
+            '    "bias": "偏多/偏空/震荡",\n'
+            '    "uncertainty_factors": ["不确定因素1", "不确定因素2"]\n'
+            "  },\n"
             '  "reasons": ["理由1", "理由2", "理由3"]\n'
             "}\n\n"
             f"输入数据：{json.dumps(payload, ensure_ascii=False)}"
@@ -1151,16 +1200,109 @@ class OkxAiShortTermAssistant:
     ) -> Dict[str, Any]:
         # 本地规则分析是AI不可用时的兜底，也用于未触发信号时的简短输出。
         reasons = [item["desc"] for item in signals] or ["未触发强信号，按规则保持观察。"]
+        trends = score["trends"]
+        direction = score["direction"]
+        price = snapshot["price"]
+        volume = snapshot["volume"]
+        oi_pct = snapshot["oi_change_pct_15m"]
+        funding = snapshot["funding_rate"]
+        bias = _trends_to_bias(trends)
+
+        # ---- 短期预测（5分钟）：看1m趋势 + 放量情况 ----
+        t1m = trends.get("1m", "unknown")
+        vol_spike = volume["multiplier"] >= self.config.volume_multiplier
+        if t1m == "up" and vol_spike:
+            short_term = f"1m放量上涨(量比{volume['multiplier']:.1f}x)，短期惯性偏多，关注能否站稳{price:.1f}上方。"
+        elif t1m == "down" and vol_spike:
+            short_term = f"1m放量下跌(量比{volume['multiplier']:.1f}x)，短期惯性偏空，关注{price:.1f}支撑。"
+        elif t1m == "up":
+            short_term = f"1m温和上涨，量能正常，短期延续偏多但力度有限。"
+        elif t1m == "down":
+            short_term = f"1m温和下跌，量能正常，短期延续偏空但力度有限。"
+        else:
+            short_term = "1m方向不明，短期看震荡整理，等待方向选择。"
+
+        # ---- 中期预测（15-60分钟）：看15m+1H共振 + OI + 资金费率 ----
+        t15m = trends.get("15m", "unknown")
+        t1h = trends.get("1H", "unknown")
+        oi_ready = snapshot.get("oi_warmup_ready", False)
+        fund_ready = snapshot.get("funding_warmup_ready", False)
+        mid_parts = []
+        if t15m == t1h and t15m in ("up", "down"):
+            mid_parts.append(f"15m与1H共振{t15m}，中期趋势一致性较好")
+        elif t15m != "unknown" and t1h != "unknown":
+            mid_parts.append(f"15m{t15m}与1H{t1h}存在周期冲突，中期方向不确定性高")
+        if oi_ready:
+            if oi_pct > 0:
+                mid_parts.append(f"OI 15分钟增加{oi_pct:.1f}%，有新增仓位进场")
+            elif oi_pct < 0:
+                mid_parts.append(f"OI 15分钟减少{abs(oi_pct):.1f}%，部分仓位离场")
+        if fund_ready and abs(funding) >= self.config.funding_abs_threshold:
+            side = "多头拥挤" if funding > 0 else "空头拥挤"
+            mid_parts.append(f"资金费率{funding:.5f}偏{side}，追单风险提高")
+        mid_term = "；".join(mid_parts) if mid_parts else "数据预热未完成，中期暂无有效预测。"
+
+        # ---- 置信度：看趋势一致性和信号数量 ----
+        up_c = sum(1 for t in trends.values() if t == "up")
+        down_c = sum(1 for t in trends.values() if t == "down")
+        consistent = max(up_c, down_c)
+        sig_count = len(signals)
+        if consistent >= 3 and sig_count >= 2:
+            confidence = "中"
+        elif consistent >= 3 or sig_count >= 2:
+            confidence = "低"
+        else:
+            confidence = "低"
+
+        # ---- 支撑/压力位：优先用止损止盈，其次从15m K线取近端高低点 ----
+        support = score.get("stop_loss", "-")
+        resistance = score.get("take_profit", "-")
+        if support == "-" or resistance == "-":
+            c15 = snapshot["candles"].get("15m", [])
+            if len(c15) >= 3:
+                highs = [c["high"] for c in c15[1:] if c.get("high", 0) > 0]
+                lows = [c["low"] for c in c15[1:] if c.get("low", 0) > 0]
+                if support == "-" and lows:
+                    support = f"{min(lows):.2f}"
+                if resistance == "-" and highs:
+                    resistance = f"{max(highs):.2f}"
+
+        # ---- 不确定因素 ----
+        unknowns = []
+        if not snapshot.get("oi_warmup_ready"):
+            unknowns.append("OI预热未完成(需15分钟)")
+        if not snapshot.get("funding_warmup_ready"):
+            unknowns.append("资金费率预热未完成(需15分钟)")
+        lr = snapshot["long_short_ratio"]
+        if not lr.get("available"):
+            unknowns.append("多空比接口不可用")
+        if consistent < 3:
+            unknowns.append("多周期方向不一致")
+        if not unknowns:
+            unknowns.append("无明显不确定因素")
+
+        prediction = {
+            "short_term": short_term,
+            "mid_term": mid_term,
+            "target_price": _extract_first_price(score.get("take_profit", "-")),
+            "confidence": confidence,
+            "key_support": support,
+            "key_resistance": resistance,
+            "bias": bias,
+            "uncertainty_factors": unknowns,
+        }
+
         content = {
-            "trend": score["trends"],
+            "trend": trends,
             "risk": f"风险等级：{score['risk_level']}",
             "suggestion": "仅供观察，不构成投资建议。",
-            "direction": score["direction"],
+            "direction": direction,
             "entry": score["entry"],
             "stop_loss": score["stop_loss"],
             "take_profit": score["take_profit"],
             "risk_level": score["risk_level"],
             "reasons": reasons,
+            "prediction": prediction,
         }
         return {"provider": "local-rule", "content": content}
 
@@ -1219,7 +1361,7 @@ class OkxAiShortTermAssistant:
             print(f"Telegram push failed: {exc}")
 
     def _push_webhook(self, url: Optional[str], message: str) -> None:
-        # 企业微信和微信机器人通常都支持类似的Webhook JSON格式。
+        # 企业微信群机器人 Webhook，JSON POST 格式。
         if not url:
             return
         try:
@@ -1231,6 +1373,87 @@ class OkxAiShortTermAssistant:
             )
         except Exception as exc:
             print(f"Webhook push failed: {exc}")
+
+    def _push_serverchan(
+        self,
+        send_key: Optional[str],
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        score: Dict[str, Any],
+        analysis: Dict[str, Any],
+    ) -> None:
+        # Server酱 推送个人微信。SendKey 从 https://sct.ftqq.com 获取。
+        if not send_key:
+            return
+        inst_id = snapshot["inst_id"]
+        direction = score["direction"]
+        price = snapshot["price"]
+        total = score["total_score"]
+        risk = score["risk_level"]
+        entry = score["entry"]
+        stop_loss = score["stop_loss"]
+        take_profit = score["take_profit"]
+        reason_text = "; ".join(item["desc"] for item in signals) or "规则评分达到推送阈值"
+
+        # 提取 AI/规则分析摘要和预测
+        provider = analysis.get("provider", "unknown")
+        parsed = analysis.get("parsed") or {}
+        if isinstance(parsed, dict) and parsed.get("suggestion"):
+            ai_summary = f"- **{provider}建议**：{parsed['suggestion']}\n"
+        elif analysis.get("fallback"):
+            fb = analysis["fallback"]
+            fb_content = fb.get("content", {}) if isinstance(fb, dict) else {}
+            if isinstance(fb_content, dict) and fb_content.get("suggestion"):
+                ai_summary = f"- **规则建议**：{fb_content['suggestion']}\n"
+            else:
+                ai_summary = ""
+        else:
+            ai_summary = ""
+
+        # 提取预测信息
+        pred = parsed.get("prediction") if isinstance(parsed, dict) else None
+        if pred and isinstance(pred, dict):
+            pred_text = (
+                f"\n## 走势预测\n\n"
+                f"- **置信度**：{pred.get('confidence', '-')}\n"
+                f"- **偏向**：{pred.get('bias', '-')}\n"
+                f"- **短期(5m)**：{pred.get('short_term', '-')}\n"
+                f"- **中期(15-60m)**：{pred.get('mid_term', '-')}\n"
+                f"- **目标价**：{pred.get('target_price', '-')}\n"
+                f"- **支撑位**：{pred.get('key_support', '-')}\n"
+                f"- **压力位**：{pred.get('key_resistance', '-')}\n"
+            )
+        else:
+            pred_text = ""
+
+        # title 手机通知栏直接显示。
+        bias = pred.get("bias", "") if pred else ""
+        title = f"{inst_id} {direction} {bias} 评分{total} 风险{risk}"
+
+        # desp Markdown 格式，点开通知看到详情。
+        desp = (
+            f"## {inst_id} 短线分析\n\n"
+            f"- **价格**：{price}\n"
+            f"- **方向**：{direction}\n"
+            f"- **综合评分**：{total}\n"
+            f"- **入场区间**：{entry}\n"
+            f"- **止损**：{stop_loss}\n"
+            f"- **止盈**：{take_profit}\n"
+            f"- **风险等级**：{risk}\n"
+            f"- **信号**：{reason_text}\n"
+            f"{ai_summary}"
+            f"{pred_text}"
+        )
+
+        try:
+            http_post_json(
+                f"https://sctapi.ftqq.com/{send_key}.send",
+                {"title": title, "desp": desp},
+                self.runtime_config.retry_times,
+                self.runtime_config.retry_backoff,
+            )
+        except Exception as exc:
+            print(f"ServerChan push failed: {exc}")
 
     def _rotate_log_if_needed(self) -> None:
         # 简单日志轮转：超过大小就把当前日志替换为 .1。
@@ -1260,13 +1483,32 @@ class OkxAiShortTermAssistant:
             f"price={snapshot['price']} score={score['total_score']} "
             f"dir={score['direction']} risk={score['risk_level']} signals={signal_text}"
         )
-        if signals:
-            print(f"analysis={json.dumps(analysis, ensure_ascii=False)}")
+        # if signals:
+        print(f"analysis={json.dumps(analysis, ensure_ascii=False)}")
 
 
 def short_count_greater(trends: Dict[str, str]) -> bool:
     # 判断多周期中下跌周期是否多于上涨周期。
     return sum(1 for item in trends.values() if item == "down") > sum(1 for item in trends.values() if item == "up")
+
+
+def _trends_to_bias(trends: Dict[str, str]) -> str:
+    # 根据多周期趋势判断方向偏向，供本地规则兜底使用。
+    up = sum(1 for t in trends.values() if t == "up")
+    down = sum(1 for t in trends.values() if t == "down")
+    if up > down:
+        return "偏多"
+    if down > up:
+        return "偏空"
+    return "震荡"
+
+
+def _extract_first_price(text: str) -> str:
+    # 从 "78343.50 - 78657.50" 或 "79442.51 / 80070.51" 中取第一个价格，
+    # 作为 target_price 的默认值。
+    if not text or text == "-":
+        return "-"
+    return text.replace("/", "-").replace(" ", "").split("-")[0]
 
 
 def parse_instruments(value: str) -> List[str]:
