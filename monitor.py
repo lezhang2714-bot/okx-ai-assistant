@@ -645,6 +645,10 @@ class OkxAiShortTermAssistant:
             "time": snapshot["time"],
             "inst_id": snapshot["inst_id"],
             "price": snapshot["price"],
+            "chart": {
+                "bar": "1m",
+                "points": compact_candles(snapshot["candles"].get("1m", []), 21),
+            },
             "open_interest": snapshot["open_interest"],
             "oi_change_pct_15m": snapshot["oi_change_pct_15m"],
             "oi_warmup_ready": snapshot["oi_warmup_ready"],

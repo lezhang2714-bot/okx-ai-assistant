@@ -43,7 +43,6 @@ SESSIONS = set()
 MONITOR_PROCESS: subprocess.Popen = None
 MONITOR_STARTED_AT = ""
 MONITOR_LOG_START_AT = ""
-HISTORY_POINTS_CACHE: Dict[str, List[Dict[str, Any]]] = {}
 
 
 CONFIG_FIELDS = [
@@ -277,7 +276,7 @@ def monitor_status() -> Dict[str, Any]:
 
 
 def start_monitor() -> str:
-    global MONITOR_PROCESS, MONITOR_STARTED_AT, MONITOR_LOG_START_AT, HISTORY_POINTS_CACHE
+    global MONITOR_PROCESS, MONITOR_STARTED_AT, MONITOR_LOG_START_AT
     status = monitor_status()
     if status["running"]:
         return status["text"]
@@ -285,7 +284,6 @@ def start_monitor() -> str:
         return "请先在配置页至少选择一个监控币种。"
     MONITOR_STARTED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
     MONITOR_LOG_START_AT = MONITOR_STARTED_AT
-    HISTORY_POINTS_CACHE = {}
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = MONITOR_PROCESS_LOG_FILE.open("a", encoding="utf-8")
     log_file.write(f"\n===== monitor started at {MONITOR_STARTED_AT} =====\n")
@@ -325,28 +323,12 @@ def post_json(url: str, payload: dict) -> str:
 
 
 def get_quick_ticker(inst_id: str) -> Dict[str, Any]:
-    if inst_id not in SUPPORTED_INSTRUMENTS:
-        inst_id = "BTC-USDT-SWAP"
-    query = urllib.parse.urlencode({"instId": inst_id})
-    request = urllib.request.Request(
-        f"{OKX_BASE_URL}/api/v5/market/ticker?{query}",
-        headers={"Accept": "application/json", "User-Agent": "okx-ai-assistant-web/1.0"},
-    )
-    with urllib.request.urlopen(request, timeout=6) as response:
-        payload = json.loads(response.read().decode("utf-8", errors="ignore"))
-    data = payload.get("data") or []
-    item = data[0] if data else {}
-    price = float(item.get("last") or 0)
-    now = time.strftime("%Y-%m-%d %H:%M:%S")
-    return {
-        "inst_id": inst_id,
-        "running": bool(monitor_status()["running"]),
-        "points": [{"time": now, "price": price}, {"time": now, "price": price}],
-        "price": price,
-        "change": 0,
-        "change_pct": 0,
-        "quick": True,
-    }
+    payload = read_monitor_points(inst_id, max_points=2)
+    points = payload.get("points") or []
+    payload["points"] = points[-1:] if points else []
+    payload["quick"] = True
+    payload["source"] = "monitor-log"
+    return payload
 
 
 def get_history_candle_points(inst_id: str, bar: str = "1m", limit: int = 120) -> List[Dict[str, Any]]:
@@ -362,23 +344,56 @@ def get_history_candle_points(inst_id: str, bar: str = "1m", limit: int = 120) -
     rows = payload.get("data") or []
     points = []
     for row in reversed(rows):
-        if not isinstance(row, list) or len(row) < 5:
+        if not isinstance(row, list) or len(row) < 6:
             continue
         try:
+            close = float(row[4])
             points.append({
                 "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(row[0]) / 1000)),
-                "price": float(row[4]),
+                "price": close,
                 "kind": "history",
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": close,
+                "volume": float(row[5]),
+                "confirmed": str(row[8]) if len(row) > 8 else "0",
             })
         except (TypeError, ValueError):
             continue
     return points
 
 
-def get_cached_history_points(inst_id: str) -> List[Dict[str, Any]]:
-    if inst_id not in HISTORY_POINTS_CACHE:
-        HISTORY_POINTS_CACHE[inst_id] = get_history_candle_points(inst_id)
-    return list(HISTORY_POINTS_CACHE.get(inst_id, []))
+def chart_points_from_log_item(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    chart = item.get("chart") if isinstance(item.get("chart"), dict) else {}
+    rows = chart.get("points") if chart.get("bar") == "1m" and isinstance(chart.get("points"), list) else []
+    points = []
+    for row in reversed(rows):
+        if not isinstance(row, dict):
+            continue
+        try:
+            price = float(row.get("close"))
+        except (TypeError, ValueError):
+            continue
+        points.append({
+            "time": row.get("time", ""),
+            "price": price,
+            "kind": "history",
+            "open": row.get("open"),
+            "high": row.get("high"),
+            "low": row.get("low"),
+            "close": row.get("close"),
+            "volume": row.get("volume"),
+            "confirmed": row.get("confirmed"),
+        })
+    return points
+
+
+def minute_bucket_key(value: Any) -> str:
+    text = str(value or "")
+    if len(text) >= 16 and text[4:5] == "-" and text[7:8] == "-":
+        return f"{text[:16]}:00"
+    return text
 
 
 def merge_price_points(history_points: List[Dict[str, Any]], realtime_points: List[Dict[str, Any]], max_points: int) -> List[Dict[str, Any]]:
@@ -389,16 +404,17 @@ def merge_price_points(history_points: List[Dict[str, Any]], realtime_points: Li
             price = float(point.get("price"))
         except (AttributeError, TypeError, ValueError):
             continue
-        key = str(point.get("time", ""))
+        key = minute_bucket_key(point.get("time", ""))
         normalized = dict(point)
         normalized["time"] = key
         normalized["price"] = price
         if key and key in index_by_time:
-            merged[index_by_time[key]] = normalized
+            merged[index_by_time[key]] = {**merged[index_by_time[key]], **normalized}
             continue
         if key:
             index_by_time[key] = len(merged)
         merged.append(normalized)
+    merged.sort(key=lambda point: minute_bucket_key(point.get("time", "")))
     return merged[-max_points:]
 
 
@@ -478,6 +494,7 @@ def monitor_log_text() -> str:
 
 def read_monitor_points(inst_id: str, max_points: int = 20000) -> Dict[str, Any]:
     realtime_points = []
+    log_chart_points = []
     running = bool(monitor_status()["running"])
     for line in tail_text(MONITOR_JSON_LOG_FILE, 40 * 1024 * 1024).splitlines():
         try:
@@ -492,18 +509,31 @@ def read_monitor_points(inst_id: str, max_points: int = 20000) -> Dict[str, Any]
             continue
         if MONITOR_LOG_START_AT and str(item.get("time", "")) < MONITOR_LOG_START_AT:
             continue
+        item_chart_points = chart_points_from_log_item(item)
+        if item_chart_points:
+            log_chart_points = item_chart_points
         realtime_points.append(point_from_log_item(item, price))
     realtime_points = realtime_points[-max_points:]
-    source = "log"
+    source = "monitor-log"
     points = realtime_points
+    web_chart_points = []
     if running:
         try:
-            history_points = get_cached_history_points(inst_id)
-            if history_points:
-                points = merge_price_points(history_points, realtime_points, max_points)
-                source = "history+log" if realtime_points else "history"
+            web_chart_points = get_history_candle_points(inst_id, "1m", 120)
         except Exception:
-            source = "log"
+            web_chart_points = []
+    chart_points = web_chart_points or log_chart_points
+    if chart_points:
+        points = merge_price_points(chart_points, [], max_points)
+        latest_by_minute = {minute_bucket_key(point.get("time", "")): point for point in realtime_points}
+        for index, point in enumerate(points):
+            metrics = latest_by_minute.get(minute_bucket_key(point.get("time", "")))
+            if metrics:
+                enriched = {**metrics, **point}
+                enriched["price"] = point["price"]
+                enriched["kind"] = "history"
+                points[index] = enriched
+        source = "web-chart" if web_chart_points else "monitor-chart"
     if len(points) == 1:
         points.append({"time": points[0]["time"], "price": points[0]["price"]})
     first = points[0]["price"] if points else 0
@@ -798,34 +828,47 @@ if (importConfigBtn) {{
 let virtualTick=0;
 let configuredMonitorInsts={json.dumps(selected_instruments, ensure_ascii=False)};
 let monitorInst={json.dumps(monitor_initial, ensure_ascii=False)}, monitorPayload=null, monitorLiveMode=false;
+let monitorSeriesByInst={{}}, monitorLastTickerAt=0;
+let virtualSeriesByInst={{}};
 let monitorViewStart=0, monitorViewEnd=1;
 let monitorVisiblePoints=[], monitorPlotPoints=[], monitorSelectedKey='', monitorLatestPoint=null;
-let monitorYZoom=1, monitorDrag=null;
+let monitorYZoom=1, monitorYPan=0, monitorYRange=1, monitorDrag=null;
 function refreshMonitorTabs(insts){{if(!Array.isArray(insts))return;configuredMonitorInsts=insts;const box=document.querySelector('.coin-tabs');if(!box)return;if(!configuredMonitorInsts.length){{monitorInst='';box.innerHTML='<span class="empty-coin">请先在配置页选择监控币种</span>';clearChartMessage('请先在配置页选择监控币种');return;}}if(configuredMonitorInsts.indexOf(monitorInst)<0)monitorInst=configuredMonitorInsts[0];box.innerHTML=configuredMonitorInsts.map(inst=>'<button class="button coin-tab '+(inst===monitorInst?'active':'')+'" type="button" data-monitor-inst="'+inst+'">'+inst+'</button>').join('');bindMonitorTabs();}}
-function bindMonitorTabs(){{document.querySelectorAll('[data-monitor-inst]').forEach(b=>b.onclick=()=>{{const next=b.getAttribute('data-monitor-inst');if(configuredMonitorInsts.indexOf(next)<0)return;monitorInst=next;monitorViewStart=0;monitorViewEnd=1;monitorYZoom=1;monitorSelectedKey='';document.querySelectorAll('[data-monitor-inst]').forEach(o=>o.classList.remove('active'));b.classList.add('active');fetchMonitor();}});}}
-function gen(n,base){{let a=[],v=base,now=Date.now();for(let i=0;i<n;i++){{v+=(Math.random()-.48)*7+Math.sin((i+virtualTick)/12)*1.5;if(Math.random()>.96)v+=(Math.random()-.5)*30;a.push({{time:new Date(now-(n-i-1)*60000).toLocaleString(),price:v}});}}return a;}}
+function bindMonitorTabs(){{document.querySelectorAll('[data-monitor-inst]').forEach(b=>b.onclick=()=>{{const next=b.getAttribute('data-monitor-inst');if(configuredMonitorInsts.indexOf(next)<0)return;monitorInst=next;monitorViewStart=0;monitorViewEnd=1;monitorYZoom=1;monitorYPan=0;monitorSelectedKey='';monitorLastTickerAt=0;document.querySelectorAll('[data-monitor-inst]').forEach(o=>o.classList.remove('active'));b.classList.add('active');bootstrapMonitorChart();}});}}
+function virtualBase(){{return monitorInst==='ETH-USDT-SWAP'?3200:63000;}}
+function gen(n,base){{let a=[],v=base,now=Date.now();const step=Math.max(.18,base*.000055);for(let i=0;i<n;i++){{v+=(Math.random()-.5)*step+Math.sin((i+virtualTick)/18)*step*.18;a.push({{time:new Date(now-(n-i-1)*1000).toLocaleString(),price:v,kind:'virtual'}});}}return a;}}
+function nextVirtualSeries(){{if(!monitorInst)return [];virtualTick++;let series=virtualSeriesByInst[monitorInst]||[];if(series.length<2){{series=gen(260,virtualBase());}}else{{const last=Number(series[series.length-1].price)||virtualBase(),step=Math.max(.18,virtualBase()*.00007),drift=Math.sin(virtualTick/16)*step*.2,price=Math.max(.01,last+(Math.random()-.5)*step+drift);series=[...series.slice(-259),{{time:new Date().toLocaleString(),price:price,kind:'virtual'}}];}}virtualSeriesByInst[monitorInst]=series;return series;}}
 function visiblePoints(points){{if(!points||points.length<2)return points||[];const s=Math.max(0,Math.floor(monitorViewStart*(points.length-1))),e=Math.min(points.length,Math.ceil(monitorViewEnd*(points.length-1))+1);return points.slice(s,Math.max(s+2,e));}}
 function fmt(v,d){{const n=Number(v);return Number.isFinite(n)?n.toFixed(d):'--';}}
 function fmtPct(v){{const n=Number(v);return Number.isFinite(n)?n.toFixed(4)+'%':'--';}}
 function shortTime(t){{if(!t)return '--';const s=String(t);return s.length>=16?s.slice(11,16):s;}}
 function compactTime(t){{if(!t)return '--';const s=String(t);return s.length>=16?s.slice(5,16):s;}}
 function updateChartFooter(points){{const c=document.getElementById('monitorPointCount');if(!c)return;c.textContent='数据点：'+((points&&points.length)||0);}}
+function parsePointTime(t){{const s=String(t||'');const m=s.match(/^(\\d{{4}})-(\\d{{2}})-(\\d{{2}})[ T](\\d{{2}}):(\\d{{2}})(?::(\\d{{2}}))?/);if(m)return new Date(Number(m[1]),Number(m[2])-1,Number(m[3]),Number(m[4]),Number(m[5]),Number(m[6]||0));const d=new Date(s);return Number.isFinite(d.getTime())?d:new Date();}}
+function formatPointTime(d){{const pad=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());}}
+function bucket1mTime(t){{const d=parsePointTime(t);d.setSeconds(0,0);return formatPointTime(d);}}
+function normalizeClientPoint(point,fallbackKind){{if(!point)return null;const price=Number(point.price);if(!Number.isFinite(price))return null;const normalized=Object.assign({{}},point);normalized.kind=normalized.kind||fallbackKind||'realtime';normalized.time=String(point.time||new Date().toLocaleString());if(normalized.kind!=='virtual')normalized.time=bucket1mTime(normalized.time);normalized.price=price;return normalized;}}
+function mergeClientPoints(existing,incoming,maxPoints){{const merged=[],indexByTime={{}};[...(existing||[]),...(incoming||[])].forEach(point=>{{const normalized=normalizeClientPoint(point,'realtime');if(!normalized)return;const key=normalized.time||'';if(key&&Object.prototype.hasOwnProperty.call(indexByTime,key)){{merged[indexByTime[key]]=Object.assign({{}},merged[indexByTime[key]],normalized);return;}}if(key)indexByTime[key]=merged.length;merged.push(normalized);}});merged.sort((a,b)=>parsePointTime(a.time).getTime()-parsePointTime(b.time).getTime());return merged.slice(-Math.max(2,maxPoints||20000));}}
+function setMonitorSeries(points){{const series=mergeClientPoints([],points||[],20000);monitorSeriesByInst[monitorInst]=series;monitorPayload={{points:series}};return series;}}
+function appendMonitorPoints(points){{const series=mergeClientPoints(monitorSeriesByInst[monitorInst]||[],points||[],20000);monitorSeriesByInst[monitorInst]=series;monitorPayload={{points:series}};return series;}}
+function drawMonitorSeries(metaText){{const series=monitorSeriesByInst[monitorInst]||[];if(series.length){{drawChart('monitorChart',series,document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));document.getElementById('monitorTitle').textContent=monitorInst+' 实时走势';const m=document.getElementById('monitorMeta');if(m&&metaText)m.textContent=metaText;return true;}}return false;}}
 function snapshotHtml(point,title){{if(!point)return '<strong>Snapshot</strong><div class="snapshot-grid"><span>价格</span><b>--</b><span>时间</span><b>--</b><span>评分</span><b>--</b><span>方向</span><b>--</b></div>';const kind=point.kind==='history'?'历史K线':'实时快照';return '<strong>'+title+' · '+kind+'</strong><div class="snapshot-grid"><span>时间</span><b>'+compactTime(point.time)+'</b><span>价格</span><b>'+fmt(point.price,2)+'</b><span>评分</span><b>'+(point.score??'--')+'</b><span>方向</span><b>'+(point.direction||'--')+'</b><span>风险</span><b>'+(point.risk_level||'--')+'</b><span>OI</span><b>'+fmt(point.open_interest,2)+'</b><span>OI 15m</span><b>'+fmtPct(point.oi_change_pct_15m)+'</b><span>资金费率</span><b>'+fmt(point.funding_rate,6)+'</b><span>多头/空头</span><b>'+fmt(Number(point.long_ratio)*100,1)+'/'+fmt(Number(point.short_ratio)*100,1)+'%</b><span>放量倍数</span><b>'+fmt(point.volume_multiplier,2)+'</b></div>';}}
 function updateSnapshotPanel(point,title){{const panel=document.getElementById('snapshotPanel');if(panel)panel.innerHTML=snapshotHtml(point,title||'Snapshot');}}
 function drawTimeAxis(x,W,H,p,points,cw){{if(!points||points.length<2)return;const maxLabels=Math.max(2,Math.min(8,Math.floor(W/150))),step=Math.max(1,Math.floor((points.length-1)/(maxLabels-1)));x.fillStyle='rgba(229,231,235,.9)';x.font='12px Segoe UI, Microsoft YaHei, Arial';x.textAlign='center';x.textBaseline='top';for(let i=0;i<points.length;i+=step){{const px=p.l+cw*i/(points.length-1);x.fillText(shortTime(points[i].time),px,H-24);}}const lastIndex=points.length-1;if((lastIndex%step)!==0){{x.fillText(shortTime(points[lastIndex].time),W-p.r,H-24);}}}}
 function drawPriceAxis(x,W,H,p,mn,mx){{x.fillStyle='rgba(229,231,235,.82)';x.font='12px Segoe UI, Microsoft YaHei, Arial';x.textAlign='right';x.textBaseline='middle';for(let i=0;i<=4;i++){{const value=mx-(mx-mn)*i/4,y=p.t+(H-p.t-p.b)*i/4;x.fillText(value.toFixed(2),W-8,y);}}}}
 function clearChartMessage(text){{const c=document.getElementById('monitorChart'),l=document.getElementById('monitorLoading'),p=document.getElementById('monitorPrice'),m=document.getElementById('monitorMeta'),t=document.getElementById('monitorTitle');monitorSelectedKey='';monitorVisiblePoints=[];monitorPlotPoints=[];monitorLatestPoint=null;if(c){{const r=c.getBoundingClientRect(),x=c.getContext('2d');c.width=Math.max(1,r.width);c.height=Math.max(1,r.height);x.clearRect(0,0,r.width,r.height);}}if(l){{l.style.display='grid';l.textContent=text;}}if(p)p.innerHTML='<strong>--</strong><span>无数据</span>';if(m)m.textContent=text;if(t)t.textContent='未配置币种';updateChartFooter([]);updateSnapshotPanel(null,'Snapshot');}}
-function drawChart(id,points,priceBox,metaBox,loading){{const c=document.getElementById(id);if(!c||!points||points.length<1)return;if(points.length===1)points=[points[0],{{time:points[0].time,price:points[0].price}}];monitorLatestPoint=points[points.length-1];points=visiblePoints(points);monitorVisiblePoints=points;updateChartFooter(points);if(loading)loading.style.display='none';const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=r.width*d;c.height=r.height*d;const x=c.getContext('2d');x.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,p={{l:34,r:74,t:18,b:58}},cw=W-p.l-p.r,ch=H-p.t-p.b,prices=points.map(q=>q.price);let mn=Math.min(...prices),mx=Math.max(...prices);const center=(mn+mx)/2,baseRg=Math.max(.01,mx-mn),rg=baseRg/monitorYZoom;mn=center-rg/2;mx=center+rg/2;monitorPlotPoints=[];x.clearRect(0,0,W,H);x.strokeStyle='rgba(255,255,255,.12)';for(let i=0;i<=4;i++){{const y=p.t+ch*i/4;x.beginPath();x.moveTo(p.l,y);x.lineTo(W-p.r,y);x.stroke();}}x.beginPath();points.forEach((q,i)=>{{const px=p.l+cw*i/(points.length-1),py=p.t+ch-((q.price-mn)/rg)*ch;monitorPlotPoints.push({{x:px,y:py,point:q}});if(i===0)x.moveTo(px,py);else x.lineTo(px,py);}});const up=points[points.length-1].price>=points[0].price;x.strokeStyle=up?'#22c55e':'#fb7185';x.lineWidth=2;x.stroke();x.fillStyle=up?'rgba(34,197,94,.08)':'rgba(251,113,133,.10)';x.lineTo(W-p.r,H-p.b);x.lineTo(p.l,H-p.b);x.closePath();x.fill();drawTimeAxis(x,W,H,p,points,cw);drawPriceAxis(x,W,H,p,mn,mx);if(monitorSelectedKey){{const hit=monitorPlotPoints.find(o=>(o.point.time||'')===monitorSelectedKey);if(hit){{x.strokeStyle='rgba(255,255,255,.62)';x.setLineDash([4,5]);x.beginPath();x.moveTo(hit.x,p.t);x.lineTo(hit.x,H-p.b);x.stroke();x.beginPath();x.moveTo(p.l,hit.y);x.lineTo(W-p.r,hit.y);x.stroke();x.setLineDash([]);x.fillStyle='#60a5fa';x.beginPath();x.arc(hit.x,hit.y,5,0,7);x.fill();updateSnapshotPanel(hit.point,'选中点');}}else{{monitorSelectedKey='';updateSnapshotPanel(monitorLatestPoint,'最新快照');}}}}if(priceBox){{const first=points[0].price,last=points[points.length-1].price,chg=last-first,pct=first?chg/first*100:0;priceBox.classList.toggle('up',chg>=0);priceBox.classList.toggle('down',chg<0);priceBox.innerHTML='<strong>'+last.toFixed(2)+'</strong><span>'+(chg>=0?'+':'')+chg.toFixed(2)+' / '+(pct>=0?'+':'')+pct.toFixed(2)+'%</span>';}}if(!monitorSelectedKey)updateSnapshotPanel(monitorLatestPoint,'最新快照');if(metaBox)metaBox.textContent='更新：'+new Date().toLocaleTimeString();}}
-function drawVirtualMonitor(){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}virtualTick++;const base=monitorInst==='ETH-USDT-SWAP'?3200:63000;drawChart('monitorChart',gen(260,base),document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));document.getElementById('monitorTitle').textContent=monitorInst+' 虚拟走势';}}
+function drawChart(id,points,priceBox,metaBox,loading){{const c=document.getElementById(id);if(!c||!points||points.length<1)return;if(points.length===1)points=[points[0],{{time:points[0].time,price:points[0].price}}];monitorLatestPoint=points[points.length-1];points=visiblePoints(points);monitorVisiblePoints=points;updateChartFooter(points);if(loading)loading.style.display='none';const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=r.width*d;c.height=r.height*d;const x=c.getContext('2d');x.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,p={{l:34,r:74,t:18,b:58}},cw=W-p.l-p.r,ch=H-p.t-p.b,prices=points.map(q=>q.price);let mn=Math.min(...prices),mx=Math.max(...prices);const rawCenter=(mn+mx)/2,baseRg=Math.max(.01,(mx-mn)*1.16),center=rawCenter+monitorYPan,rg=baseRg/monitorYZoom;monitorYRange=rg;mn=center-rg/2;mx=center+rg/2;monitorPlotPoints=[];x.clearRect(0,0,W,H);x.strokeStyle='rgba(255,255,255,.12)';for(let i=0;i<=4;i++){{const y=p.t+ch*i/4;x.beginPath();x.moveTo(p.l,y);x.lineTo(W-p.r,y);x.stroke();}}x.beginPath();points.forEach((q,i)=>{{const px=p.l+cw*i/(points.length-1),py=p.t+ch-((q.price-mn)/rg)*ch;monitorPlotPoints.push({{x:px,y:py,point:q}});if(i===0)x.moveTo(px,py);else x.lineTo(px,py);}});const up=points[points.length-1].price>=points[0].price;x.strokeStyle=up?'#22c55e':'#fb7185';x.lineWidth=2;x.stroke();x.fillStyle=up?'rgba(34,197,94,.08)':'rgba(251,113,133,.10)';x.lineTo(W-p.r,H-p.b);x.lineTo(p.l,H-p.b);x.closePath();x.fill();drawTimeAxis(x,W,H,p,points,cw);drawPriceAxis(x,W,H,p,mn,mx);if(monitorSelectedKey){{const hit=monitorPlotPoints.find(o=>(o.point.time||'')===monitorSelectedKey);if(hit){{x.strokeStyle='rgba(255,255,255,.62)';x.setLineDash([4,5]);x.beginPath();x.moveTo(hit.x,p.t);x.lineTo(hit.x,H-p.b);x.stroke();x.beginPath();x.moveTo(p.l,hit.y);x.lineTo(W-p.r,hit.y);x.stroke();x.setLineDash([]);x.fillStyle='#60a5fa';x.beginPath();x.arc(hit.x,hit.y,5,0,7);x.fill();updateSnapshotPanel(hit.point,'选中点');}}else{{monitorSelectedKey='';updateSnapshotPanel(monitorLatestPoint,'最新快照');}}}}if(priceBox){{const first=points[0].price,last=points[points.length-1].price,chg=last-first,pct=first?chg/first*100:0;priceBox.classList.toggle('up',chg>=0);priceBox.classList.toggle('down',chg<0);priceBox.innerHTML='<strong>'+last.toFixed(2)+'</strong><span>'+(chg>=0?'+':'')+chg.toFixed(2)+' / '+(pct>=0?'+':'')+pct.toFixed(2)+'%</span>';}}if(!monitorSelectedKey)updateSnapshotPanel(monitorLatestPoint,'最新快照');if(metaBox)metaBox.textContent='更新：'+new Date().toLocaleTimeString();}}
+function drawVirtualMonitor(){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}drawChart('monitorChart',nextVirtualSeries(),document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));document.getElementById('monitorTitle').textContent=monitorInst+' 虚拟走势';const m=document.getElementById('monitorMeta');if(m)m.textContent='虚拟行情预览 · 点击开始监控后切换真实数据';}}
 function setMonitorButtonState(state,text){{const btn=document.getElementById('monitorToggleBtn'),meta=document.getElementById('monitorMeta');if(!btn)return;btn.classList.remove('is-running','is-starting');btn.disabled=false;if(state==='starting'){{btn.classList.add('is-starting');btn.textContent='启动中...';btn.disabled=true;if(meta)meta.textContent=text||'正在启动监控进程...';}}else if(state==='running'){{btn.classList.add('is-running');btn.textContent='停止监控';if(meta&&text)meta.textContent=text;}}else if(state==='stopping'){{btn.classList.add('is-starting');btn.textContent='停止中...';btn.disabled=true;if(meta)meta.textContent=text||'正在停止监控进程...';}}else{{btn.textContent='开始监控';if(meta&&text)meta.textContent=text;}}}}
 async function syncMonitorStatus(){{try{{const r=await fetch('/api/status',{{cache:'no-store'}}),p=await r.json();setMonitorButtonState(p.running?'running':'stopped',p.text||'');return p;}}catch(e){{return null;}}}}
 function showRealtimeWaiting(clearChart){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}monitorLiveMode=true;const c=document.getElementById('monitorChart'),l=document.getElementById('monitorLoading'),m=document.getElementById('monitorMeta'),t=document.getElementById('monitorTitle'),p=document.getElementById('monitorPrice');if(clearChart&&c){{const r=c.getBoundingClientRect(),x=c.getContext('2d');c.width=Math.max(1,r.width);c.height=Math.max(1,r.height);x.clearRect(0,0,r.width,r.height);updateChartFooter([]);}}if(l){{l.style.display=clearChart?'grid':'none';l.textContent='监控已启动，正在等待真实价格数据...';}}if(m)m.textContent=clearChart?'实时监控已启动 · 等待第一条价格数据':'已获取最新价 · 等待完整分析数据';if(t)t.textContent=monitorInst+' 实时走势';if(clearChart&&p)p.innerHTML='<strong>--</strong><span>等待真实数据</span>';}}
-async function fetchQuickTicker(){{try{{const r=await fetch('/api/ticker?inst_id='+encodeURIComponent(monitorInst),{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'ticker失败');if(p.points&&p.points.length>0){{drawChart('monitorChart',p.points,document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));document.getElementById('monitorTitle').textContent=monitorInst+' 实时走势';const m=document.getElementById('monitorMeta');if(m)m.textContent='已获取最新价 · 等待完整分析数据';}}}}catch(e){{showRealtimeWaiting(false);}}}}
-async function fetchMonitor(){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}try{{const r=await fetch('/api/monitor-data?inst_id='+encodeURIComponent(monitorInst),{{cache:'no-store'}}),p=await r.json();monitorPayload=p;if(!r.ok||p.ok===false){{clearChartMessage(p.error||'当前币种未配置，不能读取监控数据');return;}}if(p.running)monitorLiveMode=true;if(p.running&&p.points&&p.points.length>0){{drawChart('monitorChart',p.points,document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));document.getElementById('monitorTitle').textContent=monitorInst+(p.source==='history'?' 历史K线走势':' 实时走势');const m=document.getElementById('monitorMeta');if(m)m.textContent=p.source==='history'?'已加载历史K线 · 等待实时分析数据':'实时监控数据 · '+new Date().toLocaleTimeString();}}else if(monitorLiveMode){{showRealtimeWaiting(false);}}else{{drawVirtualMonitor();}}}}catch(e){{if(monitorLiveMode)showRealtimeWaiting(false);else drawVirtualMonitor();}}}}
-function redrawMonitorCached(){{if(monitorPayload&&monitorPayload.points&&monitorPayload.points.length){{drawChart('monitorChart',monitorPayload.points,document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));}}else{{drawVirtualMonitor();}}}}
+async function fetchMonitor(){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return null;}}try{{const r=await fetch('/api/monitor-data?inst_id='+encodeURIComponent(monitorInst),{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false){{clearChartMessage(p.error||'当前币种未配置，不能读取监控数据');return p;}}if(!p.running){{monitorLiveMode=false;monitorSeriesByInst[monitorInst]=[];drawVirtualMonitor();return p;}}monitorLiveMode=true;if(p.points&&p.points.length>0){{setMonitorSeries(p.points);const hasChart=p.source==='web-chart'||p.source==='monitor-chart';document.getElementById('monitorTitle').textContent=monitorInst+(hasChart?' 1m K线走势':' 实时走势');const meta=p.source==='web-chart'?'Web获取1m K线 · 指标读取monitor.py日志':(p.source==='monitor-chart'?'monitor.py 1m K线兜底 · 指标读取日志':'读取monitor.py实时日志 · 等待K线');drawMonitorSeries(meta+' · '+new Date().toLocaleTimeString());}}else if(!drawMonitorSeries('保留最近走势 · 等待K线/日志')){{showRealtimeWaiting(false);}}return p;}}catch(e){{if(monitorLiveMode){{if(!drawMonitorSeries('保留最近走势 · 等待K线/日志'))showRealtimeWaiting(false);}}else drawVirtualMonitor();return null;}}}}
+function sleep(ms){{return new Promise(resolve=>setTimeout(resolve,ms));}}
+async function bootstrapMonitorChart(){{monitorLastTickerAt=0;for(let i=0;i<16;i++){{const payload=await fetchMonitor();if(payload&&(payload.source==='web-chart'||payload.source==='monitor-chart')&&payload.points&&payload.points.length>0)break;await sleep(i<4?500:1000);}}}}
+function redrawMonitorCached(){{if(drawMonitorSeries())return;const series=virtualSeriesByInst[monitorInst]||[];if(series.length){{drawChart('monitorChart',series,document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));document.getElementById('monitorTitle').textContent=monitorInst+' 虚拟走势';}}else{{drawVirtualMonitor();}}}}
 bindMonitorTabs();
 const monitorToggleBtn=document.getElementById('monitorToggleBtn');
-if(monitorToggleBtn){{monitorToggleBtn.addEventListener('click',async()=>{{const status=await syncMonitorStatus();if(status&&status.running){{setMonitorButtonState('stopping','正在停止监控进程...');try{{await fetch('/stop#monitor',{{cache:'no-store'}});}}catch(e){{}}monitorLiveMode=false;monitorViewStart=0;monitorViewEnd=1;setMonitorButtonState('stopped','监控已停止，当前显示虚拟行情');drawVirtualMonitor();return;}}if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}setMonitorButtonState('starting','正在保存配置并启动监控...');showRealtimeWaiting(true);try{{await autoSaveConfig();await fetch('/start#monitor',{{cache:'no-store'}});await syncMonitorStatus();fetchMonitor();}}catch(e){{setMonitorButtonState('stopped','启动监控失败');const l=document.getElementById('monitorLoading');if(l)l.textContent='启动监控失败：'+e;}}}});}}
+if(monitorToggleBtn){{monitorToggleBtn.addEventListener('click',async()=>{{const status=await syncMonitorStatus();if(status&&status.running){{setMonitorButtonState('stopping','正在停止监控进程...');try{{await fetch('/stop#monitor',{{cache:'no-store'}});}}catch(e){{}}monitorLiveMode=false;monitorViewStart=0;monitorViewEnd=1;monitorYZoom=1;monitorYPan=0;monitorSeriesByInst[monitorInst]=[];setMonitorButtonState('stopped','监控已停止，当前显示虚拟行情');drawVirtualMonitor();return;}}if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}setMonitorButtonState('starting','正在保存配置并启动监控...');monitorYPan=0;showRealtimeWaiting(true);try{{await autoSaveConfig();await fetch('/start#monitor',{{cache:'no-store'}});await syncMonitorStatus();bootstrapMonitorChart();}}catch(e){{setMonitorButtonState('stopped','启动监控失败');const l=document.getElementById('monitorLoading');if(l)l.textContent='启动监控失败：'+e;}}}});}}
 let logCleared=false;async function refreshLogs(force){{const box=document.getElementById('logWindow');if(!box)return;if(logCleared&&!force)return;try{{const r=await fetch('/api/logs',{{cache:'no-store'}}),p=await r.json();logCleared=false;box.value=p.text||'暂无日志。';box.scrollTop=box.scrollHeight;}}catch(e){{box.value='日志读取失败：'+e;}}}}
 const refreshLogBtn = document.getElementById('refreshLogBtn');
 if (refreshLogBtn) refreshLogBtn.addEventListener('click', function() {{ refreshLogs(true); }});
@@ -882,8 +925,10 @@ if (saveLogBtn) {{
   }});
 }}
 const monitorCanvas=document.getElementById('monitorChart');
-if(monitorCanvas){{monitorCanvas.addEventListener('wheel',function(event){{event.preventDefault();const rect=monitorCanvas.getBoundingClientRect(),focus=Math.min(1,Math.max(0,(event.clientX-rect.left)/Math.max(1,rect.width))),span=monitorViewEnd-monitorViewStart,zoom=(event.deltaY<0?0.82:1.22),newSpan=Math.min(1,Math.max(.06,span*zoom)),center=monitorViewStart+span*focus;let ns=center-newSpan*focus,ne=ns+newSpan;if(ns<0){{ne-=ns;ns=0;}}if(ne>1){{ns-=ne-1;ne=1;}}monitorViewStart=Math.max(0,ns);monitorViewEnd=Math.min(1,ne);monitorYZoom=Math.max(.45,Math.min(10,monitorYZoom*(event.deltaY<0?1.14:.88)));redrawMonitorCached();}},{{passive:false}});monitorCanvas.addEventListener('mousedown',function(event){{monitorDrag={{x:event.clientX,start:monitorViewStart,end:monitorViewEnd,moved:false}};monitorCanvas.classList.add('dragging');}});window.addEventListener('mousemove',function(event){{if(!monitorDrag)return;const rect=monitorCanvas.getBoundingClientRect(),span=monitorDrag.end-monitorDrag.start,dx=(event.clientX-monitorDrag.x)/Math.max(1,rect.width);if(Math.abs(event.clientX-monitorDrag.x)>3)monitorDrag.moved=true;let ns=monitorDrag.start-dx*span,ne=monitorDrag.end-dx*span;if(ns<0){{ne-=ns;ns=0;}}if(ne>1){{ns-=ne-1;ne=1;}}monitorViewStart=Math.max(0,ns);monitorViewEnd=Math.min(1,ne);redrawMonitorCached();}});window.addEventListener('mouseup',function(){{if(monitorDrag){{setTimeout(function(){{monitorDrag=null;}},0);}}monitorCanvas.classList.remove('dragging');}});function selectNearestPoint(event,strict){{if(!monitorPlotPoints.length)return;const rect=monitorCanvas.getBoundingClientRect(),x=event.clientX-rect.left,y=event.clientY-rect.top;let best=null,bestDist=Infinity;monitorPlotPoints.forEach(o=>{{const dx=o.x-x,dy=o.y-y,dist=Math.sqrt(dx*dx+dy*dy);if(dist<bestDist){{best=o;bestDist=dist;}}}});if(best&&bestDist<(strict?42:34)){{monitorSelectedKey=best.point.time||'';updateSnapshotPanel(best.point,'选中点');redrawMonitorCached();}}else if(!strict){{monitorSelectedKey='';updateSnapshotPanel(monitorLatestPoint,'最新快照');redrawMonitorCached();}}}}monitorCanvas.addEventListener('click',function(event){{if(monitorDrag&&monitorDrag.moved)return;selectNearestPoint(event,false);}});monitorCanvas.addEventListener('dblclick',function(event){{selectNearestPoint(event,true);}});}}
-window.addEventListener('resize',()=>{{if(currentPage()==='monitor')fetchMonitor();}});setInterval(()=>{{if(currentPage()==='monitor'){{syncMonitorStatus();fetchMonitor();}}}},1000);setInterval(()=>{{if(currentPage()==='logs')refreshLogs(false);}},3000);window.addEventListener('hashchange',()=>showPage(currentPage()));syncMonitorStatus();showPage(currentPage());
+if(monitorCanvas){{monitorCanvas.addEventListener('wheel',function(event){{event.preventDefault();const rect=monitorCanvas.getBoundingClientRect(),focus=Math.min(1,Math.max(0,(event.clientX-rect.left)/Math.max(1,rect.width))),span=monitorViewEnd-monitorViewStart,zoom=(event.deltaY<0?0.82:1.22),newSpan=Math.min(1,Math.max(.06,span*zoom)),center=monitorViewStart+span*focus;let ns=center-newSpan*focus,ne=ns+newSpan;if(ns<0){{ne-=ns;ns=0;}}if(ne>1){{ns-=ne-1;ne=1;}}monitorViewStart=Math.max(0,ns);monitorViewEnd=Math.min(1,ne);monitorYZoom=Math.max(.45,Math.min(10,monitorYZoom*(event.deltaY<0?1.14:.88)));redrawMonitorCached();}},{{passive:false}});monitorCanvas.addEventListener('mousedown',function(event){{monitorDrag={{x:event.clientX,y:event.clientY,start:monitorViewStart,end:monitorViewEnd,yPan:monitorYPan,yRange:monitorYRange,moved:false}};monitorCanvas.classList.add('dragging');}});window.addEventListener('mousemove',function(event){{if(!monitorDrag)return;const rect=monitorCanvas.getBoundingClientRect(),span=monitorDrag.end-monitorDrag.start,dx=(event.clientX-monitorDrag.x)/Math.max(1,rect.width),dy=(event.clientY-monitorDrag.y)/Math.max(1,rect.height);if(Math.abs(event.clientX-monitorDrag.x)>3||Math.abs(event.clientY-monitorDrag.y)>3)monitorDrag.moved=true;let ns=monitorDrag.start-dx*span,ne=monitorDrag.end-dx*span;if(ns<0){{ne-=ns;ns=0;}}if(ne>1){{ns-=ne-1;ne=1;}}monitorViewStart=Math.max(0,ns);monitorViewEnd=Math.min(1,ne);monitorYPan=monitorDrag.yPan+dy*Math.max(.01,monitorDrag.yRange||monitorYRange);redrawMonitorCached();}});window.addEventListener('mouseup',function(){{if(monitorDrag){{setTimeout(function(){{monitorDrag=null;}},0);}}monitorCanvas.classList.remove('dragging');}});function selectNearestPoint(event,strict){{if(!monitorPlotPoints.length)return;const rect=monitorCanvas.getBoundingClientRect(),x=event.clientX-rect.left,y=event.clientY-rect.top;let best=null,bestDist=Infinity;monitorPlotPoints.forEach(o=>{{const dx=o.x-x,dy=o.y-y,dist=Math.sqrt(dx*dx+dy*dy);if(dist<bestDist){{best=o;bestDist=dist;}}}});if(best&&bestDist<(strict?42:34)){{monitorSelectedKey=best.point.time||'';updateSnapshotPanel(best.point,'选中点');redrawMonitorCached();}}else if(!strict){{monitorSelectedKey='';updateSnapshotPanel(monitorLatestPoint,'最新快照');redrawMonitorCached();}}}}monitorCanvas.addEventListener('click',function(event){{if(monitorDrag&&monitorDrag.moved)return;selectNearestPoint(event,false);}});monitorCanvas.addEventListener('dblclick',function(event){{selectNearestPoint(event,true);}});}}
+window.addEventListener('resize',()=>{{if(currentPage()==='monitor')redrawMonitorCached();}});
+setInterval(async()=>{{if(currentPage()!=='monitor')return;const status=await syncMonitorStatus();if(status&&status.running){{monitorLiveMode=true;const now=Date.now();if(now-monitorLastTickerAt>=5000){{monitorLastTickerAt=now;fetchMonitor();}}}}else{{monitorLiveMode=false;drawVirtualMonitor();}}}},1000);
+setInterval(()=>{{if(currentPage()==='logs')refreshLogs(false);}},3000);window.addEventListener('hashchange',()=>showPage(currentPage()));syncMonitorStatus();showPage(currentPage());
 </script></body></html>"""
     return body.encode("utf-8")
 

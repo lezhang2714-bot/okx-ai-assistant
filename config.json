@@ -5,7 +5,7 @@
     "ETH-USDT-SWAP"
   ],
   "interval_desc": "轮询间隔，单位秒。默认5秒执行一轮监控。",
-  "interval": 10,
+  "interval": 5,
   "runtime_desc": "运行时长，单位秒。0表示一直运行，300表示运行5分钟后退出。",
   "runtime": 0,
   "flag_desc": "OKX环境标识。0表示正式环境，1表示模拟盘环境。",
