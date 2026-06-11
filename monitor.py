@@ -460,6 +460,8 @@ class OkxAiShortTermAssistant:
         # 评分系统满分100分：
         # 趋势评分最高50分，资金评分最高30分，风险评分最高20分。
         # 评分用于“是否推送”和“建议强弱”，不是自动交易指令。
+
+        # 趋势判断，通过当前收盘价和21条K线的最早收盘价，判断时间范围内的up/down/flat/unkonw状态
         trends = {
             "1m": trend_from_candles(snapshot["candles"]["1m"]),
             "5m": trend_from_candles(snapshot["candles"]["5m"]),
@@ -467,6 +469,7 @@ class OkxAiShortTermAssistant:
             "1H": trend_from_candles(snapshot["candles"]["1H"]),
         }
 
+        # 单纯依靠收盘价来判断做多/做空
         up_count = sum(1 for item in trends.values() if item == "up")
         down_count = sum(1 for item in trends.values() if item == "down")
         direction = "观望"
@@ -525,6 +528,8 @@ class OkxAiShortTermAssistant:
             "entry": entry,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
+
+            # 风险等级：高、中、低
             "risk_level": self._risk_level(total, signals),
             "trends": trends,
         }
@@ -673,16 +678,16 @@ class OkxAiShortTermAssistant:
                 # 返回是一个数组，有信号变化就加入数组，没有信号产生，数组就是空
                 signals = self.detect_signals(snapshot)
 
-                # 通过信号产生情况计算评分，若无关注信号产生则评分为0
+                # 本地综合评分，包括：各项打分、总分、建议、操作区间、风险等级、K线趋势；
                 score = self.score_snapshot(snapshot, signals)
 
-                # 有信号产生则进行AI分析，节省AI成本；否则，进行本地分析（本地阈值检测时分析出来的结果）
+                # 有信号产生则进行AI分析，节省AI成本；否则，进行本地分析（本地分析结果封装成AI返回格式）
                 analysis = self.analyze_with_ai(snapshot, signals, score) if signals else self._local_analysis(snapshot, signals, score)
 
                 # 快照、信号、评分、分析结果打印到控制台
-                self._print_console(snapshot, signals, score, analysis)
+                # self._print_console(snapshot, signals, score, analysis)
 
-                # 微信推送判断与处理
+                # 微信推送判断与处理：有信号 and 80分以上 and 功能使能 才会推送
                 self.push_if_needed(snapshot, signals, score, analysis)
                 
                 # 记录JSON日志到文件
