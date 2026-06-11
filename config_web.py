@@ -1,0 +1,1046 @@
+#!/usr/bin/env python3
+"""
+Browser based local control panel for OKX AI Assistant.
+
+This file intentionally uses only Python standard library modules so the
+Windows deployment can start the UI without installing a web framework.
+"""
+
+import html
+import json
+import mimetypes
+import os
+import secrets
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Dict, List
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = SCRIPT_DIR / "assets"
+LOG_DIR = SCRIPT_DIR / "logs"
+CONFIG_FILE = SCRIPT_DIR / "config.json"
+ENV_FILE = SCRIPT_DIR / ".env"
+AUTH_FILE = SCRIPT_DIR / "auth.json"
+USER_STATE_DIR = (Path(os.getenv("LOCALAPPDATA")) / "OKX_AI_Assistant") if os.getenv("LOCALAPPDATA") else (Path.home() / ".okx_ai_assistant")
+USER_CONFIG_FILE = USER_STATE_DIR / "config.json"
+USER_ENV_FILE = USER_STATE_DIR / ".env"
+USER_AUTH_FILE = USER_STATE_DIR / "auth.json"
+MONITOR_JSON_LOG_FILE = LOG_DIR / "okx_ai_monitor.log"
+MONITOR_PROCESS_LOG_FILE = LOG_DIR / "okx_ai_monitor_console.log"
+HOST = os.getenv("CONFIG_WEB_HOST", "127.0.0.1")
+PORT = int(os.getenv("CONFIG_WEB_PORT", "8765"))
+SUPPORTED_INSTRUMENTS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
+OKX_BASE_URL = "https://www.okx.com"
+
+SESSIONS = set()
+MONITOR_PROCESS: subprocess.Popen = None
+MONITOR_STARTED_AT = ""
+MONITOR_LOG_START_AT = ""
+HISTORY_POINTS_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+
+
+CONFIG_FIELDS = [
+    ("基础运行", "interval", "number", "轮询间隔(秒)", "默认5秒执行一轮监控。"),
+    ("基础运行", "runtime", "number", "运行时长(秒)", "0表示一直运行，300表示运行5分钟。"),
+    ("基础运行", "flag", "choice", "OKX环境", "0正式环境，1模拟盘。"),
+    ("AI与推送", "ai_enabled", "checkbox", "启用AI分析", "触发信号后调用AI。"),
+    ("AI与推送", "dry_run_ai", "checkbox", "AI dry-run", "只生成AI请求数据，不真实调用AI。"),
+    ("AI与推送", "push_enabled", "checkbox", "启用微信推送", "满足信号和评分条件时发送微信机器人推送。"),
+    ("AI与推送", "push_score", "number", "推送分数阈值", "触发信号且评分达到该值才推送。"),
+    ("策略阈值", "volume_multiplier", "number", "放量倍数", "当前1m成交量超过20根均量的倍数。"),
+    ("策略阈值", "oi_change_pct_15m", "number", "15分钟OI变化%", "预热满15分钟后生效。"),
+    ("策略阈值", "funding_abs_threshold", "number", "资金费率过热阈值", "资金费率绝对值超过该值触发。"),
+    ("策略阈值", "funding_change_threshold", "number", "资金费率变化阈值", "预热满15分钟后生效。"),
+    ("策略阈值", "long_short_extreme", "number", "多空极端占比", "例如0.75表示75%。"),
+    ("网络与日志", "retry_times", "number", "重试次数", "OKX/AI/推送请求失败重试次数。"),
+    ("网络与日志", "retry_backoff", "number", "重试退避(秒)", "第N次失败等待 backoff * N 秒。"),
+    ("网络与日志", "push_cooldown_seconds", "number", "推送冷却(秒)", "同类信号冷却期内不重复推送。"),
+    ("网络与日志", "log_max_bytes", "number", "日志最大字节", "超过后轮转为.1文件。"),
+]
+
+ENV_FIELDS = [
+    ("OPENAI_API_KEY", "OpenAI API Key", "AI接口密钥。"),
+    ("AI_MODEL", "AI模型", "默认gpt-5.5，可改为更便宜模型。"),
+    ("WECHAT_WEBHOOK_URL", "微信机器人Webhook", "微信机器人地址。"),
+]
+
+
+def esc(value: Any) -> str:
+    return html.escape("" if value is None else str(value), quote=True)
+
+
+def active_config_file() -> Path:
+    return USER_CONFIG_FILE if USER_CONFIG_FILE.exists() else CONFIG_FILE
+
+
+def load_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def load_config() -> Dict[str, Any]:
+    return load_json(active_config_file(), {})
+
+
+def configured_instruments() -> List[str]:
+    inst_ids = load_config().get("inst_ids", [])
+    if isinstance(inst_ids, str):
+        inst_ids = [inst_ids]
+    return [inst for inst in inst_ids if inst in SUPPORTED_INSTRUMENTS]
+
+
+def save_config(config: Dict[str, Any]) -> Path:
+    text = json.dumps(config, indent=2, ensure_ascii=False) + "\n"
+    try:
+        CONFIG_FILE.write_text(text, encoding="utf-8")
+        if USER_CONFIG_FILE.exists():
+            USER_CONFIG_FILE.write_text(text, encoding="utf-8")
+        return CONFIG_FILE
+    except PermissionError:
+        USER_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        USER_CONFIG_FILE.write_text(text, encoding="utf-8")
+        return USER_CONFIG_FILE
+
+
+def load_auth() -> Dict[str, str]:
+    for path in (USER_AUTH_FILE, AUTH_FILE):
+        if path.exists():
+            return load_json(path, {"username": "admin", "password": "admin123"})
+    save_auth("admin", "admin123")
+    return {"username": "admin", "password": "admin123"}
+
+
+def save_auth(username: str, password: str) -> Path:
+    data = {"username": username.strip() or "admin", "password": password.strip() or "admin123"}
+    text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    try:
+        AUTH_FILE.write_text(text, encoding="utf-8")
+        return AUTH_FILE
+    except PermissionError:
+        USER_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        USER_AUTH_FILE.write_text(text, encoding="utf-8")
+        return USER_AUTH_FILE
+
+
+def load_env() -> Dict[str, str]:
+    env: Dict[str, str] = {}
+    for path in (ENV_FILE, USER_ENV_FILE):
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            env[key.strip()] = value.strip().strip('"').strip("'")
+    return env
+
+
+def save_env(env: Dict[str, str]) -> Path:
+    lines = [
+        "# OKX AI短线助手环境变量配置",
+        "",
+        f'OPENAI_API_KEY="{env.get("OPENAI_API_KEY", "")}"',
+        f'AI_MODEL="{env.get("AI_MODEL", "gpt-5.5")}"',
+        f'WECHAT_WEBHOOK_URL="{env.get("WECHAT_WEBHOOK_URL", "")}"',
+        "",
+    ]
+    text = "\n".join(lines)
+    try:
+        ENV_FILE.write_text(text, encoding="utf-8")
+        return ENV_FILE
+    except PermissionError:
+        USER_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        USER_ENV_FILE.write_text(text, encoding="utf-8")
+        return USER_ENV_FILE
+
+
+def parse_cookies(header: str) -> Dict[str, str]:
+    cookies = {}
+    for item in header.split(";"):
+        if "=" in item:
+            key, value = item.split("=", 1)
+            cookies[key.strip()] = value.strip()
+    return cookies
+
+
+def parse_bool(form: Dict[str, Any], key: str) -> bool:
+    return key in form
+
+
+def update_from_form(form: Dict[str, Any]) -> Path:
+    config = load_config()
+    env = load_env()
+    inst_ids = form.get("inst_ids", [])
+    if isinstance(inst_ids, str):
+        inst_ids = [inst_ids]
+    config["inst_ids"] = [item for item in inst_ids if item in SUPPORTED_INSTRUMENTS]
+    if not config["inst_ids"]:
+        raise ValueError("至少选择一个监控币种")
+
+    for _, key, kind, _, _ in CONFIG_FIELDS:
+        if kind == "checkbox":
+            config[key] = parse_bool(form, key)
+        elif kind == "choice":
+            config[key] = str(form.get(key, "0"))
+        else:
+            raw = str(form.get(key, "")).strip()
+            old = config.get(key)
+            config[key] = float(raw) if isinstance(old, float) or "." in raw else int(raw)
+
+    for key, _, _ in ENV_FIELDS:
+        env[key] = str(form.get(f"env_{key}", "")).strip()
+    save_config(config)
+    return save_env(env)
+
+
+def export_config_bundle(name: str = "") -> Dict[str, Any]:
+    return {"name": name or "OKX_AI_Config", "version": "1.0", "config": load_config(), "env": load_env()}
+
+
+def import_config_bundle(bundle: Dict[str, Any]) -> None:
+    config = bundle.get("config", bundle)
+    env = bundle.get("env", {})
+    if not isinstance(config, dict):
+        raise ValueError("配置文件格式错误")
+    save_config(config)
+    if isinstance(env, dict):
+        save_env(env)
+
+
+def build_child_env() -> Dict[str, str]:
+    child_env = os.environ.copy()
+    child_env["PYTHONUNBUFFERED"] = "1"
+    for key, value in load_env().items():
+        child_env[key] = value
+    return child_env
+
+
+def build_monitor_args(config: Dict[str, Any]) -> List[str]:
+    args = [
+        sys.executable,
+        str(SCRIPT_DIR / "monitor.py"),
+        "--inst-ids",
+        ",".join(config.get("inst_ids", [])),
+        "--interval",
+        str(config.get("interval", 5)),
+        "--runtime",
+        str(config.get("runtime", 0)),
+        "--flag",
+        str(config.get("flag", "0")),
+        "--push-score",
+        str(config.get("push_score", 80)),
+        "--retry-times",
+        str(config.get("retry_times", 3)),
+        "--retry-backoff",
+        str(config.get("retry_backoff", 1.5)),
+        "--push-cooldown",
+        str(config.get("push_cooldown_seconds", 900)),
+        "--log-max-bytes",
+        str(config.get("log_max_bytes", 10485760)),
+        "--volume-multiplier",
+        str(config.get("volume_multiplier", 2.0)),
+        "--oi-change-pct-15m",
+        str(config.get("oi_change_pct_15m", 5.0)),
+        "--funding-threshold",
+        str(config.get("funding_abs_threshold", 0.0008)),
+        "--funding-change-threshold",
+        str(config.get("funding_change_threshold", 0.0003)),
+        "--long-short-extreme",
+        str(config.get("long_short_extreme", 0.75)),
+    ]
+    if config.get("ai_enabled"):
+        args.append("--ai")
+    if config.get("dry_run_ai"):
+        args.append("--dry-run-ai")
+    if config.get("push_enabled"):
+        args.append("--push")
+    return args
+
+
+def monitor_status() -> Dict[str, Any]:
+    global MONITOR_PROCESS
+    if MONITOR_PROCESS is None:
+        return {"running": False, "text": "未启动", "started_at": ""}
+    code = MONITOR_PROCESS.poll()
+    if code is None:
+        return {"running": True, "text": f"运行中 PID={MONITOR_PROCESS.pid}", "started_at": MONITOR_STARTED_AT}
+    return {"running": False, "text": f"已停止，退出码={code}", "started_at": MONITOR_STARTED_AT}
+
+
+def start_monitor() -> str:
+    global MONITOR_PROCESS, MONITOR_STARTED_AT, MONITOR_LOG_START_AT, HISTORY_POINTS_CACHE
+    status = monitor_status()
+    if status["running"]:
+        return status["text"]
+    if not configured_instruments():
+        return "请先在配置页至少选择一个监控币种。"
+    MONITOR_STARTED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
+    MONITOR_LOG_START_AT = MONITOR_STARTED_AT
+    HISTORY_POINTS_CACHE = {}
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = MONITOR_PROCESS_LOG_FILE.open("a", encoding="utf-8")
+    log_file.write(f"\n===== monitor started at {MONITOR_STARTED_AT} =====\n")
+    log_file.flush()
+    MONITOR_PROCESS = subprocess.Popen(
+        build_monitor_args(load_config()),
+        cwd=str(SCRIPT_DIR),
+        env=build_child_env(),
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        creationflags=0,
+    )
+    return f"监控已启动，PID={MONITOR_PROCESS.pid}"
+
+
+def stop_monitor() -> str:
+    global MONITOR_PROCESS
+    status = monitor_status()
+    if not status["running"]:
+        return "监控未运行。"
+    MONITOR_PROCESS.terminate()
+    try:
+        MONITOR_PROCESS.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        MONITOR_PROCESS.kill()
+        MONITOR_PROCESS.wait(timeout=5)
+    return "监控已停止。"
+
+
+def post_json(url: str, payload: dict) -> str:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return response.read().decode("utf-8", errors="ignore")
+
+
+def get_quick_ticker(inst_id: str) -> Dict[str, Any]:
+    if inst_id not in SUPPORTED_INSTRUMENTS:
+        inst_id = "BTC-USDT-SWAP"
+    query = urllib.parse.urlencode({"instId": inst_id})
+    request = urllib.request.Request(
+        f"{OKX_BASE_URL}/api/v5/market/ticker?{query}",
+        headers={"Accept": "application/json", "User-Agent": "okx-ai-assistant-web/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=6) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+    data = payload.get("data") or []
+    item = data[0] if data else {}
+    price = float(item.get("last") or 0)
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    return {
+        "inst_id": inst_id,
+        "running": bool(monitor_status()["running"]),
+        "points": [{"time": now, "price": price}, {"time": now, "price": price}],
+        "price": price,
+        "change": 0,
+        "change_pct": 0,
+        "quick": True,
+    }
+
+
+def get_history_candle_points(inst_id: str, bar: str = "1m", limit: int = 120) -> List[Dict[str, Any]]:
+    if inst_id not in SUPPORTED_INSTRUMENTS:
+        inst_id = "BTC-USDT-SWAP"
+    query = urllib.parse.urlencode({"instId": inst_id, "bar": bar, "limit": str(limit)})
+    request = urllib.request.Request(
+        f"{OKX_BASE_URL}/api/v5/market/candles?{query}",
+        headers={"Accept": "application/json", "User-Agent": "okx-ai-assistant-web/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=8) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+    rows = payload.get("data") or []
+    points = []
+    for row in reversed(rows):
+        if not isinstance(row, list) or len(row) < 5:
+            continue
+        try:
+            points.append({
+                "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(row[0]) / 1000)),
+                "price": float(row[4]),
+                "kind": "history",
+            })
+        except (TypeError, ValueError):
+            continue
+    return points
+
+
+def get_cached_history_points(inst_id: str) -> List[Dict[str, Any]]:
+    if inst_id not in HISTORY_POINTS_CACHE:
+        HISTORY_POINTS_CACHE[inst_id] = get_history_candle_points(inst_id)
+    return list(HISTORY_POINTS_CACHE.get(inst_id, []))
+
+
+def merge_price_points(history_points: List[Dict[str, Any]], realtime_points: List[Dict[str, Any]], max_points: int) -> List[Dict[str, Any]]:
+    merged = []
+    index_by_time = {}
+    for point in history_points + realtime_points:
+        try:
+            price = float(point.get("price"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        key = str(point.get("time", ""))
+        normalized = dict(point)
+        normalized["time"] = key
+        normalized["price"] = price
+        if key and key in index_by_time:
+            merged[index_by_time[key]] = normalized
+            continue
+        if key:
+            index_by_time[key] = len(merged)
+        merged.append(normalized)
+    return merged[-max_points:]
+
+
+def point_from_log_item(item: Dict[str, Any], price: float) -> Dict[str, Any]:
+    score = item.get("score") if isinstance(item.get("score"), dict) else {}
+    volume = item.get("volume") if isinstance(item.get("volume"), dict) else {}
+    long_short = item.get("long_short_ratio") if isinstance(item.get("long_short_ratio"), dict) else {}
+    signals = item.get("signals") if isinstance(item.get("signals"), list) else []
+    return {
+        "time": item.get("time", ""),
+        "price": price,
+        "kind": "realtime",
+        "open_interest": item.get("open_interest"),
+        "oi_change_pct_15m": item.get("oi_change_pct_15m"),
+        "funding_rate": item.get("funding_rate"),
+        "funding_change": item.get("funding_change"),
+        "volume_multiplier": volume.get("multiplier"),
+        "volume_current": volume.get("current"),
+        "long_ratio": long_short.get("long_ratio"),
+        "short_ratio": long_short.get("short_ratio"),
+        "score": score.get("total_score"),
+        "direction": score.get("direction"),
+        "risk_level": score.get("risk_level"),
+        "signals": [signal.get("type", "") for signal in signals if isinstance(signal, dict)],
+    }
+
+
+def test_ai_connection() -> str:
+    env = build_child_env()
+    api_key = env.get("OPENAI_API_KEY", "")
+    model = env.get("AI_MODEL", "gpt-5.5")
+    if not api_key:
+        return "AI测试失败：OPENAI_API_KEY未配置。"
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        response = client.responses.create(model=model, input="请回复：AI接口连通性测试成功。")
+        return f"AI测试成功：{getattr(response, 'output_text', response)}"
+    except Exception as exc:
+        return f"AI测试失败：{exc}"
+
+
+def test_push_connection() -> str:
+    url = build_child_env().get("WECHAT_WEBHOOK_URL", "")
+    if not url:
+        return "推送测试失败：未配置微信机器人Webhook。"
+    try:
+        result = post_json(url, {"msgtype": "text", "text": {"content": "[OKX AI短线助手] 推送测试成功。"}})
+        return f"微信机器人成功：{result[:160]}"
+    except Exception as exc:
+        return f"微信机器人失败：{exc}"
+
+
+def tail_text(path: Path, max_bytes: int = 160000) -> str:
+    if not path.exists():
+        return ""
+    size = path.stat().st_size
+    with path.open("rb") as file:
+        if size > max_bytes:
+            file.seek(size - max_bytes)
+        return file.read().decode("utf-8", errors="replace")
+
+
+def monitor_log_text() -> str:
+    if not MONITOR_LOG_START_AT:
+        return "等待启动监控。本窗口只显示本次启动后的JSON分析日志。"
+    lines = []
+    for line in tail_text(MONITOR_JSON_LOG_FILE, 40 * 1024 * 1024).splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if str(item.get("time", "")) >= MONITOR_LOG_START_AT:
+            lines.append(line)
+    return "\n".join(lines) or "暂无本次启动后的JSON分析日志。"
+
+
+def read_monitor_points(inst_id: str, max_points: int = 20000) -> Dict[str, Any]:
+    realtime_points = []
+    running = bool(monitor_status()["running"])
+    for line in tail_text(MONITOR_JSON_LOG_FILE, 40 * 1024 * 1024).splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if item.get("inst_id") != inst_id:
+            continue
+        try:
+            price = float(item.get("price"))
+        except (TypeError, ValueError):
+            continue
+        if MONITOR_LOG_START_AT and str(item.get("time", "")) < MONITOR_LOG_START_AT:
+            continue
+        realtime_points.append(point_from_log_item(item, price))
+    realtime_points = realtime_points[-max_points:]
+    source = "log"
+    points = realtime_points
+    if running:
+        try:
+            history_points = get_cached_history_points(inst_id)
+            if history_points:
+                points = merge_price_points(history_points, realtime_points, max_points)
+                source = "history+log" if realtime_points else "history"
+        except Exception:
+            source = "log"
+    if len(points) == 1:
+        points.append({"time": points[0]["time"], "price": points[0]["price"]})
+    first = points[0]["price"] if points else 0
+    last = points[-1]["price"] if points else 0
+    change = last - first if points else 0
+    return {
+        "inst_id": inst_id,
+        "running": running,
+        "points": points,
+        "price": last,
+        "change": change,
+        "change_pct": (change / first * 100) if first else 0,
+        "source": source,
+    }
+
+
+def open_log_dir() -> str:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        if hasattr(os, "startfile"):
+            explorer = os.environ.get("WINDIR", r"C:\Windows") + r"\explorer.exe"
+            subprocess.Popen([explorer, str(LOG_DIR)])
+            subprocess.Popen(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    "Start-Sleep -Milliseconds 350; $shell = New-Object -ComObject WScript.Shell; $shell.AppActivate('logs') | Out-Null",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(LOG_DIR)])
+        else:
+            subprocess.Popen(["xdg-open", str(LOG_DIR)])
+        return f"已打开日志目录：{LOG_DIR}"
+    except Exception as exc:
+        raise RuntimeError(f"打开日志目录失败：{exc}") from exc
+
+
+def field_html(key: str, label: str, kind: str, help_text: str, value: Any) -> str:
+    if kind == "checkbox":
+        checked = "checked" if bool(value) else ""
+        control = f'<label class="switch"><input type="checkbox" name="{esc(key)}" value="1" {checked}><span></span></label>'
+    elif kind == "choice":
+        control = (
+            f'<select name="{esc(key)}">'
+            f'<option value="0" {"selected" if str(value) == "0" else ""}>0 正式环境</option>'
+            f'<option value="1" {"selected" if str(value) == "1" else ""}>1 模拟盘</option>'
+            "</select>"
+        )
+    else:
+        step = "any" if isinstance(value, float) else "1"
+        control = f'<input type="number" step="{step}" name="{esc(key)}" value="{esc(value)}">'
+    return f'<div class="field"><label>{esc(label)}</label><div>{control}<p>{esc(help_text)}</p></div></div>'
+
+
+def render_login(message: str = "") -> bytes:
+    notice = f'<div class="notice">{esc(message)}</div>' if message else ""
+    body = f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OKX AI Assistant Login</title>
+<style>
+*{{box-sizing:border-box}} body{{margin:0;min-height:100vh;overflow:hidden;display:grid;place-items:center;font-family:"Segoe UI","Microsoft YaHei",Arial,sans-serif;background:#020617;color:#f8fafc}}
+.earth-video{{position:fixed;inset:0;width:100%;height:100%;object-fit:cover;transform:scale(1.08);filter:saturate(1.32) contrast(1.12) brightness(1.08);opacity:.96}}
+.shade{{position:fixed;inset:0;background:linear-gradient(90deg,rgba(2,6,23,.62),rgba(15,23,42,.18) 48%,rgba(49,46,129,.38));pointer-events:none}}
+#login-bg{{position:fixed;inset:0;width:100%;height:100%;display:block}}
+.grid{{position:fixed;inset:0;background:linear-gradient(rgba(148,163,184,.08) 1px,transparent 1px),linear-gradient(90deg,rgba(148,163,184,.08) 1px,transparent 1px);background-size:46px 46px;pointer-events:none}}
+.box{{position:relative;z-index:3;width:min(440px,calc(100vw - 34px));background:rgba(15,23,42,.66);border:1px solid rgba(148,163,184,.32);border-radius:24px;padding:34px;box-shadow:0 28px 90px rgba(0,0,0,.42);backdrop-filter:blur(18px)}}
+h1{{margin:0 0 8px;font-size:28px}} p{{margin:0 0 24px;color:#cbd5e1}} label{{display:block;margin:16px 0 8px;font-weight:750}}
+input{{width:100%;padding:13px 14px;border-radius:14px;border:1px solid rgba(148,163,184,.35);background:rgba(15,23,42,.78);color:#fff;font-size:15px;outline:none}}
+button{{margin-top:22px;width:100%;border:0;border-radius:14px;padding:13px;background:linear-gradient(135deg,#60a5fa,#8b5cf6 58%,#14b8a6);color:white;font-weight:850;cursor:pointer}}
+.notice{{background:#fee2e2;color:#991b1b;border:1px solid #fecaca;padding:10px 12px;border-radius:12px;margin-bottom:14px}}
+</style></head><body>
+<video class="earth-video" autoplay muted loop playsinline preload="auto"><source src="/assets/earth_rotation.webm" type="video/webm"></video>
+<div class="shade"></div><canvas id="login-bg"></canvas><div class="grid"></div>
+<form class="box" method="post" action="/login"><h1>OKX AI Assistant</h1><p>请输入账号密码进入本地控制台。</p>{notice}
+<label>用户名</label><input name="username" autocomplete="username" value="admin"><label>密码</label><input type="password" name="password" autocomplete="current-password">
+<button type="submit">登录</button></form>
+<script>
+const c=document.getElementById('login-bg'),x=c.getContext('2d');let ps=[];
+function r(){{const d=window.devicePixelRatio||1;c.width=innerWidth*d;c.height=innerHeight*d;x.setTransform(d,0,0,d,0,0);ps=Array.from({{length:70}},()=>({{x:Math.random()*innerWidth,y:Math.random()*innerHeight,vx:(Math.random()-.5)*.35,vy:(Math.random()-.5)*.35}}));}}
+function a(){{x.clearRect(0,0,innerWidth,innerHeight);ps.forEach(p=>{{p.x+=p.vx;p.y+=p.vy;if(p.x<0)p.x=innerWidth;if(p.x>innerWidth)p.x=0;if(p.y<0)p.y=innerHeight;if(p.y>innerHeight)p.y=0;x.fillStyle='rgba(191,219,254,.7)';x.beginPath();x.arc(p.x,p.y,2,0,7);x.fill();}});requestAnimationFrame(a);}}
+addEventListener('resize',r);r();a();
+</script></body></html>"""
+    return body.encode("utf-8")
+
+
+def render_page(message: str = "") -> bytes:
+    config = load_config()
+    env = load_env()
+    auth = load_auth()
+    selected = set(config.get("inst_ids", []))
+    selected_instruments = [inst for inst in SUPPORTED_INSTRUMENTS if inst in selected]
+    monitor_initial = selected_instruments[0] if selected_instruments else ""
+    if selected_instruments:
+        monitor_tabs = "".join(
+            f'<button class="button coin-tab {"active" if index == 0 else ""}" type="button" data-monitor-inst="{inst}">{inst}</button>'
+            for index, inst in enumerate(selected_instruments)
+        )
+    else:
+        monitor_tabs = '<span class="empty-coin">请先在配置页选择监控币种</span>'
+    rows = []
+    rows.append('<section class="card hero-card page-section" data-page="config"><div><h2>配置币种</h2><p class="section-sub">选择本次需要监控的OKX永续合约。</p></div><div class="checks">')
+    for inst in SUPPORTED_INSTRUMENTS:
+        checked = "checked" if inst in selected else ""
+        rows.append(f'<label class="check-tile"><input type="checkbox" name="inst_ids" value="{inst}" {checked}><span>{inst}</span></label>')
+    rows.append("</div></section>")
+    current = ""
+    for section, key, kind, label, help_text in CONFIG_FIELDS:
+        if section != current:
+            if current:
+                rows.append("</section>")
+            current = section
+            rows.append(f'<section class="card page-section" data-page="config"><h2>{esc(section)}</h2>')
+        rows.append(field_html(key, label, kind, help_text, config.get(key)))
+    rows.append("</section>")
+    rows.append('<section class="card page-section" data-page="config"><h2>AI密钥与微信机器人</h2>')
+    for key, label, help_text in ENV_FIELDS:
+        value = env.get(key, "gpt-5.5" if key == "AI_MODEL" else "")
+        input_type = "password" if "KEY" in key else "text"
+        rows.append(f'<div class="field"><label>{esc(label)}</label><div><input type="{input_type}" name="env_{esc(key)}" value="{esc(value)}"><p>{esc(help_text)}</p></div></div>')
+    rows.append("</section>")
+
+    body = f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>OKX AI Assistant</title>
+<style>
+:root{{--bg:#f5f5f6;--panel:#fff;--text:#172033;--muted:#6b7a90;--line:#e1e8f0;--primary:#8b6cf6;--shadow:0 8px 26px rgba(15,23,42,.08)}}
+*{{box-sizing:border-box}} body{{margin:0;font-family:"Segoe UI","Microsoft YaHei",Arial,sans-serif;background:var(--bg);color:var(--text)}} .app{{min-height:100vh;display:grid;grid-template-columns:258px 1fr}}
+.sidebar{{position:sticky;top:0;height:100vh;background:#fff;border-right:1px solid #eceef3;padding:26px 16px;box-shadow:4px 0 24px rgba(15,23,42,.04)}} .brand{{display:flex;align-items:center;gap:10px;margin:0 0 24px;padding:0 8px;font-size:22px;font-weight:800;color:#201a38}} .logo{{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;color:#fff;background:linear-gradient(135deg,#ec4899,#8b5cf6 58%,#38bdf8)}}
+.nav-item{{display:flex;align-items:center;min-height:44px;padding:0 14px;border-radius:12px;color:#3c4050;text-decoration:none;font-weight:650;margin-bottom:6px}} .nav-item:hover{{background:#f1edff}} .nav-item.active{{background:#ddd5ff;color:#201a38;box-shadow:inset 4px 0 0 #8b6cf6}}
+.content{{min-width:0;min-height:100vh;padding:18px 22px 22px}} .page-panel,.page-section{{display:none}} .page-panel.active{{display:block}} .page-panel[data-page="monitor"].active{{height:100%}} .page-section.active{{display:grid}} .page-section.hero-card.active{{display:flex}}
+.card{{position:relative;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 22px;background:#fff;border:1px solid #edf0f5;border-radius:18px;padding:22px;margin-bottom:18px;box-shadow:var(--shadow)}} .card::before{{content:"";position:absolute;inset:0 0 auto;height:3px;background:linear-gradient(90deg,#8b6cf6,#60a5fa,transparent);opacity:.55}} .hero-card{{justify-content:space-between;align-items:center}} h2{{grid-column:1/-1;margin:0 0 4px;font-size:18px}} .section-sub{{margin:0;color:var(--muted);font-size:13px}}
+.field{{display:grid;grid-template-columns:160px minmax(160px,1fr);gap:6px 14px;align-items:center;min-height:74px;padding:12px 14px;border:1px solid var(--line);border-radius:14px;background:#fff}} .field p{{margin:0;color:var(--muted);font-size:12px}} label{{font-weight:650}} input[type=text],input[type=password],input[type=number],select{{width:100%;padding:11px 12px;border:1px solid #cbd7e5;border-radius:12px;outline:none;background:#fff;color:var(--text);font-size:14px}} input[type=checkbox]{{width:16px;height:16px;accent-color:var(--primary)}}
+.switch{{display:inline-flex;width:46px;height:26px;border-radius:999px;background:#cbd5e1;position:relative}} .switch input{{opacity:0}} .switch span{{position:absolute;width:20px;height:20px;left:3px;top:3px;border-radius:50%;background:white;box-shadow:0 2px 8px rgba(15,23,42,.22)}} .switch:has(input:checked){{background:linear-gradient(135deg,#8b6cf6,#5b8cff)}} .switch:has(input:checked) span{{transform:translateX(20px)}}
+.checks{{display:flex;gap:14px;flex-wrap:wrap}} .check-tile{{display:inline-flex;align-items:center;gap:9px;padding:13px 16px;border-radius:14px;background:#f8fafc;border:1px solid var(--line);cursor:pointer}} .check-tile:has(input:checked){{background:#efeaff;border-color:#a78bfa;color:#4c1d95}}
+.actions{{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap;position:sticky;bottom:0;margin-top:20px;padding:14px;border-radius:18px;background:rgba(255,255,255,.9);border:1px solid rgba(255,255,255,.9);box-shadow:var(--shadow);backdrop-filter:blur(12px)}} .action-group,.toolbar-right,.toolbar-left{{display:flex;align-items:center;gap:10px;flex-wrap:wrap}}
+button,.button{{border:0;border-radius:12px;padding:11px 16px;background:#f1f3f8;color:#263449;min-width:94px;justify-content:center;white-space:nowrap;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;font-size:14px;font-weight:650;transition:background .18s ease,color .18s ease,box-shadow .18s ease,transform .18s ease,opacity .18s ease}} button:disabled,.button.disabled{{cursor:not-allowed;opacity:.72}} .btn-save,.btn-log{{background:#ede9fe;color:#5b21b6}} .btn-run{{background:#dcfce7;color:#047857}} .btn-run.is-running{{background:linear-gradient(135deg,#10b981,#22c55e);color:#fff;box-shadow:0 10px 26px rgba(16,185,129,.28)}} .btn-run.is-starting{{background:linear-gradient(135deg,#60a5fa,#8b5cf6);color:#fff;box-shadow:0 10px 26px rgba(99,102,241,.25)}} .btn-danger{{background:#fee2e2;color:#b91c1c}} .btn-danger.is-ready{{background:#ef4444;color:#fff;box-shadow:0 10px 26px rgba(239,68,68,.22)}} .btn-test{{background:#e0f2fe;color:#0369a1}} .btn-view{{background:#f1f5f9;color:#334155}}
+.toolbar-card{{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:16px}} .toolbar-card::before{{display:none}} .coin-tabs{{display:inline-flex;gap:8px;padding:4px;border-radius:14px;background:#f1f5f9;border:1px solid #e2e8f0}} .coin-tab.active{{background:#8b6cf6;color:#fff}} .empty-coin{{display:inline-flex;align-items:center;padding:0 12px;color:#64748b;font-size:13px;font-weight:650}}
+.market-card{{background:#242424;border:1px solid #3a3a3a;border-radius:18px;margin:0;padding:18px 20px 16px;color:#f8fafc;box-shadow:0 12px 34px rgba(15,23,42,.16);overflow:hidden;height:calc(100vh - 40px);display:flex;flex-direction:column}} .monitor-card{{height:calc(100vh - 188px);min-height:520px}} .market-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:12px}} .market-title{{font-size:18px;font-weight:800;margin-bottom:4px}} .market-sub{{color:#a3a3a3;font-size:12px}} .market-price{{text-align:right}} .market-price strong{{display:block;font-size:24px;line-height:1.1}} .market-price span{{font-size:13px;color:#94a3b8}} .market-price.up span{{color:#22c55e}} .market-price.down span{{color:#fb7185}} .market-canvas-wrap{{position:relative;flex:1;min-height:0;border-top:1px solid #393939;background:linear-gradient(rgba(255,255,255,.055) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);background-size:100% 72px,72px 100%}} canvas{{width:100%;height:100%;display:block;cursor:crosshair}} .market-loading{{position:absolute;inset:0;display:grid;place-items:center;color:#a3a3a3;pointer-events:none}} .snapshot-panel{{position:absolute;left:16px;bottom:18px;z-index:2;min-width:230px;max-width:min(420px,calc(100% - 32px));padding:12px 14px;border-radius:14px;background:rgba(15,23,42,.78);border:1px solid rgba(148,163,184,.22);box-shadow:0 12px 28px rgba(0,0,0,.28);backdrop-filter:blur(10px);font-size:12px;color:#dbeafe;pointer-events:none}} .snapshot-panel strong{{display:block;color:#fff;font-size:13px;margin-bottom:6px}} .snapshot-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 12px}} .snapshot-grid span{{color:#9ca3af}} .snapshot-grid b{{font-weight:700;color:#e5e7eb}} .market-time-range{{margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.08);color:#a3a3a3;font-size:12px;display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}}
+.log-window{{width:100%;min-height:calc(100vh - 250px);resize:vertical;border:1px solid #dbe4ef;border-radius:16px;padding:16px;background:#0f172a;color:#d1fae5;font-family:Consolas,"Courier New",monospace;font-size:13px;line-height:1.55;white-space:pre}} .notice{{background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0;padding:13px 15px;border-radius:14px;margin-bottom:16px}}
+@media(max-width:860px){{.app{{grid-template-columns:1fr}}.sidebar{{position:relative;height:auto}}.card{{grid-template-columns:1fr}}.field{{grid-template-columns:1fr}}}}
+</style></head><body><div class="app"><aside class="sidebar"><div class="brand"><span class="logo">O</span><span>OKX AI</span></div>
+<a class="nav-item active" href="#monitor" data-page-link="monitor">监控</a><a class="nav-item" href="#config" data-page-link="config">配置</a><a class="nav-item" href="#logs" data-page-link="logs">日志</a><a class="nav-item" href="#tests" data-page-link="tests">测试</a><a class="nav-item" href="#settings" data-page-link="settings">设置</a>
+</aside><div class="content"><main>
+<form class="config-form" method="post" action="/save#config">{''.join(rows)}<div class="actions config-actions" data-page-actions="config"><div class="action-group"><button class="action-control btn-save" type="button" id="saveConfigBtn">保存配置</button><button class="action-control btn-save" type="button" id="importConfigBtn">导入配置</button><a class="button action-control btn-save" href="/config-json#config">查看配置</a></div></div></form>
+<form class="settings-form" method="post" action="/save-auth#settings"><section class="card page-panel" data-page="settings"><h2>登录账号</h2><div class="field"><label>用户名</label><div><input type="text" name="auth_username" value="{esc(auth.get("username","admin"))}"><p>Web控制台登录用户名。</p></div></div><div class="field"><label>新密码</label><div><input type="password" name="auth_password" placeholder="留空则不修改"><p>建议首次部署后立即修改默认密码。</p></div></div></section><div class="actions settings-actions" data-page-actions="settings"><div class="action-group"><button class="action-control btn-save" type="submit">保存账号密码</button><a class="button action-control btn-view" href="/logout">切换账号</a><a class="button action-control btn-danger" href="/logout">退出登录</a></div></div></form>
+<div class="page-panel active" data-page="monitor"><section class="card toolbar-card"><div><h2>实时监控</h2><p class="section-sub">未启动时显示虚拟行情；启动后读取真实监控日志，鼠标滚轮可缩放。</p></div><div class="toolbar-right"><div class="coin-tabs">{monitor_tabs}</div><button class="button btn-run action-control" type="button" id="startMonitorBtn">启动监控</button><button class="button btn-danger action-control" type="button" id="stopMonitorBtn">停止监控</button></div></section><section class="market-card monitor-card"><div class="market-head"><div><div class="market-title" id="monitorTitle">{esc(monitor_initial or "未配置币种")} 实时走势</div><div class="market-sub" id="monitorMeta">{esc("虚拟行情预览 · 启动监控后自动切换真实数据" if monitor_initial else "请先在配置页选择监控币种")}</div></div><div class="market-price" id="monitorPrice"><strong>--</strong><span>生成模拟行情</span></div></div><div class="market-canvas-wrap"><canvas id="monitorChart"></canvas><div class="market-loading" id="monitorLoading">正在生成虚拟走势...</div><div class="snapshot-panel" id="snapshotPanel"><strong>Snapshot</strong><div class="snapshot-grid"><span>价格</span><b>--</b><span>时间</span><b>--</b><span>评分</span><b>--</b><span>方向</span><b>--</b></div></div></div><div class="market-time-range"><span id="monitorPointCount">数据点：0</span></div></section></div>
+<div class="page-panel" data-page="logs"><section class="card toolbar-card"><div><h2>实时日志</h2><p class="section-sub">仅显示本次启动监控后的JSON分析日志。默认保存：{esc(MONITOR_JSON_LOG_FILE)}</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="refreshLogBtn">刷新日志</button><button class="button btn-log" type="button" id="openLogDirBtn">打开日志目录</button><button class="button btn-log" type="button" id="clearLogBtn">清除窗口</button></div></section><section class="card" style="display:block;"><textarea class="log-window" id="logWindow" readonly>正在加载日志...</textarea><div class="toolbar-card" style="margin:14px 0 0;box-shadow:none;"><div><h2>保存日志</h2><p class="section-sub" id="saveLogHint">点击后弹出文件另存为窗口，可手动选择位置并输入文件名。</p></div><button class="btn-save" type="button" id="saveLogBtn">另存为日志文件</button></div></section></div>
+<div class="page-panel" data-page="tests"><section class="card toolbar-card"><div><h2>连通性测试</h2><p class="section-sub">测试AI接口和微信机器人推送配置是否可用。</p></div><div class="toolbar-right"><a class="button action-control btn-test" href="/test-ai#tests">测试AI</a><a class="button action-control btn-test" href="/test-push#tests">测试微信推送</a></div></section></div>
+</main></div></div>
+<script>
+function currentPage() {{
+  return (location.hash || '#monitor').replace('#', '') || 'monitor';
+}}
+function showPage(page) {{
+  document.querySelectorAll('.page-panel, .page-section').forEach(function(section) {{
+    section.classList.toggle('active', section.getAttribute('data-page') === page);
+  }});
+  document.querySelectorAll('[data-page-link]').forEach(function(item) {{
+    item.classList.toggle('active', item.getAttribute('data-page-link') === page);
+  }});
+  const configForm = document.querySelector('.config-form');
+  const settingsForm = document.querySelector('.settings-form');
+  if (configForm) configForm.style.display = page === 'config' ? 'block' : 'none';
+  if (settingsForm) settingsForm.style.display = page === 'settings' ? 'block' : 'none';
+  document.querySelectorAll('[data-page-actions]').forEach(function(actions) {{
+    actions.style.display = actions.getAttribute('data-page-actions') === page ? 'flex' : 'none';
+  }});
+  if (page === 'logs') refreshLogs(false);
+  if (page === 'monitor') fetchMonitor(false);
+}}
+function encodeForm(form) {{
+  const params = new URLSearchParams();
+  new FormData(form).forEach(function(value, key) {{
+    params.append(key, value);
+  }});
+  return params.toString();
+}}
+async function postFormJson(url, form) {{
+  const response = await fetch(url, {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }},
+    body: encodeForm(form),
+    cache: 'no-store'
+  }});
+  const payload = await response.json();
+  if (!response.ok || payload.ok === false) throw new Error(payload.error || '请求失败');
+  return payload;
+}}
+function autoName() {{
+  const d = new Date();
+  const p = function(n) {{ return String(n).padStart(2, '0'); }};
+  return 'okx_ai_config_' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '_' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()) + '.json';
+}}
+const saveConfigBtn = document.getElementById('saveConfigBtn');
+if (saveConfigBtn) {{
+  saveConfigBtn.addEventListener('click', async function() {{
+    try {{
+      const payload = await postFormJson('/api/config/export', document.querySelector('.config-form'));
+      const text = JSON.stringify(payload.bundle, null, 2);
+      const name = autoName();
+      if (window.showSaveFilePicker) {{
+        const handle = await showSaveFilePicker({{
+          suggestedName: name,
+          types: [{{ description: 'OKX AI配置文件', accept: {{ 'application/json': ['.json'] }} }}]
+        }});
+        const writable = await handle.createWritable();
+        await writable.write(text);
+        await writable.close();
+      }} else {{
+        const blob = new Blob([text], {{ type: 'application/json;charset=utf-8' }});
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = name;
+        link.click();
+        URL.revokeObjectURL(url);
+      }}
+    }} catch (error) {{
+      alert('保存配置失败：' + error);
+    }}
+  }});
+}}
+const importConfigBtn = document.getElementById('importConfigBtn');
+if (importConfigBtn) {{
+  importConfigBtn.addEventListener('click', async function() {{
+    try {{
+      let file = null;
+      if (window.showOpenFilePicker) {{
+        const handles = await showOpenFilePicker({{
+          multiple: false,
+          types: [{{ description: 'OKX AI配置文件', accept: {{ 'application/json': ['.json'] }} }}]
+        }});
+        file = await handles[0].getFile();
+      }} else {{
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.json,application/json';
+        file = await new Promise(function(resolve) {{
+          input.onchange = function() {{ resolve(input.files && input.files[0]); }};
+          input.click();
+        }});
+      }}
+      if (!file) return;
+      const response = await fetch('/api/config/import', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: await file.text(),
+        cache: 'no-store'
+      }});
+      const payload = await response.json();
+      if (!response.ok || payload.ok === false) throw new Error(payload.error || '导入失败');
+      location.href = '/#config';
+      location.reload();
+    }} catch (error) {{
+      alert('导入配置失败：' + error);
+    }}
+  }});
+}}
+let virtualTick=0;
+const configuredMonitorInsts={json.dumps(selected_instruments, ensure_ascii=False)};
+let monitorInst={json.dumps(monitor_initial, ensure_ascii=False)}, monitorPayload=null, monitorLiveMode=false;
+let monitorViewStart=0, monitorViewEnd=1;
+let monitorVisiblePoints=[], monitorPlotPoints=[], monitorSelectedKey='', monitorLatestPoint=null;
+function gen(n,base){{let a=[],v=base,now=Date.now();for(let i=0;i<n;i++){{v+=(Math.random()-.48)*7+Math.sin((i+virtualTick)/12)*1.5;if(Math.random()>.96)v+=(Math.random()-.5)*30;a.push({{time:new Date(now-(n-i-1)*60000).toLocaleString(),price:v}});}}return a;}}
+function visiblePoints(points){{if(!points||points.length<2)return points||[];const s=Math.max(0,Math.floor(monitorViewStart*(points.length-1))),e=Math.min(points.length,Math.ceil(monitorViewEnd*(points.length-1))+1);return points.slice(s,Math.max(s+2,e));}}
+function fmt(v,d){{const n=Number(v);return Number.isFinite(n)?n.toFixed(d):'--';}}
+function fmtPct(v){{const n=Number(v);return Number.isFinite(n)?n.toFixed(4)+'%':'--';}}
+function shortTime(t){{if(!t)return '--';const s=String(t);return s.length>=16?s.slice(11,16):s;}}
+function compactTime(t){{if(!t)return '--';const s=String(t);return s.length>=16?s.slice(5,16):s;}}
+function updateChartFooter(points){{const c=document.getElementById('monitorPointCount');if(!c)return;c.textContent='数据点：'+((points&&points.length)||0);}}
+function snapshotHtml(point,title){{if(!point)return '<strong>Snapshot</strong><div class="snapshot-grid"><span>价格</span><b>--</b><span>时间</span><b>--</b><span>评分</span><b>--</b><span>方向</span><b>--</b></div>';const kind=point.kind==='history'?'历史K线':'实时快照';return '<strong>'+title+' · '+kind+'</strong><div class="snapshot-grid"><span>时间</span><b>'+compactTime(point.time)+'</b><span>价格</span><b>'+fmt(point.price,2)+'</b><span>评分</span><b>'+(point.score??'--')+'</b><span>方向</span><b>'+(point.direction||'--')+'</b><span>风险</span><b>'+(point.risk_level||'--')+'</b><span>OI</span><b>'+fmt(point.open_interest,2)+'</b><span>OI 15m</span><b>'+fmtPct(point.oi_change_pct_15m)+'</b><span>资金费率</span><b>'+fmt(point.funding_rate,6)+'</b><span>多头/空头</span><b>'+fmt(Number(point.long_ratio)*100,1)+'/'+fmt(Number(point.short_ratio)*100,1)+'%</b><span>放量倍数</span><b>'+fmt(point.volume_multiplier,2)+'</b></div>';}}
+function updateSnapshotPanel(point,title){{const panel=document.getElementById('snapshotPanel');if(panel)panel.innerHTML=snapshotHtml(point,title||'Snapshot');}}
+function drawTimeAxis(x,W,H,p,points,cw){{if(!points||points.length<2)return;const maxLabels=Math.max(2,Math.min(8,Math.floor(W/150))),step=Math.max(1,Math.floor((points.length-1)/(maxLabels-1)));x.fillStyle='rgba(229,231,235,.9)';x.font='12px Segoe UI, Microsoft YaHei, Arial';x.textAlign='center';x.textBaseline='top';for(let i=0;i<points.length;i+=step){{const px=p.l+cw*i/(points.length-1);x.fillText(shortTime(points[i].time),px,H-24);}}const lastIndex=points.length-1;if((lastIndex%step)!==0){{x.fillText(shortTime(points[lastIndex].time),W-p.r,H-24);}}}}
+function clearChartMessage(text){{const c=document.getElementById('monitorChart'),l=document.getElementById('monitorLoading'),p=document.getElementById('monitorPrice'),m=document.getElementById('monitorMeta'),t=document.getElementById('monitorTitle');monitorSelectedKey='';monitorVisiblePoints=[];monitorPlotPoints=[];monitorLatestPoint=null;if(c){{const r=c.getBoundingClientRect(),x=c.getContext('2d');c.width=Math.max(1,r.width);c.height=Math.max(1,r.height);x.clearRect(0,0,r.width,r.height);}}if(l){{l.style.display='grid';l.textContent=text;}}if(p)p.innerHTML='<strong>--</strong><span>无数据</span>';if(m)m.textContent=text;if(t)t.textContent='未配置币种';updateChartFooter([]);updateSnapshotPanel(null,'Snapshot');}}
+function drawChart(id,points,priceBox,metaBox,loading){{const c=document.getElementById(id);if(!c||!points||points.length<1)return;if(points.length===1)points=[points[0],{{time:points[0].time,price:points[0].price}}];monitorLatestPoint=points[points.length-1];points=visiblePoints(points);monitorVisiblePoints=points;updateChartFooter(points);if(loading)loading.style.display='none';const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=r.width*d;c.height=r.height*d;const x=c.getContext('2d');x.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,p={{l:28,r:44,t:18,b:58}},cw=W-p.l-p.r,ch=H-p.t-p.b,prices=points.map(q=>q.price),mn=Math.min(...prices),mx=Math.max(...prices),rg=Math.max(.01,mx-mn);monitorPlotPoints=[];x.clearRect(0,0,W,H);x.strokeStyle='rgba(255,255,255,.12)';for(let i=0;i<=4;i++){{const y=p.t+ch*i/4;x.beginPath();x.moveTo(p.l,y);x.lineTo(W-p.r,y);x.stroke();}}x.beginPath();points.forEach((q,i)=>{{const px=p.l+cw*i/(points.length-1),py=p.t+ch-((q.price-mn)/rg)*ch;monitorPlotPoints.push({{x:px,y:py,point:q}});if(i===0)x.moveTo(px,py);else x.lineTo(px,py);}});const up=points[points.length-1].price>=points[0].price;x.strokeStyle=up?'#22c55e':'#fb7185';x.lineWidth=2;x.stroke();x.fillStyle=up?'rgba(34,197,94,.08)':'rgba(251,113,133,.10)';x.lineTo(W-p.r,H-p.b);x.lineTo(p.l,H-p.b);x.closePath();x.fill();drawTimeAxis(x,W,H,p,points,cw);if(monitorSelectedKey){{const hit=monitorPlotPoints.find(o=>(o.point.time||'')===monitorSelectedKey);if(hit){{x.strokeStyle='rgba(255,255,255,.62)';x.setLineDash([4,5]);x.beginPath();x.moveTo(hit.x,p.t);x.lineTo(hit.x,H-p.b);x.stroke();x.setLineDash([]);x.fillStyle='#60a5fa';x.beginPath();x.arc(hit.x,hit.y,5,0,7);x.fill();updateSnapshotPanel(hit.point,'选中点');}}else{{monitorSelectedKey='';updateSnapshotPanel(monitorLatestPoint,'最新快照');}}}}if(priceBox){{const first=points[0].price,last=points[points.length-1].price,chg=last-first,pct=first?chg/first*100:0;priceBox.classList.toggle('up',chg>=0);priceBox.classList.toggle('down',chg<0);priceBox.innerHTML='<strong>'+last.toFixed(2)+'</strong><span>'+(chg>=0?'+':'')+chg.toFixed(2)+' / '+(pct>=0?'+':'')+pct.toFixed(2)+'%</span>';}}if(!monitorSelectedKey)updateSnapshotPanel(monitorLatestPoint,'最新快照');if(metaBox)metaBox.textContent='更新：'+new Date().toLocaleTimeString();}}
+function drawVirtualMonitor(){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}virtualTick++;const base=monitorInst==='ETH-USDT-SWAP'?3200:63000;drawChart('monitorChart',gen(260,base),document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));document.getElementById('monitorTitle').textContent=monitorInst+' 虚拟走势';}}
+function setMonitorButtonState(state,text){{const start=document.getElementById('startMonitorBtn'),stop=document.getElementById('stopMonitorBtn'),meta=document.getElementById('monitorMeta');if(!start||!stop)return;start.classList.remove('is-running','is-starting');stop.classList.remove('is-ready');if(state==='starting'){{start.classList.add('is-starting');start.textContent='启动中...';start.disabled=true;stop.textContent='停止监控';stop.disabled=true;if(meta)meta.textContent=text||'正在启动监控进程...';}}else if(state==='running'){{start.classList.add('is-running');start.textContent='监控运行中';start.disabled=true;stop.textContent='停止监控';stop.classList.add('is-ready');stop.disabled=false;if(meta&&text)meta.textContent=text;}}else{{start.textContent='启动监控';start.disabled=false;stop.textContent='停止监控';stop.disabled=true;if(meta&&text)meta.textContent=text;}}}}
+async function syncMonitorStatus(){{try{{const r=await fetch('/api/status',{{cache:'no-store'}}),p=await r.json();setMonitorButtonState(p.running?'running':'stopped',p.text||'');return p;}}catch(e){{return null;}}}}
+function showRealtimeWaiting(clearChart){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}monitorLiveMode=true;const c=document.getElementById('monitorChart'),l=document.getElementById('monitorLoading'),m=document.getElementById('monitorMeta'),t=document.getElementById('monitorTitle'),p=document.getElementById('monitorPrice');if(clearChart&&c){{const r=c.getBoundingClientRect(),x=c.getContext('2d');c.width=Math.max(1,r.width);c.height=Math.max(1,r.height);x.clearRect(0,0,r.width,r.height);updateChartFooter([]);}}if(l){{l.style.display=clearChart?'grid':'none';l.textContent='监控已启动，正在等待真实价格数据...';}}if(m)m.textContent=clearChart?'实时监控已启动 · 等待第一条价格数据':'已获取最新价 · 等待完整分析数据';if(t)t.textContent=monitorInst+' 实时走势';if(clearChart&&p)p.innerHTML='<strong>--</strong><span>等待真实数据</span>';}}
+async function fetchQuickTicker(){{try{{const r=await fetch('/api/ticker?inst_id='+encodeURIComponent(monitorInst),{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'ticker失败');if(p.points&&p.points.length>0){{drawChart('monitorChart',p.points,document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));document.getElementById('monitorTitle').textContent=monitorInst+' 实时走势';const m=document.getElementById('monitorMeta');if(m)m.textContent='已获取最新价 · 等待完整分析数据';}}}}catch(e){{showRealtimeWaiting(false);}}}}
+async function fetchMonitor(){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}try{{const r=await fetch('/api/monitor-data?inst_id='+encodeURIComponent(monitorInst),{{cache:'no-store'}}),p=await r.json();monitorPayload=p;if(!r.ok||p.ok===false){{clearChartMessage(p.error||'当前币种未配置，不能读取监控数据');return;}}if(p.running)monitorLiveMode=true;if(p.running&&p.points&&p.points.length>0){{drawChart('monitorChart',p.points,document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));document.getElementById('monitorTitle').textContent=monitorInst+(p.source==='history'?' 历史K线走势':' 实时走势');const m=document.getElementById('monitorMeta');if(m)m.textContent=p.source==='history'?'已加载历史K线 · 等待实时分析数据':'实时监控数据 · '+new Date().toLocaleTimeString();}}else if(monitorLiveMode){{showRealtimeWaiting(false);}}else{{drawVirtualMonitor();}}}}catch(e){{if(monitorLiveMode)showRealtimeWaiting(false);else drawVirtualMonitor();}}}}
+document.querySelectorAll('[data-monitor-inst]').forEach(b=>b.addEventListener('click',()=>{{const next=b.getAttribute('data-monitor-inst');if(configuredMonitorInsts.indexOf(next)<0)return;monitorInst=next;monitorViewStart=0;monitorViewEnd=1;document.querySelectorAll('[data-monitor-inst]').forEach(o=>o.classList.remove('active'));b.classList.add('active');fetchMonitor();}}));
+const startMonitorBtn=document.getElementById('startMonitorBtn');
+if(startMonitorBtn){{startMonitorBtn.addEventListener('click',async()=>{{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}setMonitorButtonState('starting','正在启动监控进程...');showRealtimeWaiting(true);try{{await fetch('/start#monitor',{{cache:'no-store'}});await syncMonitorStatus();fetchMonitor();}}catch(e){{setMonitorButtonState('stopped','启动监控失败');const l=document.getElementById('monitorLoading');if(l)l.textContent='启动监控失败：'+e;}}}});}}
+const stopMonitorBtn=document.getElementById('stopMonitorBtn');
+if(stopMonitorBtn){{stopMonitorBtn.addEventListener('click',async()=>{{stopMonitorBtn.textContent='停止中...';stopMonitorBtn.disabled=true;try{{await fetch('/stop#monitor',{{cache:'no-store'}});}}catch(e){{}}monitorLiveMode=false;monitorViewStart=0;monitorViewEnd=1;setMonitorButtonState('stopped','监控已停止，当前显示虚拟行情');stopMonitorBtn.textContent='停止监控';drawVirtualMonitor();}});}}
+let logCleared=false;async function refreshLogs(force){{const box=document.getElementById('logWindow');if(!box)return;if(logCleared&&!force)return;try{{const r=await fetch('/api/logs',{{cache:'no-store'}}),p=await r.json();logCleared=false;box.value=p.text||'暂无日志。';box.scrollTop=box.scrollHeight;}}catch(e){{box.value='日志读取失败：'+e;}}}}
+const refreshLogBtn = document.getElementById('refreshLogBtn');
+if (refreshLogBtn) refreshLogBtn.addEventListener('click', function() {{ refreshLogs(true); }});
+const clearLogBtn = document.getElementById('clearLogBtn');
+if (clearLogBtn) {{
+  clearLogBtn.addEventListener('click', function() {{
+    const box = document.getElementById('logWindow');
+    if (box) box.value = '';
+    logCleared = true;
+  }});
+}}
+const openLogDirBtn = document.getElementById('openLogDirBtn');
+if (openLogDirBtn) {{
+  openLogDirBtn.addEventListener('click', async function() {{
+    try {{
+      const response = await fetch('/api/open-log-dir', {{ cache: 'no-store' }});
+      const payload = await response.json();
+      if (!response.ok || payload.ok === false) throw new Error(payload.error || '打开失败');
+    }} catch (error) {{
+      alert('打开日志目录失败：' + error);
+    }}
+  }});
+}}
+const saveLogBtn = document.getElementById('saveLogBtn');
+if (saveLogBtn) {{
+  saveLogBtn.addEventListener('click', async function() {{
+    try {{
+      const response = await fetch('/api/logs', {{ cache: 'no-store' }});
+      const payload = await response.json();
+      const text = payload.text || '';
+      const hint = document.getElementById('saveLogHint');
+      if (window.showSaveFilePicker) {{
+        const handle = await showSaveFilePicker({{
+          suggestedName: 'okx_ai_monitor_json.log',
+          types: [{{ description: '日志文件', accept: {{ 'text/plain': ['.log', '.txt'] }} }}]
+        }});
+        const writable = await handle.createWritable();
+        await writable.write(text);
+        await writable.close();
+        if (hint) hint.textContent = '已另存为：' + (handle.name || '用户选择的日志文件') + '。浏览器安全限制不会暴露完整本地路径。';
+      }} else {{
+        const blob = new Blob([text], {{ type: 'text/plain;charset=utf-8' }});
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'okx_ai_monitor_json.log';
+        link.click();
+        URL.revokeObjectURL(url);
+        if (hint) hint.textContent = '已触发下载：okx_ai_monitor_json.log。';
+      }}
+    }} catch (error) {{
+      alert('保存日志失败：' + error);
+    }}
+  }});
+}}
+const monitorCanvas=document.getElementById('monitorChart');
+if(monitorCanvas){{monitorCanvas.addEventListener('wheel',function(event){{event.preventDefault();const rect=monitorCanvas.getBoundingClientRect(),focus=Math.min(1,Math.max(0,(event.clientX-rect.left)/Math.max(1,rect.width))),span=monitorViewEnd-monitorViewStart,zoom=(event.deltaY<0?0.82:1.22),newSpan=Math.min(1,Math.max(.06,span*zoom)),center=monitorViewStart+span*focus;let ns=center-newSpan*focus,ne=ns+newSpan;if(ns<0){{ne-=ns;ns=0;}}if(ne>1){{ns-=ne-1;ne=1;}}monitorViewStart=Math.max(0,ns);monitorViewEnd=Math.min(1,ne);fetchMonitor();}},{{passive:false}});monitorCanvas.addEventListener('click',function(event){{if(!monitorPlotPoints.length)return;const rect=monitorCanvas.getBoundingClientRect(),x=event.clientX-rect.left,y=event.clientY-rect.top;let best=null,bestDist=Infinity;monitorPlotPoints.forEach(o=>{{const dx=o.x-x,dy=o.y-y,dist=Math.sqrt(dx*dx+dy*dy);if(dist<bestDist){{best=o;bestDist=dist;}}}});if(best&&bestDist<34){{monitorSelectedKey=best.point.time||'';updateSnapshotPanel(best.point,'选中点');fetchMonitor();}}else{{monitorSelectedKey='';updateSnapshotPanel(monitorLatestPoint,'最新快照');fetchMonitor();}}}});}}
+window.addEventListener('resize',()=>{{if(currentPage()==='monitor')fetchMonitor();}});setInterval(()=>{{if(currentPage()==='monitor'){{syncMonitorStatus();fetchMonitor();}}}},1000);setInterval(()=>{{if(currentPage()==='logs')refreshLogs(false);}},3000);window.addEventListener('hashchange',()=>showPage(currentPage()));syncMonitorStatus();showPage(currentPage());
+</script></body></html>"""
+    return body.encode("utf-8")
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+    def is_authenticated(self) -> bool:
+        return parse_cookies(self.headers.get("Cookie", "")).get("okx_ai_session") in SESSIONS
+
+    def send_html(self, content: bytes) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def send_json(self, payload: Dict[str, Any], status: int = 200) -> None:
+        content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def redirect(self, location: str, cookie: str = "") -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.end_headers()
+
+    def send_asset(self, request_path: str) -> None:
+        name = urllib.parse.unquote(request_path.removeprefix("/assets/"))
+        asset_path = (ASSETS_DIR / name).resolve()
+        try:
+            asset_path.relative_to(ASSETS_DIR.resolve())
+        except ValueError:
+            self.send_error(403)
+            return
+        if not asset_path.is_file():
+            self.send_error(404)
+            return
+        content = asset_path.read_bytes()
+        content_type = mimetypes.guess_type(str(asset_path))[0] or "application/octet-stream"
+        if asset_path.suffix.lower() == ".webm":
+            content_type = "video/webm"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        self.wfile.write(content)
+
+    def do_GET(self) -> None:
+        path = urllib.parse.urlparse(self.path).path
+        if path.startswith("/assets/"):
+            self.send_asset(path)
+            return
+        if path == "/login":
+            self.send_html(render_login())
+            return
+        if path == "/logout":
+            token = parse_cookies(self.headers.get("Cookie", "")).get("okx_ai_session")
+            if token in SESSIONS:
+                SESSIONS.remove(token)
+            self.redirect("/login", "okx_ai_session=; Path=/; Max-Age=0; HttpOnly")
+            return
+        if not self.is_authenticated():
+            self.redirect("/login")
+            return
+        if path == "/":
+            self.send_html(render_page())
+        elif path == "/api/status":
+            self.send_json(monitor_status())
+        elif path == "/api/monitor-data":
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            inst_id = params.get("inst_id", ["BTC-USDT-SWAP"])[0]
+            configured = configured_instruments()
+            if inst_id not in configured:
+                self.send_json({"ok": False, "error": f"{inst_id} 未在配置中启用，不能读取监控数据。", "configured": configured}, status=400)
+                return
+            self.send_json(read_monitor_points(inst_id))
+        elif path == "/api/ticker":
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            inst_id = params.get("inst_id", ["BTC-USDT-SWAP"])[0]
+            configured = configured_instruments()
+            if inst_id not in configured:
+                self.send_json({"ok": False, "error": f"{inst_id} 未在配置中启用。", "configured": configured}, status=400)
+                return
+            try:
+                self.send_json(get_quick_ticker(inst_id))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=502)
+        elif path == "/api/logs":
+            self.send_json({"text": monitor_log_text(), "running": bool(monitor_status()["running"]), "default_path": str(MONITOR_JSON_LOG_FILE), "start_at": MONITOR_LOG_START_AT})
+        elif path == "/api/open-log-dir":
+            try:
+                self.send_json({"ok": True, "message": open_log_dir(), "path": str(LOG_DIR)})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc), "path": str(LOG_DIR)}, status=500)
+        elif path == "/config-json":
+            content = f"<pre>{esc(active_config_file().read_text(encoding='utf-8-sig'))}</pre>".encode("utf-8")
+            self.send_html(content)
+        elif path == "/start":
+            self.send_html(render_page(start_monitor()))
+        elif path == "/stop":
+            self.send_html(render_page(stop_monitor()))
+        elif path == "/test-ai":
+            self.send_html(render_page(test_ai_connection()))
+        elif path == "/test-push":
+            self.send_html(render_page(test_push_connection()))
+        else:
+            self.send_error(404)
+
+    def do_POST(self) -> None:
+        path = urllib.parse.urlparse(self.path).path
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length).decode("utf-8")
+        if path == "/api/config/import":
+            if not self.is_authenticated():
+                self.send_json({"ok": False, "error": "未登录"}, status=401)
+                return
+            try:
+                import_config_bundle(json.loads(raw or "{}"))
+                self.send_json({"ok": True})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        form = {key: values if len(values) > 1 else values[0] for key, values in urllib.parse.parse_qs(raw).items()}
+        if path == "/login":
+            auth = load_auth()
+            if form.get("username") == auth.get("username") and form.get("password") == auth.get("password"):
+                token = secrets.token_urlsafe(32)
+                SESSIONS.add(token)
+                self.redirect("/", f"okx_ai_session={token}; Path=/; HttpOnly; SameSite=Lax")
+            else:
+                self.send_html(render_login("用户名或密码错误。"))
+            return
+        if not self.is_authenticated():
+            self.redirect("/login")
+            return
+        if path == "/api/config/export":
+            try:
+                update_from_form(form)
+                self.send_json({"ok": True, "bundle": export_config_bundle()})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        if path == "/save-auth":
+            auth = load_auth()
+            username = str(form.get("auth_username", auth.get("username", "admin"))).strip() or "admin"
+            password = str(form.get("auth_password", "")).strip() or auth.get("password", "admin123")
+            save_auth(username, password)
+            self.send_html(render_page())
+            return
+        try:
+            env_path = update_from_form(form)
+        except Exception as exc:
+            self.send_html(render_page(f"保存失败：{exc}"))
+            return
+        if path == "/save-and-run":
+            self.send_html(render_page(f"配置已保存，{start_monitor()}。"))
+        else:
+            note = "" if env_path == ENV_FILE else f" 密钥已保存到用户目录：{env_path}"
+            self.send_html(render_page(f"配置已保存。{note}"))
+
+
+def main() -> int:
+    try:
+        server = ThreadingHTTPServer((HOST, PORT), Handler)
+    except OSError as exc:
+        print(f"配置页面启动失败: {exc}")
+        print(f"可能是端口 {PORT} 被占用。可以设置 CONFIG_WEB_PORT 后重试。")
+        return 1
+    url = f"http://{HOST}:{PORT}"
+    print(f"配置页面已启动: {url}")
+    print("如果浏览器没有自动打开，请手动访问该地址；按 Ctrl+C 停止。")
+    if HOST in ("127.0.0.1", "localhost"):
+        threading = __import__("threading")
+        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n配置页面已停止。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

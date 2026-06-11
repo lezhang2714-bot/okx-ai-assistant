@@ -7,9 +7,6 @@ Scope:
     - Provide analysis and suggestions only.
     - No auto order, no martingale, no grid.
 
-Install:
-    pip install python-okx
-
 Optional AI:
     pip install openai
     export OPENAI_API_KEY="..."
@@ -46,10 +43,9 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 try:
     import okx.MarketData as MarketData
     import okx.PublicData as PublicData
-except ImportError as exc:
-    print("Missing dependency: python-okx. Install it with: pip install python-okx")
-    raise SystemExit(1) from exc
-
+except ImportError:
+    MarketData = None
+    PublicData = None
 
 # AI短线助手V1的固定范围：只做BTC/ETH USDT永续，不做现货和其他币种。
 SUPPORTED_INSTRUMENTS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
@@ -78,7 +74,9 @@ CACHE_TTL_SECONDS = {
 }
 
 # 日志使用JSON Lines格式，一行一条分析记录，便于后续导入数据库或做回测统计。
-LOG_FILE = Path(__file__).with_name("okx_ai_monitor.log")
+# 默认保存到运行目录下的logs目录，便于交付后集中查看、备份和清理。
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+LOG_FILE = LOG_DIR / "okx_ai_monitor.log"
 
 
 @dataclass
@@ -167,7 +165,7 @@ def http_get_json(
     retry_times: int = DEFAULT_RETRY_TIMES,
     retry_backoff: float = DEFAULT_RETRY_BACKOFF_SECONDS,
 ) -> Dict[str, Any]:
-    # python-okx没有覆盖所有Rubik统计接口，所以多空比这里直接用标准库请求。
+    # 标准库REST兜底：当python-okx未安装或SDK调用失败时，仍可继续采集公共行情。
     def request() -> Dict[str, Any]:
         query = urllib.parse.urlencode(params)
         url = f"{OKX_BASE_URL}{path}?{query}"
@@ -190,6 +188,15 @@ def http_get_json(
             return json.loads(response.read().decode("utf-8"))
 
     return retry_call(path, request, retry_times, retry_backoff)
+
+
+def okx_public_get(
+    path: str,
+    params: Dict[str, str],
+    retry_times: int = DEFAULT_RETRY_TIMES,
+    retry_backoff: float = DEFAULT_RETRY_BACKOFF_SECONDS,
+) -> Dict[str, Any]:
+    return http_get_json(path, params, retry_times, retry_backoff)
 
 
 def http_post_json(
@@ -334,10 +341,10 @@ class OkxAiShortTermAssistant:
         self.config = config
         self.runtime_config = runtime_config
 
-        # OKX官方SDK接口：
-        # MarketData负责价格和K线，PublicData负责OI、资金费率等公共合约数据。
-        self.market_api = MarketData.MarketAPI(flag=flag)
-        self.public_api = PublicData.PublicAPI(flag=flag)
+        # 优先使用OKX官方python-okx SDK；未安装时自动使用标准库REST兜底。
+        # 这样交付时可以选择“SDK稳定优先”，也可以在极简环境里先跑通。
+        self.market_api = MarketData.MarketAPI(flag=flag) if MarketData else None
+        self.public_api = PublicData.PublicAPI(flag=flag) if PublicData else None
 
         # OI和资金费率需要计算“15分钟内变化”，所以本地保存最近一段时间的采样值。
         # maxlen=240在5秒轮询下大约可保存20分钟数据。
@@ -352,31 +359,29 @@ class OkxAiShortTermAssistant:
         self.last_push_at: Dict[str, float] = {}
 
     def collect_snapshot(self, inst_id: str) -> Dict[str, Any]:
-        # 每轮对一个币种生成一份完整快照snapshot。
-        # 后面的信号检测、评分、AI Prompt和日志都只依赖这个结构，方便后续替换数据源。
-
-        # 获取最新价、买一价、卖一价。
+        # 获取当前时刻的成交价、买入挂单价、卖出挂单价。
         ticker = self._get_ticker(inst_id)
 
-        # 每个周期取21根K线：当前K线 + 最近20根，用于计算均量和趋势。
+        # 获取k线，返回字典：key是哪个k线周期，数据是数组，包含当前周期下的21根K线的数据结构，
+        # 一个结构包含：时间戳、开盘价、最高价、最低价、收盘价、成交量、是否收盘标记（当前k线还是历史k线）
         candles = {bar: self._get_candles(inst_id, bar) for bar in BAR_CHANNELS}
 
-        # 获取当前成交量取、均量。
+        # 参照1m周期k线计算成交量数据；返回一个结构，包含当前成交量、历史20根K线的平均成交量、放量倍数（当前/平均）。
         volume = self._volume_stats(candles["1m"])
 
-        # 获取合约OI持仓量。
+        # 获取当前合约的OI持仓量。返回的就是一个OI值
         open_interest = self._get_open_interest(inst_id)
 
-        # 获取合约资金费率。
+        # 获取当前合约的资金费率。返回的就是一个资金费率值
         funding_rate = self._get_funding_rate(inst_id)
 
-        # 获取多空比
+        # 获取当前5m周期内的多空比，并换算成百分比；返回一个结构，包含：多空比、多头百分比、空头百分比、是否有效
         long_short = self._get_long_short_ratio(inst_id)
 
-        # 记录当前OI和资金费率，用于下一轮计算15分钟变化。
+        # 记录当前OI和资金费率，240次存储的循环队列，5s轮询可以存储大约15min。
         self._remember_metric(self.oi_history[inst_id], open_interest)
         self._remember_metric(self.funding_history[inst_id], funding_rate)
-
+        
         return {
             "time": now_text(),
             "inst_id": inst_id,
@@ -386,9 +391,12 @@ class OkxAiShortTermAssistant:
             "candles": candles,
             "volume": volume,
             "open_interest": open_interest,
+            # 获取这15m内的OI变化率，计算百分比，就是当前oi / 15m前的oi 的百分比
             "oi_change_pct_15m": self._change_pct_last_minutes(self.oi_history[inst_id], 15),
+            # 数据是否满足15min的要求，预热是否完成
             "oi_warmup_ready": self._history_ready(self.oi_history[inst_id], WARMUP_MINUTES),
             "funding_rate": funding_rate,
+            # 资金费率相对于15Min前的变化量，就是当前资金费率 - 15Min前的资金费率
             "funding_change": self._change_last_minutes(self.funding_history[inst_id], 15),
             "funding_warmup_ready": self._history_ready(self.funding_history[inst_id], WARMUP_MINUTES),
             "long_short_ratio": long_short,
@@ -404,30 +412,30 @@ class OkxAiShortTermAssistant:
         funding_rate = snapshot["funding_rate"]
         funding_change = snapshot["funding_change"]
         oi_change = snapshot["oi_change_pct_15m"]
-
+        
         if volume["multiplier"] >= self.config.volume_multiplier:
-            # 放量通常代表短时间交易活跃度提高，但方向需要结合K线和OI判断。
+            # 放量倍数判断：放量通常代表短时间交易活跃度提高，但方向需要结合K线和OI判断。
             signals.append({
                 "type": "volume_spike",
                 "desc": f"1m volume multiplier {volume['multiplier']:.2f}x",
             })
 
         if snapshot.get("oi_warmup_ready") and abs(oi_change) >= self.config.oi_change_pct_15m:
-            # OI变化表示合约持仓量变化，配合价格可以判断新开仓或平仓压力。
+            # 持仓率判断：OI变化表示合约持仓量变化，配合价格可以判断新开仓或平仓压力。
             signals.append({
                 "type": "oi_change",
                 "desc": f"15m OI change {oi_change:.2f}%",
             })
 
         if abs(funding_rate) >= self.config.funding_abs_threshold:
-            # 资金费率过热说明多空某一侧过于拥挤，追单风险会提高。
+            # 当前资金费率判断：资金费率过热说明多空某一侧过于拥挤，追单风险会提高。
             signals.append({
                 "type": "funding_hot",
                 "desc": f"funding rate {funding_rate:.6f}",
             })
 
         if snapshot.get("funding_warmup_ready") and abs(funding_change) >= self.config.funding_change_threshold:
-            # 资金费率快速变化代表市场情绪在短时间内切换。
+            # 当前资金费率变化量判断：资金费率快速变化代表市场情绪在短时间内切换。
             signals.append({
                 "type": "funding_fast_change",
                 "desc": f"15m funding change {funding_change:.6f}",
@@ -644,34 +652,47 @@ class OkxAiShortTermAssistant:
             "analysis": analysis,
         }
         self._rotate_log_if_needed()
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
         with LOG_FILE.open("a", encoding="utf-8") as file:
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def run_once(self) -> None:
-        # 单轮执行：遍历所有支持币种，完成采集、检测、评分、分析、推送、日志。
+        # 定时执行：遍历所有支持币种，完成数据采集、阈值检测、综合评分、AI分析、微信推送、日志存储等全部功能。
         for inst_id in self.instruments:
             try:
-                # 采集所有基础数据的快照
+                # 采集当前币种基础数据快照,包括：
+                # 当前时间戳、币种、当前成交价、买入挂单价、卖出挂单价、21条k线、1m成交量、oi、oi变化率、资金费率、费率变化量、多空比
                 snapshot = self.collect_snapshot(inst_id)
-                # 检测异常信号，通过阈值判断是否有关注的信号产生
+
+                # 阈值检测，通过阈值判断是否有用户关注的信号产生:信号格式为多个type和desc
+                # {
+                #     "type": "volume_spike",
+                #     "desc": "1m volume multiplier 3.21x"
+                # }
+                # 放量倍数、持仓率、资金费率、资金费率变化量、多头占比、空头占比
+                # 返回是一个数组，有信号变化就加入数组，没有信号产生，数组就是空
                 signals = self.detect_signals(snapshot)
-                # 计算综合评分
+
+                # 通过信号产生情况计算评分，若无关注信号产生则评分为0
                 score = self.score_snapshot(snapshot, signals)
 
-                # 只有触发信号才调用AI；否则用本地规则输出简要分析，节省AI成本。
+                # 有信号产生则进行AI分析，节省AI成本；否则，进行本地分析（本地阈值检测时分析出来的结果）
                 analysis = self.analyze_with_ai(snapshot, signals, score) if signals else self._local_analysis(snapshot, signals, score)
 
-                # 打印终端摘要
+                # 快照、信号、评分、分析结果打印到控制台
                 self._print_console(snapshot, signals, score, analysis)
-                # 推送判断与处理
+
+                # 微信推送判断与处理
                 self.push_if_needed(snapshot, signals, score, analysis)
-                # 记录JSON日志
+                
+                # 记录JSON日志到文件
                 self.log_result(snapshot, signals, score, analysis)
+
             except Exception as exc:
                 print(f"[{now_text()}] {inst_id} collect/analyze failed: {exc}")
 
     def run_forever(self, runtime: int) -> None:
-        # 主循环：默认永久运行；runtime>0时，到指定秒数自动退出。
+        # 主循环：默认永久运行；runtime>0时，到指定秒数自动退出，用于实现定时任务。
         started = time.time()
         while True:
             self.run_once()
@@ -690,7 +711,7 @@ class OkxAiShortTermAssistant:
         return value
 
     def _okx_call(self, label: str, func: Any) -> Any:
-        # OKX SDK调用统一套重试，降低临时网络故障影响。
+        # OKX HTTP调用统一套重试，降低临时网络故障影响。
         return retry_call(
             label,
             func,
@@ -698,19 +719,41 @@ class OkxAiShortTermAssistant:
             self.runtime_config.retry_backoff,
         )
 
+    def _sdk_or_rest(self, label: str, sdk_func: Any, rest_func: Any) -> Any:
+        # 优先走官方SDK；如果SDK不可用或调用失败，自动降级到REST兜底。
+        if sdk_func:
+            try:
+                return self._okx_call(f"{label}-sdk", sdk_func)
+            except Exception as exc:
+                print(f"[{now_text()}] {label} SDK failed, fallback to REST: {exc}")
+        return self._okx_call(f"{label}-rest", rest_func)
+
     def _get_ticker(self, inst_id: str) -> Dict[str, float]:
-        # 获取最新价、买一价、卖一价。
+        # 为避免API访问频繁，用缓存记录，在配置的有效时间段内返回缓存数据，否则才去API重新获取。
         response = self._cached(
             f"ticker:{inst_id}",
             CACHE_TTL_SECONDS["ticker"],
-            lambda: self._okx_call("ticker", lambda: self.market_api.get_ticker(instId=inst_id)),
+            lambda: self._sdk_or_rest(
+                "ticker",
+                (lambda: self.market_api.get_ticker(instId=inst_id)) if self.market_api else None,
+                lambda: okx_public_get(
+                    "/api/v5/market/ticker",
+                    {"instId": inst_id},
+                    self.runtime_config.retry_times,
+                    self.runtime_config.retry_backoff,
+                ),
+            ),
         )
+
+        # API返回结构如下：code(是否成功)、msg（描述）、data（实际数据），接口只获取data
         data = okx_data(response)
+
+        # API返回的是数组,你可以一次性查多个币种，一个数组返回所有结果，这里取第一个，因为只查一个。
         item = data[0] if data else {}
         return {
-            "last": to_float(item.get("last")),
-            "bid_px": to_float(item.get("bidPx")),
-            "ask_px": to_float(item.get("askPx")),
+            "last": to_float(item.get("last")),     #成交价
+            "bid_px": to_float(item.get("bidPx")),  #买入挂单价
+            "ask_px": to_float(item.get("askPx")),  #卖出挂单价
         }
 
     def _get_candles(self, inst_id: str, bar: str) -> List[Dict[str, Any]]:
@@ -718,12 +761,21 @@ class OkxAiShortTermAssistant:
         response = self._cached(
             f"candles:{inst_id}:{bar}",
             CACHE_TTL_SECONDS["candles"],
-            lambda: self._okx_call(
+            lambda: self._sdk_or_rest(
                 f"candles-{bar}",
-                lambda: self.market_api.get_candlesticks(instId=inst_id, bar=bar, limit="21"),
+                (lambda: self.market_api.get_candlesticks(instId=inst_id, bar=bar, limit="21")) if self.market_api else None,
+                lambda: okx_public_get(
+                    "/api/v5/market/candles",
+                    {"instId": inst_id, "bar": bar, "limit": "21"},
+                    self.runtime_config.retry_times,
+                    self.runtime_config.retry_backoff,
+                ),
             ),
         )
         data = okx_data(response)
+
+        # API返回的是21条k线数据，一个数组返回，这里通过for循环遍历21条生成一个返回数组结构
+        # 一个结构包含：时间戳、开盘价、最高价、最低价、收盘价、成交量、是否收盘标记（当前k线还是历史k线）
         return [candle_to_dict(row) for row in data if isinstance(row, list)]
 
     def _get_open_interest(self, inst_id: str) -> float:
@@ -731,9 +783,15 @@ class OkxAiShortTermAssistant:
         response = self._cached(
             f"open_interest:{inst_id}",
             CACHE_TTL_SECONDS["open_interest"],
-            lambda: self._okx_call(
+            lambda: self._sdk_or_rest(
                 "open-interest",
-                lambda: self.public_api.get_open_interest(instType="SWAP", instId=inst_id),
+                (lambda: self.public_api.get_open_interest(instType="SWAP", instId=inst_id)) if self.public_api else None,
+                lambda: okx_public_get(
+                    "/api/v5/public/open-interest",
+                    {"instType": "SWAP", "instId": inst_id},
+                    self.runtime_config.retry_times,
+                    self.runtime_config.retry_backoff,
+                ),
             ),
         )
         data = okx_data(response)
@@ -745,18 +803,25 @@ class OkxAiShortTermAssistant:
         response = self._cached(
             f"funding_rate:{inst_id}",
             CACHE_TTL_SECONDS["funding_rate"],
-            lambda: self._okx_call(
+            lambda: self._sdk_or_rest(
                 "funding-rate",
-                lambda: self.public_api.get_funding_rate(instId=inst_id),
+                (lambda: self.public_api.get_funding_rate(instId=inst_id)) if self.public_api else None,
+                lambda: okx_public_get(
+                    "/api/v5/public/funding-rate",
+                    {"instId": inst_id},
+                    self.runtime_config.retry_times,
+                    self.runtime_config.retry_backoff,
+                ),
             ),
         )
         data = okx_data(response)
+
+        # API返回的是数组，可以同时获取多个币种的资金费率，这里取第一个
         item = data[0] if data else {}
         return to_float(item.get("fundingRate"))
 
     def _get_long_short_ratio(self, inst_id: str) -> Dict[str, float]:
-        # 获取多空账户比。OKX返回的是long/short ratio，
-        # 这里换算成多头占比和空头占比，便于判断是否超过75%。
+        # 获取当前5m周期内的多空比，并换算成百分比；
         try:
             response = self._cached(
                 f"long_short_ratio:{inst_id}",
@@ -1166,6 +1231,7 @@ class OkxAiShortTermAssistant:
         # 简单日志轮转：超过大小就把当前日志替换为 .1。
         # 生产版可以接入logrotate或保留多份历史文件。
         try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
             if not LOG_FILE.exists() or LOG_FILE.stat().st_size < self.runtime_config.log_max_bytes:
                 return
             backup = LOG_FILE.with_suffix(LOG_FILE.suffix + ".1")
@@ -1208,7 +1274,7 @@ def parse_instruments(value: str) -> List[str]:
 
 
 def parse_args() -> argparse.Namespace:
-    # 命令行参数也都可以用环境变量替代，方便服务器部署。
+    # 命令行参数 > 环境变量 > 程序默认。
     parser = argparse.ArgumentParser(description="OKX AI short-term trading assistant V1")
     parser.add_argument(
         "--inst-ids",
@@ -1232,6 +1298,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--funding-threshold", type=float, default=env_float("FUNDING_ABS_THRESHOLD", 0.0008))
     parser.add_argument("--funding-change-threshold", type=float, default=env_float("FUNDING_CHANGE_THRESHOLD", 0.0003))
     parser.add_argument("--long-short-extreme", type=float, default=env_float("LONG_SHORT_EXTREME", 0.75))
+
+    # add_argument只是向实例中注册参数，parse_args才是真正解析命令行参数的地方。会优先检测py执行时有没有传入参数，没有才会使用default；
     return parser.parse_args()
 
 
