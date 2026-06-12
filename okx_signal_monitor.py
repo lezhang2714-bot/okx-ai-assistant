@@ -1193,7 +1193,7 @@ class OkxAiShortTermAssistant:
         # 如果没有开启AI、没有安装openai包、没有配置Key或请求失败，都会回退到本地规则分析。
         if not self.ai_enabled:
             return self._local_analysis(snapshot, signals, score)
-
+        
         if self.dry_run_ai:
             # dry-run用于调试：可以看到发给AI的数据，但不会产生真实API费用。
             payload = self._ai_payload(snapshot, signals, score)
@@ -1202,7 +1202,7 @@ class OkxAiShortTermAssistant:
                 "content": "AI dry-run enabled. Payload prepared but not sent.",
                 "payload": payload,
             }
-
+           
         try:
             from openai import OpenAI
         except ImportError:
@@ -1211,31 +1211,34 @@ class OkxAiShortTermAssistant:
                 "content": "openai package is not installed; fallback to local analysis.",
                 "fallback": self._local_analysis(snapshot, signals, score),
             }
+        
+        api_key = os.getenv("AI_API_KEY","sk-aefc7a633ce3471ab1acaccaa9814ce3") or os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("AI_BASE_URL", "https://api.deepseek.com")
+        model = os.getenv("AI_MODEL", "deepseek-flash")
 
-        api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             return {
                 "provider": "local",
-                "content": "OPENAI_API_KEY is not configured; fallback to local analysis.",
+                "content": "AI_API_KEY or OPENAI_API_KEY is not configured; fallback to local analysis.",
                 "fallback": self._local_analysis(snapshot, signals, score),
-            }
-
-        client = OpenAI(api_key=api_key)
-        model = os.getenv("AI_MODEL", DEFAULT_AI_MODEL)
+            }   
+        
+        client = OpenAI(api_key=api_key, base_url=base_url)
         prompt = self._ai_prompt(snapshot, signals, score)
-
+    
         try:
-            # 使用OpenAI Responses API，让AI基于结构化行情数据输出中文分析。
-            response = client.responses.create(
+            # 使用 Chat Completions API，兼容 OpenAI 和 DeepSeek。
+            response = client.chat.completions.create(
                 model=model,
-                input=prompt,
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
             )
-            output_text = getattr(response, "output_text", str(response))
+    
+            output_text = response.choices[0].message.content
             parsed = extract_json_object(output_text)
             valid, errors = self._validate_ai_result(parsed)
             return {
-                "provider": "openai",
+                "provider": "deepseek" if "deepseek" in base_url else "openai",
                 "model": model,
                 "content": output_text,
                 "parsed": parsed,
@@ -1244,6 +1247,8 @@ class OkxAiShortTermAssistant:
                 "fallback": None if valid else self._local_analysis(snapshot, signals, score),
             }
         except Exception as exc:
+            print(f"[{now_text()}] AI request failed: {exc}")
+        
             return {
                 "provider": "local",
                 "content": f"AI request failed: {exc}; fallback to local analysis.",
@@ -1350,10 +1355,10 @@ class OkxAiShortTermAssistant:
                 snapshot["signal_tracking"] = self.update_signal_tracking(snapshot, signals, score)
 
                 # 有信号产生则进行AI分析，节省AI成本；否则，进行本地分析（本地分析结果封装成AI返回格式）
-                analysis = self.analyze_with_ai(snapshot, signals, score) if signals else self._local_analysis(snapshot, signals, score)
-
+                # analysis = self.analyze_with_ai(snapshot, signals, score) if signals else self._local_analysis(snapshot, signals, score)
+                analysis = self.analyze_with_ai(snapshot, signals, score)
                 # 快照、信号、评分、分析结果打印到控制台
-                # self._print_console(snapshot, signals, score, analysis)
+                self._print_console(snapshot, signals, score, analysis)
 
                 # 微信推送判断与处理：有信号 and 80分以上 and 功能使能 才会推送
                 self.push_if_needed(snapshot, signals, score, analysis)
