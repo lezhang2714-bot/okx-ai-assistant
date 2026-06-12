@@ -54,6 +54,7 @@ SUPPORTED_INSTRUMENTS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
 # 1m/3m负责入场节奏，5m/15m负责短线方向，1H/4H负责上级环境。
 # 这里保留1m、5m、15m、1H这些旧字段，同时新增3m和4H，保证历史日志、AI prompt和Web展示兼容。
 BAR_CHANNELS = ("1m", "3m", "5m", "15m", "1H", "4H")
+KLINE_LIMIT = 200
 DEFAULT_INTERVAL_SECONDS = 5
 DEFAULT_PUSH_SCORE = 80
 DEFAULT_AI_MODEL = "gpt-5.5"
@@ -63,6 +64,12 @@ DEFAULT_RETRY_BACKOFF_SECONDS = 1.5
 DEFAULT_PUSH_COOLDOWN_SECONDS = 900
 DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024
 WARMUP_MINUTES = 15
+HISTORY_RETENTION_MINUTES = 180
+METRIC_SAMPLE_INTERVAL_SECONDS = 60
+
+# 资金/OI/动态阈值按约1分钟保存一个有效样本，180分钟约180个点。
+# maxlen多留余量，兼容用户把轮询间隔调低、未来把部分指标改为更高频采样的情况。
+METRIC_HISTORY_MAXLEN = HISTORY_RETENTION_MINUTES * 3
 
 # 不同类型数据使用不同缓存时间，降低OKX REST请求量，减少限频风险。
 # ticker仍保持接近5秒刷新；K线、OI、资金费率、多空比可以低频更新。
@@ -527,9 +534,11 @@ def trend_profile_from_candles(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
     # 原因是短线交易里，同样是上涨，可能是稳定趋势、放量突破、尾端加速或高波动震荡，入场方式完全不同。
     rows = confirmed_candles(candles)
     closes = [to_float(item.get("close")) for item in rows]
+
+    # 判断K线质量，从这组k线中计算出来在指标是否可靠
     data_quality = {
-        "confirmed_count": len(rows),
-        "ema120_ready": len(rows) >= 120,
+        "confirmed_count": len(rows),        # k线个数
+        "ema120_ready": len(rows) >= 120,    # EMA120是否可靠
         "macd_ready": len(rows) >= 35,
         "adx_ready": len(rows) >= 28,
         "rsi_ready": len(rows) >= 25,
@@ -561,23 +570,36 @@ def trend_profile_from_candles(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     latest = closes[0]
     previous = closes[min(4, len(closes) - 1)]
+
+    # 计算各个EMA
     ema9 = ema(closes[:40], 9)
     fast = ema(closes[:80], 20)
     slow = ema(closes[:120], 60)
     ema120 = ema(closes[:120], 120)
     ma120 = sma(closes[:120], 120)
+
+    # 平均真实波动幅度，判断市场是否平静
     atr_value = atr(rows, 14)
+
+    # 最近20k线的价格最高点/最低点
     points = structure_points(rows[1:], 20)
     recent_high = points["recent_high"]
     recent_low = points["recent_low"]
+
+    # 最近5根k线的涨跌百分比
     slope_pct = pct_change(latest, previous)
+
+    # k线实体占比
     body_ratio = candle_body_ratio(rows[0])
+
     rsi_values = {"6": rsi(closes, 6), "14": rsi(closes, 14), "24": rsi(closes, 24)}
     macd_values = macd(closes)
     kdj_values = kdj(rows)
     boll_values = bollinger(closes)
     adx_values = adx(rows)
     divergence = detect_rsi_divergence(rows, rsi_values["14"])
+
+    # 当前价格是否突破最近的结构高点/低点
     breakout = "none"
     if recent_high and latest > recent_high:
         breakout = "up"
@@ -726,13 +748,17 @@ class OkxAiShortTermAssistant:
         self.market_api = MarketData.MarketAPI(flag=flag) if MarketData else None
         self.public_api = PublicData.PublicAPI(flag=flag) if PublicData else None
 
-        # OI和资金费率需要计算“15分钟内变化”，所以本地保存最近一段时间的采样值。
-        # maxlen=240在5秒轮询下大约可保存20分钟数据。
-        self.oi_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=240))
-        self.funding_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=240))
-        self.volume_multiplier_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=720))
-        self.atr_pct_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=720))
-        self.book_imbalance_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=720))
+        # OI、资金费率和动态阈值需要看“时间窗口”，不是看轮询次数。
+        # 旧版5秒轮询每次都写样本，会把60秒缓存数据重复写12次，分位数会被重复值稀释。
+        # 现在统一按约1分钟记录一个有效样本，并保留约3小时窗口：
+        # 1. 15m变化判断有足够完整的前后数据；
+        # 2. 动态阈值不只受最近二三十分钟影响；
+        # 3. 仍然保持内存很小，适合Windows本地长期运行。
+        self.oi_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=METRIC_HISTORY_MAXLEN))
+        self.funding_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=METRIC_HISTORY_MAXLEN))
+        self.volume_multiplier_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=METRIC_HISTORY_MAXLEN))
+        self.atr_pct_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=METRIC_HISTORY_MAXLEN))
+        self.book_imbalance_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=METRIC_HISTORY_MAXLEN))
 
         # REST缓存用于降低请求量。例如OI、资金费率、多空比不必每5秒都请求。
         # key -> (timestamp, value)
@@ -752,7 +778,7 @@ class OkxAiShortTermAssistant:
         # 获取当前时刻的成交价、买入挂单价、卖出挂单价。
         ticker = self._get_ticker(inst_id)
 
-        # 获取k线，返回字典：key是哪个k线周期，数据是数组，包含当前周期下的21根K线的数据结构，
+        # 获取k线，返回字典：key是哪个k线周期，数据是数组，包含当前周期下最近KLINE_LIMIT根K线的数据结构，
         # 一个结构包含：时间戳、开盘价、最高价、最低价、收盘价、成交量、是否收盘标记（当前k线还是历史k线）
         candles = {bar: self._get_candles(inst_id, bar) for bar in BAR_CHANNELS}
 
@@ -772,14 +798,20 @@ class OkxAiShortTermAssistant:
         # 订单簿变化很快，所以只作为入场确认和风险修正，不单独决定方向。
         order_book = self._get_order_book(inst_id)
 
-        # 记录当前OI和资金费率，240次存储的循环队列，5s轮询可以存储大约15min。
-        self._remember_metric(self.oi_history[inst_id], open_interest)
-        self._remember_metric(self.funding_history[inst_id], funding_rate)
+        # 记录当前OI和资金费率。API本身60秒缓存，按分钟写样本即可，避免重复采样污染15m变化和分位数。
+        self._remember_metric(self.oi_history[inst_id], open_interest, METRIC_SAMPLE_INTERVAL_SECONDS)
+        self._remember_metric(self.funding_history[inst_id], funding_rate, METRIC_SAMPLE_INTERVAL_SECONDS)
 
         oi_change_pct_15m = self._change_pct_last_minutes(self.oi_history[inst_id], 15)
         funding_change_15m = self._change_last_minutes(self.funding_history[inst_id], 15)
+
+        # 计算K线走势
         profiles = {bar: trend_profile_from_candles(rows) for bar, rows in candles.items()}
+
+        # 计算波动强度：高中低，便于后续判断止损止盈区间
         volatility = self._volatility_context(inst_id, profiles)
+
+        # 动态阈值调整：每个币种根据自己的历史来调整阈值
         dynamic_thresholds = self._dynamic_thresholds(inst_id)
         market_context = self._market_context(
             price=ticker.get("last", 0.0),
@@ -796,9 +828,9 @@ class OkxAiShortTermAssistant:
             dynamic_thresholds=dynamic_thresholds,
         )
 
-        self._remember_metric(self.volume_multiplier_history[inst_id], volume["multiplier"])
-        self._remember_metric(self.atr_pct_history[inst_id], volatility["atr_pct_15m"])
-        self._remember_metric(self.book_imbalance_history[inst_id], order_book.get("imbalance", 0.0))
+        self._remember_metric(self.volume_multiplier_history[inst_id], volume["multiplier"], METRIC_SAMPLE_INTERVAL_SECONDS)
+        self._remember_metric(self.atr_pct_history[inst_id], volatility["atr_pct_15m"], METRIC_SAMPLE_INTERVAL_SECONDS)
+        self._remember_metric(self.book_imbalance_history[inst_id], order_book.get("imbalance", 0.0), METRIC_SAMPLE_INTERVAL_SECONDS)
 
         return {
             "time": now_text(),
@@ -822,6 +854,8 @@ class OkxAiShortTermAssistant:
             "trend_profiles": profiles,
             "volatility": volatility,
             "dynamic_thresholds": dynamic_thresholds,
+
+            # 参考阈值：当动态阈值采样不够时的参考
             "instrument_profile": self._instrument_profile(inst_id),
             "market_context": market_context,
         }
@@ -1655,17 +1689,17 @@ class OkxAiShortTermAssistant:
         }
 
     def _get_candles(self, inst_id: str, bar: str) -> List[Dict[str, Any]]:
-        # 每个周期取120根K线：当前K线 + 足够多的历史K线。
-        # 旧版只取21根，足够计算均量但不足以判断EMA、ATR、结构高低点和分位数环境。
+        # 每个周期取KLINE_LIMIT根K线：当前K线 + 足够多的历史K线。
+        # 200根能让EMA120/MA120在去掉未收盘K线后仍保持稳定，同时给MACD/ADX/ATR留下缓冲。
         response = self._cached(
             f"candles:{inst_id}:{bar}",
             CACHE_TTL_SECONDS["candles"],
             lambda: self._sdk_or_rest(
                 f"candles-{bar}",
-                (lambda: self.market_api.get_candlesticks(instId=inst_id, bar=bar, limit="120")) if self.market_api else None,
+                (lambda: self.market_api.get_candlesticks(instId=inst_id, bar=bar, limit=str(KLINE_LIMIT))) if self.market_api else None,
                 lambda: okx_public_get(
                     "/api/v5/market/candles",
-                    {"instId": inst_id, "bar": bar, "limit": "120"},
+                    {"instId": inst_id, "bar": bar, "limit": str(KLINE_LIMIT)},
                     self.runtime_config.retry_times,
                     self.runtime_config.retry_backoff,
                 ),
@@ -1673,7 +1707,7 @@ class OkxAiShortTermAssistant:
         )
         data = okx_data(response)
 
-        # API返回的是21条k线数据，一个数组返回，这里通过for循环遍历21条生成一个返回数组结构
+        # API返回的是K线数组，这里通过for循环遍历生成统一结构。
         # 一个结构包含：时间戳、开盘价、最高价、最低价、收盘价、成交量、是否收盘标记（当前k线还是历史k线）
         return [candle_to_dict(row) for row in data if isinstance(row, list)]
 
@@ -1797,17 +1831,28 @@ class OkxAiShortTermAssistant:
     def _volume_stats(self, candles_1m: List[Dict[str, Any]]) -> Dict[str, float]:
         # 成交量判断改为优先使用“最近已收盘1m K线”。
         # 如果直接使用未收盘K线，开盘几秒会低估，临近收盘又可能突然误报，导致放量信号不稳定。
+
+        # 过滤KLINE_LIMIT根中的已收盘K线
         rows = confirmed_candles(candles_1m)
+
+        # 取最新k线的成交量
         current = rows[0]["volume"] if rows else 0.0
+        # 提取历史成交量的和
         previous = [item["volume"] for item in rows[1:21]]
+        # 计算平均成交量
         average = sum(previous) / len(previous) if previous else 0.0
+        # 计算放量倍数
         multiplier = current / average if average > 0 else 0.0
+
         latest = rows[0] if rows else {}
+        # 判断最新的K线方向：阳线、阴线、平盘
         direction = "up" if to_float(latest.get("close")) > to_float(latest.get("open")) else ("down" if to_float(latest.get("close")) < to_float(latest.get("open")) else "flat")
         recent = [item["volume"] for item in rows[:5]]
         older = [item["volume"] for item in rows[5:10]]
         recent_avg = sum(recent) / len(recent) if recent else 0.0
         older_avg = sum(older) / len(older) if older else 0.0
+
+        # 判断趋势：上涨、下跌、平盘；通过最近5根K线和前5根k线的平均成交量判断，如果变化超过15%则判断为上涨、下跌，否则平盘
         trend = "rising" if recent_avg > older_avg * 1.15 and older_avg > 0 else ("falling" if recent_avg < older_avg * 0.85 and older_avg > 0 else "flat")
         return {
             "current": current,
@@ -1820,9 +1865,19 @@ class OkxAiShortTermAssistant:
             "source": "confirmed_1m",
         }
 
-    def _remember_metric(self, history: Deque[Tuple[float, float]], value: float) -> None:
+    def _remember_metric(self, history: Deque[Tuple[float, float]], value: float, min_interval_seconds: int = 0) -> None:
         # 保存一条时间序列采样，格式为(timestamp, value)。
-        history.append((time.time(), value))
+        # min_interval_seconds用于避免5秒轮询把同一个60秒缓存值重复写十几次。
+        # 如果距离上次采样还很近，就更新最后一个样本的值，但保留原始采样时间，不追加新点：
+        # - 最新值仍然能参与当前一轮计算；
+        # - 历史队列不会被重复值撑满；
+        # - 15m/1H这类按时间寻找旧值的逻辑仍然准确。
+        now_ts = time.time()
+        numeric_value = to_float(value)
+        if history and min_interval_seconds > 0 and now_ts - history[-1][0] < min_interval_seconds:
+            history[-1] = (history[-1][0], numeric_value)
+            return
+        history.append((now_ts, numeric_value))
 
     def _history_values(self, history: Deque[Tuple[float, float]]) -> List[float]:
         # 只取数值部分，供动态阈值和分位数计算使用。
