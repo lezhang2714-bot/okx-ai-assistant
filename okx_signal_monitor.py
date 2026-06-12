@@ -13,10 +13,8 @@ Optional AI:
     export AI_MODEL="gpt-5.5"
 
 Optional push:
-    export TELEGRAM_BOT_TOKEN="..."
-    export TELEGRAM_CHAT_ID="..."
-    export WECOM_WEBHOOK_URL="..."
-    export WECHAT_WEBHOOK_URL="..."
+    export WECHAT_SEND_KEY="..."
+    # Server酱 SendKey，可在 Web 控制面板配置
 
 Production tuning:
     export RETRY_TIMES=3
@@ -665,6 +663,38 @@ def symbol_ccy(inst_id: str) -> str:
     return inst_id.split("-")[0]
 
 
+def clip_push_text(value: Any, limit: int = 200) -> str:
+    text = "" if value is None else str(value).strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def display_push_value(value: Any, fallback: Any = None) -> str:
+    text = "" if value is None else str(value).strip()
+    if text in ("", "-", "None"):
+        fallback_text = "" if fallback is None else str(fallback).strip()
+        if fallback_text and fallback_text not in ("-", "None"):
+            return fallback_text
+        return "-"
+    return text
+
+
+SIGNAL_TYPE_LABELS = {
+    "volume_spike": "放量",
+    "structure_break": "结构突破",
+    "boll_squeeze": "布林挤压",
+    "rsi_divergence": "RSI背离",
+    "rsi_extreme": "RSI极端",
+    "macd_momentum_change": "MACD动量",
+    "oi_change": "OI异动",
+    "funding_hot": "资金费率过热",
+    "funding_fast_change": "费率快变",
+    "long_short_extreme": "多空极端",
+    "order_book_imbalance": "盘口失衡",
+}
+
+
 def compact_candles(candles: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
     # 给AI看的K线证据：保留最近limit根的时间、OHLC、成交量、是否确认。
     # 这样AI可以独立复核趋势和放量，而不是只相信程序给出的结论。
@@ -1284,9 +1314,13 @@ class OkxAiShortTermAssistant:
             self.last_push_at[push_key] = time.time()
             return
 
-        self._push_telegram(message)
-        self._push_webhook(os.getenv("WECOM_WEBHOOK_URL"), message)
-        self._push_webhook(os.getenv("WECHAT_WEBHOOK_URL"), message)
+        send_key = os.getenv("WECHAT_SEND_KEY", "").strip()
+        if not send_key:
+            print(f"[{now_text()}] WeChat push skipped: WECHAT_SEND_KEY is not configured")
+            self.last_push_at[push_key] = time.time()
+            return
+
+        self._push_wechat(send_key, snapshot, signals, score, analysis, push_kind)
         self.last_push_at[push_key] = time.time()
 
     def log_result(
@@ -1355,10 +1389,11 @@ class OkxAiShortTermAssistant:
                 snapshot["signal_tracking"] = self.update_signal_tracking(snapshot, signals, score)
 
                 # 有信号产生则进行AI分析，节省AI成本；否则，进行本地分析（本地分析结果封装成AI返回格式）
-                # analysis = self.analyze_with_ai(snapshot, signals, score) if signals else self._local_analysis(snapshot, signals, score)
-                analysis = self.analyze_with_ai(snapshot, signals, score)
+                analysis = self.analyze_with_ai(snapshot, signals, score) if signals else self._local_analysis(snapshot, signals, score)
+                # analysis = self.analyze_with_ai(snapshot, signals, score)
+                print(f"[{now_text()}] {inst_id} analysis by {analysis.get('provider')}: {analysis.get('content')}")
                 # 快照、信号、评分、分析结果打印到控制台
-                self._print_console(snapshot, signals, score, analysis)
+                # self._print_console(snapshot, signals, score, analysis)
 
                 # 微信推送判断与处理：有信号 and 80分以上 and 功能使能 才会推送
                 self.push_if_needed(snapshot, signals, score, analysis)
@@ -2455,8 +2490,11 @@ class OkxAiShortTermAssistant:
         payload = self._ai_payload(snapshot, signals, score)
         return (
             "你是欧易OKX USDT永续合约短线交易分析助手，只分析BTC-USDT-SWAP和ETH-USDT-SWAP。"
-            "你的任务是根据实时行情、多周期K线、EMA/MA/RSI/MACD/KDJ/BOLL/ADX/ATR结构画像、成交量、OI、资金费率、多空比、订单簿和本地规则评分，"
-            "先审计程序规则结果是否可信，再输出短线交易观察建议。\n\n"
+            # "你的任务是根据实时行情、多周期K线、EMA/MA/RSI/MACD/KDJ/BOLL/ADX/ATR结构画像、成交量、OI、资金费率、多空比、订单簿和本地规则评分，"
+            "你的任务是根据实时行情、多周期K线、EMA/MA/RSI/MACD/KDJ/BOLL/ADX/ATR结构画像、成交量、OI、资金费率、多空比、订单簿，"
+            ""
+            # "先审计程序规则结果是否可信，再输出短线交易观察建议。\n\n"
+            "直接忽略本地规则，独立根据原始数据和规则触发的信号来判断市场状态和交易机会。\n\n"
             "硬性限制：\n"
             "1. 只提供分析和风险提示，不允许表示系统会自动下单。\n"
             "2. 不允许承诺收益，不允许使用稳赚、必涨、必跌等确定性表述。\n"
@@ -2543,6 +2581,146 @@ class OkxAiShortTermAssistant:
         }
         return {"provider": "local-rule", "content": content}
 
+    def _resolve_push_analysis(
+        self,
+        analysis: Dict[str, Any],
+        score: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        # 推送优先使用 AI 有效 JSON；无效时回退 fallback/local-rule，再补 score 字段。
+        payload: Optional[Dict[str, Any]] = None
+        if analysis.get("valid_json") and isinstance(analysis.get("parsed"), dict):
+            payload = analysis["parsed"]
+        elif isinstance(analysis.get("fallback"), dict) and isinstance(analysis["fallback"].get("content"), dict):
+            payload = analysis["fallback"]["content"]
+        elif analysis.get("provider") == "local-rule" and isinstance(analysis.get("content"), dict):
+            payload = analysis["content"]
+
+        trend = payload.get("trend") if isinstance(payload, dict) and isinstance(payload.get("trend"), dict) else {}
+        rule_audit = payload.get("rule_audit") if isinstance(payload, dict) and isinstance(payload.get("rule_audit"), dict) else {}
+        reasons = payload.get("reasons") if isinstance(payload, dict) and isinstance(payload.get("reasons"), list) else []
+
+        def pick(field: str, score_key: Optional[str] = None) -> Any:
+            score_key = score_key or field
+            if isinstance(payload, dict):
+                value = payload.get(field)
+                if value not in (None, ""):
+                    return value
+            return score.get(score_key)
+
+        direction = display_push_value(pick("direction", "direction"), score.get("direction", "观望"))
+        return {
+            "source": analysis.get("provider", "unknown"),
+            "ai_valid": bool(analysis.get("valid_json")),
+            "direction": direction,
+            "rule_direction": score.get("direction", "观望"),
+            "entry": display_push_value(pick("entry", "entry"), score.get("entry")),
+            "stop_loss": display_push_value(pick("stop_loss", "stop_loss"), score.get("stop_loss")),
+            "take_profit": display_push_value(pick("take_profit", "take_profit"), score.get("take_profit")),
+            "risk_level": display_push_value(pick("risk_level", "risk_level"), score.get("risk_level")),
+            "suggestion": clip_push_text(pick("suggestion"), 240),
+            "risk": clip_push_text(pick("risk"), 260),
+            "score_comment": clip_push_text(pick("score_comment"), 180),
+            "trend_summary": clip_push_text(trend.get("summary"), 120),
+            "trend_conflict": clip_push_text(trend.get("conflict"), 120),
+            "rule_audit_overall": clip_push_text(rule_audit.get("overall"), 40),
+            "rule_audit_warnings": [
+                clip_push_text(item, 80)
+                for item in (rule_audit.get("warnings") or [])[:2]
+                if clip_push_text(item, 80)
+            ],
+            "reasons": [clip_push_text(item, 100) for item in reasons[:3] if clip_push_text(item, 100)],
+        }
+
+    def _signal_labels(self, signals: List[Dict[str, Any]], limit: int = 4) -> List[str]:
+        labels = []
+        for item in signals:
+            signal_type = str(item.get("type", "")).strip()
+            if not signal_type:
+                continue
+            labels.append(SIGNAL_TYPE_LABELS.get(signal_type, signal_type))
+        return labels[:limit]
+
+    def _build_wechat_push_content(
+        self,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        score: Dict[str, Any],
+        analysis: Dict[str, Any],
+        push_kind: str = "trade",
+    ) -> Tuple[str, str]:
+        view = self._resolve_push_analysis(analysis, score)
+        inst_id = snapshot["inst_id"]
+        symbol = symbol_ccy(inst_id)
+        price = snapshot["price"]
+        signal_labels = self._signal_labels(signals)
+        signal_text = "、".join(signal_labels) or "规则评分达标"
+        raw_score = score.get("raw_total_score", score.get("total_score", "-"))
+        trade_score = score.get("final_trade_score", score.get("total_score", "-"))
+
+        title_parts = [
+            symbol,
+            view["direction"],
+            f"险{view['risk_level']}",
+            f"{raw_score}分",
+        ]
+        if signal_labels:
+            title_parts.append(signal_labels[0])
+        title = " ".join(part for part in title_parts if part and part != "-")
+        if push_kind == "watch":
+            title = f"[观察] {title}"
+
+        lines = [
+            f"## {inst_id} · {snapshot.get('time', now_text())}",
+            "",
+            f"**AI结论**：{view['direction']} | 风险 {view['risk_level']} | 来源 {view['source']}",
+            f"**价格**：{price} | 观察分/交易分 {raw_score}/{trade_score}",
+        ]
+        if view["direction"] != view["rule_direction"]:
+            lines.append(f"**规则方向**：{view['rule_direction']}（与AI不一致，推送以AI为准）")
+        if view["trend_summary"] != "-":
+            lines.append(f"**趋势**：{view['trend_summary']}")
+        if view["trend_conflict"] not in ("-", "none", "无", "否"):
+            lines.append(f"**周期冲突**：{view['trend_conflict']}")
+
+        lines.extend(["", "**交易计划**"])
+        if view["direction"] == "观望" and view["entry"] == "-" and view["stop_loss"] == "-" and view["take_profit"] == "-":
+            lines.append("- 当前建议观望，暂不给出入场/止损/止盈")
+        else:
+            lines.append(f"- 入场：{view['entry']}")
+            lines.append(f"- 止损：{view['stop_loss']}")
+            lines.append(f"- 止盈：{view['take_profit']}")
+
+        if view["suggestion"] != "-":
+            lines.extend(["", f"**执行建议**：{view['suggestion']}"])
+
+        if view["reasons"]:
+            lines.extend(["", "**核心依据**"])
+            for index, reason in enumerate(view["reasons"], start=1):
+                lines.append(f"{index}. {reason}")
+
+        if view["risk"] != "-":
+            lines.extend(["", f"**风险提示**：{view['risk']}"])
+
+        if view["score_comment"] != "-":
+            lines.append(f"**评分说明**：{view['score_comment']}")
+
+        audit_bits = []
+        if view["rule_audit_overall"] != "-":
+            audit_bits.append(view["rule_audit_overall"])
+        audit_bits.extend(view["rule_audit_warnings"])
+        if audit_bits:
+            lines.extend(["", f"**规则审计**：{'；'.join(audit_bits)}"])
+
+        lines.extend([
+            "",
+            f"**触发信号**：{signal_text}",
+            f"**市场状态**：{score.get('market_regime', 'unknown')} / {score.get('bias', 'neutral')}",
+            f"**交易动作**：{score.get('trade_action_level', '-')}",
+            "",
+            "仅供观察，不构成投资建议。",
+        ])
+        return title[:120], "\n".join(lines)
+
     def _format_push_message(
         self,
         snapshot: Dict[str, Any],
@@ -2551,28 +2729,8 @@ class OkxAiShortTermAssistant:
         analysis: Dict[str, Any],
         push_kind: str = "trade",
     ) -> str:
-        # 把分析结果整理成适合聊天工具阅读的文本。
-        reason_text = "; ".join(item["desc"] for item in signals) or "规则评分达到推送阈值"
-        return (
-            f"[OKX AI短线助手][{push_kind}]\n"
-            f"币种: {snapshot['inst_id']}\n"
-            f"价格: {snapshot['price']}\n"
-            f"综合评分: {score['total_score']}\n"
-            f"观察分/交易分: {score.get('raw_total_score', '-')}/{score.get('final_trade_score', '-')}\n"
-            f"分层评分: {json.dumps(score.get('layer_scores', {}), ensure_ascii=False)}\n"
-            f"风险控制/入场质量: {score.get('risk_control_score', '-')}/{score.get('entry_quality_score', '-')}\n"
-            f"市场状态: {score.get('market_regime', 'unknown')} / {score.get('bias', 'neutral')}\n"
-            f"策略模板: {snapshot.get('market_context', {}).get('strategy_template', '-')}\n"
-            f"方向: {score.get('raw_direction', score['direction'])} -> {score['direction']}\n"
-            f"入场质量: {score.get('entry_plan', {}).get('quality', '-')}\n"
-            f"入场位: {score['entry']}\n"
-            f"止损位: {score['stop_loss']}\n"
-            f"止盈位: {score['take_profit']}\n"
-            f"失效条件: {score.get('entry_plan', {}).get('invalidation', '-')}\n"
-            f"市场风险/交易动作: {score.get('market_risk_level', score['risk_level'])}/{score.get('trade_action_level', '-')}\n"
-            f"分析理由: {reason_text}\n"
-            f"AI/规则分析: {json.dumps(analysis, ensure_ascii=False)}"
-        )
+        title, desp = self._build_wechat_push_content(snapshot, signals, score, analysis, push_kind)
+        return f"[OKX AI短线助手][{push_kind}] {title}\n\n{desp}"
 
     def _push_key(
         self,
@@ -2589,36 +2747,26 @@ class OkxAiShortTermAssistant:
         last_at = self.last_push_at.get(push_key, 0.0)
         return time.time() - last_at < self.runtime_config.push_cooldown_seconds
 
-    def _push_telegram(self, message: str) -> None:
-        # Telegram推送需要Bot Token和Chat ID。
-        token = os.getenv("TELEGRAM_BOT_TOKEN")
-        chat_id = os.getenv("TELEGRAM_CHAT_ID")
-        if not token or not chat_id:
-            return
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
+    def _push_wechat(
+        self,
+        send_key: str,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        score: Dict[str, Any],
+        analysis: Dict[str, Any],
+        push_kind: str = "trade",
+    ) -> None:
+        # Server酱推送至个人微信。正文优先展示 AI 分析结论，规则分数仅作参考。
+        title, desp = self._build_wechat_push_content(snapshot, signals, score, analysis, push_kind)
         try:
             http_post_json(
-                url,
-                {"chat_id": chat_id, "text": message},
+                f"https://sctapi.ftqq.com/{send_key}.send",
+                {"title": title, "desp": desp},
                 self.runtime_config.retry_times,
                 self.runtime_config.retry_backoff,
             )
         except Exception as exc:
-            print(f"Telegram push failed: {exc}")
-
-    def _push_webhook(self, url: Optional[str], message: str) -> None:
-        # 企业微信和微信机器人通常都支持类似的Webhook JSON格式。
-        if not url:
-            return
-        try:
-            http_post_json(
-                url,
-                {"msgtype": "text", "text": {"content": message}},
-                self.runtime_config.retry_times,
-                self.runtime_config.retry_backoff,
-            )
-        except Exception as exc:
-            print(f"Webhook push failed: {exc}")
+            print(f"WeChat push failed: {exc}")
 
     def _rotate_log_if_needed(self) -> None:
         # 简单日志轮转：超过大小就把当前日志替换为 .1。

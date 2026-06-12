@@ -75,7 +75,7 @@ CONFIG_FIELDS = [
     ("基础运行", "flag", "choice", "OKX环境", "0正式环境，1模拟盘。"),
     ("AI与推送", "ai_enabled", "checkbox", "启用AI分析", "触发信号后调用AI。"),
     ("AI与推送", "dry_run_ai", "checkbox", "AI dry-run", "只生成AI请求数据，不真实调用AI。"),
-    ("AI与推送", "push_enabled", "checkbox", "启用微信推送", "满足信号和评分条件时发送微信机器人推送。"),
+    ("AI与推送", "push_enabled", "checkbox", "启用微信推送", "满足信号和评分条件时通过 Server酱 推送到个人微信。"),
     ("AI与推送", "push_score", "number", "推送分数阈值", "触发信号且评分达到该值才推送。"),
     ("策略阈值", "volume_multiplier", "number", "放量倍数", "当前1m成交量超过20根均量的倍数。"),
     ("策略阈值", "oi_change_pct_15m", "number", "15分钟OI变化%", "预热满15分钟后生效。"),
@@ -91,7 +91,7 @@ CONFIG_FIELDS = [
 ENV_FIELDS = [
     ("OPENAI_API_KEY", "OpenAI API Key", "AI接口密钥。"),
     ("AI_MODEL", "AI模型", "默认gpt-5.5，可改为更便宜模型。"),
-    ("WECHAT_WEBHOOK_URL", "微信机器人Webhook", "微信机器人地址。"),
+    ("WECHAT_SEND_KEY", "微信推送 SendKey", "Server酱 SendKey，用于推送到个人微信。在 https://sct.ftqq.com 获取。"),
 ]
 
 
@@ -166,6 +166,8 @@ def load_env() -> Dict[str, str]:
                 continue
             key, value = line.split("=", 1)
             env[key.strip()] = value.strip().strip('"').strip("'")
+    if not env.get("WECHAT_SEND_KEY") and env.get("WECHAT_WEBHOOK_URL"):
+        env["WECHAT_SEND_KEY"] = env["WECHAT_WEBHOOK_URL"]
     return env
 
 
@@ -175,7 +177,7 @@ def save_env(env: Dict[str, str]) -> Path:
         "",
         f'OPENAI_API_KEY="{env.get("OPENAI_API_KEY", "")}"',
         f'AI_MODEL="{env.get("AI_MODEL", "gpt-5.5")}"',
-        f'WECHAT_WEBHOOK_URL="{env.get("WECHAT_WEBHOOK_URL", "")}"',
+        f'WECHAT_SEND_KEY="{env.get("WECHAT_SEND_KEY", "")}"',
         "",
     ]
     text = "\n".join(lines)
@@ -554,14 +556,17 @@ def test_ai_connection() -> str:
 
 
 def test_push_connection() -> str:
-    url = build_child_env().get("WECHAT_WEBHOOK_URL", "")
-    if not url:
-        return "推送测试失败：未配置微信机器人Webhook。"
+    send_key = build_child_env().get("WECHAT_SEND_KEY", "").strip()
+    if not send_key:
+        return "推送测试失败：未配置 WECHAT_SEND_KEY。"
     try:
-        result = post_json(url, {"msgtype": "text", "text": {"content": "[OKX AI短线助手] 推送测试成功。"}})
-        return f"微信机器人成功：{result[:160]}"
+        result = post_json(
+            f"https://sctapi.ftqq.com/{send_key}.send",
+            {"title": "[OKX AI短线助手] 推送测试", "desp": "微信推送配置正常。"},
+        )
+        return f"微信推送成功：{result[:160]}"
     except Exception as exc:
-        return f"微信机器人失败：{exc}"
+        return f"微信推送失败：{exc}"
 
 
 def tail_text(path: Path, max_bytes: int = 160000) -> str:
@@ -1532,7 +1537,7 @@ def render_page(message: str = "") -> bytes:
             rows.append(f'<section class="card page-section" data-page="config"><h2>{esc(section)}</h2>')
         rows.append(field_html(key, label, kind, help_text, config.get(key)))
     rows.append("</section>")
-    rows.append('<section class="card page-section" data-page="config"><h2>AI密钥与微信机器人</h2>')
+    rows.append('<section class="card page-section" data-page="config"><h2>AI密钥与微信推送</h2>')
     for key, label, help_text in ENV_FIELDS:
         value = env.get(key, "gpt-5.5" if key == "AI_MODEL" else "")
         input_type = "password" if "KEY" in key else "text"
@@ -1566,7 +1571,7 @@ button,.button{{border:0;border-radius:12px;padding:11px 16px;background:#f1f3f8
 <form class="settings-form" method="post" action="/save-auth#settings"><section class="card page-panel" data-page="settings"><h2>登录账号</h2><div class="field"><label>用户名</label><div><input type="text" name="auth_username" value="{esc(auth.get("username","admin"))}"><p>Web控制台登录用户名。</p></div></div><div class="field"><label>新密码</label><div><div class="password-wrap"><input type="password" name="auth_password" placeholder="留空则不修改"><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>建议首次部署后立即修改默认密码。</p></div></div></section><div class="actions settings-actions" data-page-actions="settings"><div class="action-group"><button class="action-control btn-save" type="submit">保存账号密码</button><a class="button action-control btn-view" href="/logout">切换账号</a><a class="button action-control btn-danger" href="/logout">退出登录</a></div></div></form>
 <div class="page-panel active" data-page="monitor"><section class="card toolbar-card"><div><h2>实时监控</h2><p class="section-sub">未启动时显示虚拟行情；启动后读取真实监控日志，鼠标滚轮可缩放，拖动可平移。</p></div><div class="toolbar-right"><div class="coin-tabs">{monitor_tabs}</div><button class="button btn-run action-control" type="button" id="monitorToggleBtn">开始监控</button></div></section><section class="market-card monitor-card"><div class="market-head"><div><div class="market-title" id="monitorTitle">{esc(monitor_initial or "未配置币种")} 实时走势</div><div class="market-sub" id="monitorMeta">{esc("虚拟行情预览 · 启动监控后自动切换真实数据" if monitor_initial else "请先在配置页选择监控币种")}</div></div><div class="market-price" id="monitorPrice"><strong>--</strong><span>生成模拟行情</span></div></div><div class="market-canvas-wrap"><canvas id="monitorChart"></canvas><div class="market-loading" id="monitorLoading">正在生成虚拟走势...</div><div class="snapshot-panel" id="snapshotPanel"><strong>Snapshot</strong><div class="snapshot-grid"><span>价格</span><b>--</b><span>时间</span><b>--</b><span>评分</span><b>--</b><span>方向</span><b>--</b></div></div></div><div class="market-time-range"><span id="monitorUptime">已监控：未启动</span><span id="monitorPointCount">数据点：0</span></div></section></div>
 	<div class="page-panel" data-page="logs"><section class="card toolbar-card"><div><h2>实时日志</h2><p class="section-sub">仅显示本次启动监控后的JSON分析日志。默认保存：{esc(MONITOR_JSON_LOG_FILE)}</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="refreshLogBtn">刷新日志</button><button class="button btn-log" type="button" id="openLogDirBtn">打开日志目录</button><button class="button btn-log" type="button" id="clearLogBtn">清除窗口</button></div></section><section class="card" style="display:block;"><textarea class="log-window" id="logWindow" readonly>正在加载日志...</textarea><div class="toolbar-card" style="margin:14px 0 0;box-shadow:none;"><div><h2>保存日志</h2><p class="section-sub" id="saveLogHint">点击后弹出文件另存为窗口，可手动选择位置并输入文件名。</p></div><button class="btn-save" type="button" id="saveLogBtn">另存为日志文件</button></div></section></div>
-	<div class="page-panel" data-page="tests"><section class="card toolbar-card"><div><h2>连通性测试</h2><p class="section-sub">测试AI接口和微信机器人推送配置是否可用。</p></div><div class="toolbar-right"><a class="button action-control btn-test" href="/test-ai#tests">测试AI</a><a class="button action-control btn-test" href="/test-push#tests">测试微信推送</a></div></section><section class="card accuracy-card"><h2>实时预测压测</h2><p class="section-sub">上方是累计可靠性压测指标；下方百分比是最近25个成熟样本的滚动决策合理率。</p><div class="accuracy-controls"><select id="accuracyInst"><option value="BTC-USDT-SWAP">BTC-USDT-SWAP</option><option value="ETH-USDT-SWAP">ETH-USDT-SWAP</option></select><select id="accuracyHorizon"><option value="5">下一轮约5秒</option><option value="15">15秒</option><option value="30">30秒</option><option value="60">60秒</option><option value="180">3分钟</option></select><select id="accuracyScope"><option value="session">本次启动后</option><option value="all">全部历史日志</option></select><button class="btn-test" type="button" id="accuracyRefreshBtn">刷新压测</button></div><div class="accuracy-summary" id="accuracySummary"><div><span>可靠性等级</span><b>--</b></div><div><span>已验证/日志</span><b>--</b></div><div><span>决策合理率</span><b>--</b></div><div><span>相对观望基准</span><b>--</b></div></div><div class="accuracy-canvas-wrap"><canvas id="accuracyChart"></canvas></div><p class="accuracy-note" id="accuracyNote">交易信号按做多/做空方向验证；观望按后续波动是否不足以形成可交易机会验证；系统需要长期跑赢“永远观望”基准才算有可靠性。</p></section><section class="card"><h2>近期历史回放测试</h2><div class="field"><label>币种</label><div><select id="historyInst"><option value="BTC-USDT-SWAP">BTC-USDT-SWAP</option><option value="ETH-USDT-SWAP">ETH-USDT-SWAP</option></select><p>建议选择已经在监控页启用并运行过的币种。</p></div></div><div class="field"><label>历史时间</label><div><input type="datetime-local" id="historyTime"><p>请选择当前时间前5到90分钟内的时间点，推荐15到30分钟前。</p></div></div><div class="field"><label>执行</label><div><button class="btn-test" type="button" id="historyTestBtn">运行回放</button><p>优先使用当时监控日志；没有日志时用近期K线重建，盘口/OI等会降级。</p></div></div><div class="history-result" id="historyResult">等待运行近期历史回放测试。</div></section></div>
+	<div class="page-panel" data-page="tests"><section class="card toolbar-card"><div><h2>连通性测试</h2><p class="section-sub">测试AI接口和微信推送（Server酱）配置是否可用。</p></div><div class="toolbar-right"><a class="button action-control btn-test" href="/test-ai#tests">测试AI</a><a class="button action-control btn-test" href="/test-push#tests">测试微信推送</a></div></section><section class="card accuracy-card"><h2>实时预测压测</h2><p class="section-sub">上方是累计可靠性压测指标；下方百分比是最近25个成熟样本的滚动决策合理率。</p><div class="accuracy-controls"><select id="accuracyInst"><option value="BTC-USDT-SWAP">BTC-USDT-SWAP</option><option value="ETH-USDT-SWAP">ETH-USDT-SWAP</option></select><select id="accuracyHorizon"><option value="5">下一轮约5秒</option><option value="15">15秒</option><option value="30">30秒</option><option value="60">60秒</option><option value="180">3分钟</option></select><select id="accuracyScope"><option value="session">本次启动后</option><option value="all">全部历史日志</option></select><button class="btn-test" type="button" id="accuracyRefreshBtn">刷新压测</button></div><div class="accuracy-summary" id="accuracySummary"><div><span>可靠性等级</span><b>--</b></div><div><span>已验证/日志</span><b>--</b></div><div><span>决策合理率</span><b>--</b></div><div><span>相对观望基准</span><b>--</b></div></div><div class="accuracy-canvas-wrap"><canvas id="accuracyChart"></canvas></div><p class="accuracy-note" id="accuracyNote">交易信号按做多/做空方向验证；观望按后续波动是否不足以形成可交易机会验证；系统需要长期跑赢“永远观望”基准才算有可靠性。</p></section><section class="card"><h2>近期历史回放测试</h2><div class="field"><label>币种</label><div><select id="historyInst"><option value="BTC-USDT-SWAP">BTC-USDT-SWAP</option><option value="ETH-USDT-SWAP">ETH-USDT-SWAP</option></select><p>建议选择已经在监控页启用并运行过的币种。</p></div></div><div class="field"><label>历史时间</label><div><input type="datetime-local" id="historyTime"><p>请选择当前时间前5到90分钟内的时间点，推荐15到30分钟前。</p></div></div><div class="field"><label>执行</label><div><button class="btn-test" type="button" id="historyTestBtn">运行回放</button><p>优先使用当时监控日志；没有日志时用近期K线重建，盘口/OI等会降级。</p></div></div><div class="history-result" id="historyResult">等待运行近期历史回放测试。</div></section></div>
 	<div class="page-panel" data-page="help"><section class="card toolbar-card"><div><h2>帮助</h2><p class="section-sub">指标采集、计算逻辑、评分体系、界面字段和推送内容说明。</p></div></section><div class="help-panel">
 	<section class="card help-card"><h2>采集参数、计算指标与评分产出</h2>
 	<h3>采集的数据</h3><div class="help-grid">
