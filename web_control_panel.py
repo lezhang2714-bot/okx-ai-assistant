@@ -17,25 +17,47 @@ import time
 import urllib.parse
 import urllib.request
 import webbrowser
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List
-
+from typing import Any, Dict, List, Tuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-ASSETS_DIR = SCRIPT_DIR / "assets"
-LOG_DIR = SCRIPT_DIR / "logs"
-CONFIG_FILE = SCRIPT_DIR / "config.json"
-ENV_FILE = SCRIPT_DIR / ".env"
-AUTH_FILE = SCRIPT_DIR / "auth.json"
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+try:
+    from okx_signal_monitor import OkxAiShortTermAssistant, RuntimeConfig, SignalConfig, trend_profile_from_candles
+except ModuleNotFoundError:
+    import importlib.util
+
+    signal_monitor_path = SCRIPT_DIR / "okx_signal_monitor.py"
+    spec = importlib.util.spec_from_file_location("okx_signal_monitor", signal_monitor_path)
+    if spec is None or spec.loader is None:
+        raise
+    signal_monitor_module = importlib.util.module_from_spec(spec)
+    sys.modules["okx_signal_monitor"] = signal_monitor_module
+    spec.loader.exec_module(signal_monitor_module)
+    OkxAiShortTermAssistant = signal_monitor_module.OkxAiShortTermAssistant
+    RuntimeConfig = signal_monitor_module.RuntimeConfig
+    SignalConfig = signal_monitor_module.SignalConfig
+    trend_profile_from_candles = signal_monitor_module.trend_profile_from_candles
+
+BUILD_DIR = SCRIPT_DIR / "build"
+LOCAL_STATE_DIR = BUILD_DIR / "local_state"
+ASSETS_DIR = SCRIPT_DIR / "web_assets"
+LOG_DIR = BUILD_DIR / "runtime_logs"
+CONFIG_FILE = LOCAL_STATE_DIR / "trading_assistant_config.json"
+ENV_FILE = LOCAL_STATE_DIR / "api_secrets.env"
+AUTH_FILE = LOCAL_STATE_DIR / "web_console_auth.json"
 USER_STATE_DIR = (Path(os.getenv("LOCALAPPDATA")) / "OKX_AI_Assistant") if os.getenv("LOCALAPPDATA") else (Path.home() / ".okx_ai_assistant")
-USER_CONFIG_FILE = USER_STATE_DIR / "config.json"
-USER_ENV_FILE = USER_STATE_DIR / ".env"
-USER_AUTH_FILE = USER_STATE_DIR / "auth.json"
-MONITOR_JSON_LOG_FILE = LOG_DIR / "okx_ai_monitor.log"
-MONITOR_PROCESS_LOG_FILE = LOG_DIR / "okx_ai_monitor_console.log"
-HOST = os.getenv("CONFIG_WEB_HOST", "127.0.0.1")
-PORT = int(os.getenv("CONFIG_WEB_PORT", "8765"))
+USER_CONFIG_FILE = USER_STATE_DIR / "trading_assistant_config.json"
+USER_ENV_FILE = USER_STATE_DIR / "api_secrets.env"
+USER_AUTH_FILE = USER_STATE_DIR / "web_console_auth.json"
+MONITOR_JSON_LOG_FILE = LOG_DIR / "okx_signal_analysis.jsonl"
+MONITOR_PROCESS_LOG_FILE = LOG_DIR / "signal_monitor_console.log"
+HOST = os.getenv("WEB_CONTROL_PANEL_HOST", "127.0.0.1")
+PORT = int(os.getenv("WEB_CONTROL_PANEL_PORT", "8765"))
 SUPPORTED_INSTRUMENTS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
 OKX_BASE_URL = "https://www.okx.com"
 
@@ -99,6 +121,7 @@ def configured_instruments() -> List[str]:
 def save_config(config: Dict[str, Any]) -> Path:
     text = json.dumps(config, indent=2, ensure_ascii=False) + "\n"
     try:
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_FILE.write_text(text, encoding="utf-8")
         if USER_CONFIG_FILE.exists():
             USER_CONFIG_FILE.write_text(text, encoding="utf-8")
@@ -121,6 +144,7 @@ def save_auth(username: str, password: str) -> Path:
     data = {"username": username.strip() or "admin", "password": password.strip() or "admin123"}
     text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
     try:
+        AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
         AUTH_FILE.write_text(text, encoding="utf-8")
         return AUTH_FILE
     except PermissionError:
@@ -154,6 +178,7 @@ def save_env(env: Dict[str, str]) -> Path:
     ]
     text = "\n".join(lines)
     try:
+        ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
         ENV_FILE.write_text(text, encoding="utf-8")
         return ENV_FILE
     except PermissionError:
@@ -226,7 +251,7 @@ def build_child_env() -> Dict[str, str]:
 def build_monitor_args(config: Dict[str, Any]) -> List[str]:
     args = [
         sys.executable,
-        str(SCRIPT_DIR / "monitor.py"),
+        str(SCRIPT_DIR / "okx_signal_monitor.py"),
         "--inst-ids",
         ",".join(config.get("inst_ids", [])),
         "--interval",
@@ -286,7 +311,7 @@ def start_monitor() -> str:
     MONITOR_LOG_START_AT = MONITOR_STARTED_AT
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = MONITOR_PROCESS_LOG_FILE.open("a", encoding="utf-8")
-    log_file.write(f"\n===== monitor started at {MONITOR_STARTED_AT} =====\n")
+    log_file.write(f"\n===== signal monitor started at {MONITOR_STARTED_AT} =====\n")
     log_file.flush()
     MONITOR_PROCESS = subprocess.Popen(
         build_monitor_args(load_config()),
@@ -327,7 +352,7 @@ def get_quick_ticker(inst_id: str) -> Dict[str, Any]:
     points = payload.get("points") or []
     payload["points"] = points[-1:] if points else []
     payload["quick"] = True
-    payload["source"] = "monitor-log"
+    payload["source"] = "signal-monitor-log"
     return payload
 
 
@@ -396,6 +421,13 @@ def minute_bucket_key(value: Any) -> str:
     return text
 
 
+def seconds_between_time_text(left: Any, right: Any) -> int:
+    try:
+        return abs(int((parse_history_time(str(left)) - parse_history_time(str(right))).total_seconds()))
+    except Exception:
+        return 10 ** 9
+
+
 def merge_price_points(history_points: List[Dict[str, Any]], realtime_points: List[Dict[str, Any]], max_points: int) -> List[Dict[str, Any]]:
     merged = []
     index_by_time = {}
@@ -423,21 +455,70 @@ def point_from_log_item(item: Dict[str, Any], price: float) -> Dict[str, Any]:
     volume = item.get("volume") if isinstance(item.get("volume"), dict) else {}
     long_short = item.get("long_short_ratio") if isinstance(item.get("long_short_ratio"), dict) else {}
     signals = item.get("signals") if isinstance(item.get("signals"), list) else []
+    context = item.get("market_context") if isinstance(item.get("market_context"), dict) else {}
+    order_book = item.get("order_book") if isinstance(item.get("order_book"), dict) else {}
+    volatility = item.get("volatility") if isinstance(item.get("volatility"), dict) else {}
+    dynamic = item.get("dynamic_thresholds") if isinstance(item.get("dynamic_thresholds"), dict) else {}
+    profiles = item.get("trend_profiles") if isinstance(item.get("trend_profiles"), dict) else {}
+    data_quality = profiles.get("15m", {}).get("data_quality", {}) if isinstance(profiles.get("15m"), dict) else {}
+    entry_plan = score.get("entry_plan") if isinstance(score.get("entry_plan"), dict) else {}
+    layer_scores = score.get("layer_scores") if isinstance(score.get("layer_scores"), dict) else {}
+    tracking = item.get("signal_tracking") if isinstance(item.get("signal_tracking"), dict) else {}
+    raw_total_score = score.get("raw_total_score", score.get("confidence", score.get("total_score")))
+    final_direction = score.get("final_direction", score.get("direction"))
+    final_trade_score = score.get("final_trade_score")
+    if final_trade_score is None:
+        final_trade_score = score.get("total_score") if final_direction in ("做多", "做空") else 0
     return {
         "time": item.get("time", ""),
         "price": price,
         "kind": "realtime",
         "open_interest": item.get("open_interest"),
         "oi_change_pct_15m": item.get("oi_change_pct_15m"),
+        "oi_warmup_ready": item.get("oi_warmup_ready"),
         "funding_rate": item.get("funding_rate"),
         "funding_change": item.get("funding_change"),
+        "funding_warmup_ready": item.get("funding_warmup_ready"),
         "volume_multiplier": volume.get("multiplier"),
         "volume_current": volume.get("current"),
+        "volume_average_20": volume.get("average_20"),
+        "volume_direction": volume.get("direction"),
+        "volume_trend": volume.get("trend"),
+        "volume_source": volume.get("source"),
         "long_ratio": long_short.get("long_ratio"),
         "short_ratio": long_short.get("short_ratio"),
+        "long_short_available": long_short.get("available"),
         "score": score.get("total_score"),
-        "direction": score.get("direction"),
+        "raw_total_score": raw_total_score,
+        "final_trade_score": final_trade_score,
+        "direction": final_direction,
+        "raw_direction": score.get("raw_direction", final_direction),
+        "final_direction": final_direction,
+        "risk_control_score": score.get("risk_control_score"),
+        "entry_quality_score": score.get("entry_quality_score"),
+        "entry_quality": entry_plan.get("quality"),
+        "entry": score.get("entry"),
+        "stop_loss": score.get("stop_loss"),
+        "take_profit": score.get("take_profit"),
+        "invalidation": entry_plan.get("invalidation"),
+        "wait_for": entry_plan.get("wait_for", []),
+        "layer_scores": layer_scores,
         "risk_level": score.get("risk_level"),
+        "market_risk_level": score.get("market_risk_level"),
+        "trade_action_level": score.get("trade_action_level"),
+        "market_regime": score.get("market_regime", context.get("regime")),
+        "bias": score.get("bias", context.get("bias")),
+        "strategy_template": context.get("strategy_template"),
+        "atr_pct_15m": volatility.get("atr_pct_15m"),
+        "volatility_regime": volatility.get("regime"),
+        "order_book_available": order_book.get("available"),
+        "order_book_imbalance": order_book.get("imbalance"),
+        "order_book_imbalance_5": order_book.get("imbalance_5"),
+        "spread_pct": order_book.get("spread_pct"),
+        "volume_threshold_used": context.get("volume_threshold_used", dynamic.get("volume_multiplier_p85")),
+        "data_quality_reliable": data_quality.get("is_reliable"),
+        "data_quality_count": data_quality.get("confirmed_count"),
+        "signal_tracking": tracking,
         "signals": [signal.get("type", "") for signal in signals if isinstance(signal, dict)],
     }
 
@@ -514,7 +595,7 @@ def read_monitor_points(inst_id: str, max_points: int = 20000) -> Dict[str, Any]
             log_chart_points = item_chart_points
         realtime_points.append(point_from_log_item(item, price))
     realtime_points = realtime_points[-max_points:]
-    source = "monitor-log"
+    source = "signal-monitor-log"
     points = realtime_points
     web_chart_points = []
     if running:
@@ -533,7 +614,14 @@ def read_monitor_points(inst_id: str, max_points: int = 20000) -> Dict[str, Any]
                 enriched["price"] = point["price"]
                 enriched["kind"] = "history"
                 points[index] = enriched
-        source = "web-chart" if web_chart_points else "monitor-chart"
+        if points and realtime_points and points[-1].get("raw_total_score") is None:
+            # Web画图会优先使用OKX最新1m K线；日志分析可能晚几秒或落在上一分钟。
+            # 如果两者时间相差不超过3分钟，只把“指标字段”贴到最新K线上展示，
+            # 价格、时间、K线高低点仍保留图表数据，避免用户看到最新快照指标突然全空。
+            latest_metrics = realtime_points[-1]
+            if seconds_between_time_text(points[-1].get("time"), latest_metrics.get("time")) <= 180:
+                points[-1] = {**latest_metrics, **points[-1], "price": points[-1]["price"], "kind": "history"}
+        source = "web-chart" if web_chart_points else "signal-monitor-chart"
     if len(points) == 1:
         points.append({"time": points[0]["time"], "price": points[0]["price"]})
     first = points[0]["price"] if points else 0
@@ -550,6 +638,280 @@ def read_monitor_points(inst_id: str, max_points: int = 20000) -> Dict[str, Any]
     }
 
 
+def parse_history_time(value: str) -> datetime:
+    text = value.strip().replace("T", " ")
+    if len(text) == 16:
+        text += ":00"
+    return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+
+
+def find_log_item_near(inst_id: str, target: datetime, tolerance_seconds: int = 90) -> Tuple[Dict[str, Any], int]:
+    best = {}
+    best_delta = 10 ** 9
+    for line in tail_text(MONITOR_JSON_LOG_FILE, 40 * 1024 * 1024).splitlines():
+        try:
+            item = json.loads(line)
+            if item.get("inst_id") != inst_id:
+                continue
+            item_time = parse_history_time(str(item.get("time", "")))
+        except Exception:
+            continue
+        delta = abs(int((item_time - target).total_seconds()))
+        if delta < best_delta:
+            best = item
+            best_delta = delta
+    return (best, best_delta) if best and best_delta <= tolerance_seconds else ({}, best_delta)
+
+
+def get_history_candles_before(inst_id: str, bar: str, at_time: datetime, limit: int = 120) -> List[Dict[str, Any]]:
+    before_ms = int(at_time.timestamp() * 1000)
+    query = urllib.parse.urlencode({"instId": inst_id, "bar": bar, "before": str(before_ms), "limit": str(limit)})
+    request = urllib.request.Request(
+        f"{OKX_BASE_URL}/api/v5/market/history-candles?{query}",
+        headers={"Accept": "application/json", "User-Agent": "okx-ai-assistant-web/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+    candles = []
+    for row in payload.get("data") or []:
+        if not isinstance(row, list) or len(row) < 6:
+            continue
+        candles.append({
+            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(row[0]) / 1000)),
+            "open": float(row[1]),
+            "high": float(row[2]),
+            "low": float(row[3]),
+            "close": float(row[4]),
+            "volume": float(row[5]),
+            "confirmed": str(row[8]) if len(row) > 8 else "1",
+        })
+    return candles
+
+
+def build_history_assistant(config: Dict[str, Any]) -> OkxAiShortTermAssistant:
+    return OkxAiShortTermAssistant(
+        instruments=config.get("inst_ids", list(SUPPORTED_INSTRUMENTS)),
+        interval=max(int(config.get("interval", 5)), 1),
+        flag=str(config.get("flag", "0")),
+        ai_enabled=False,
+        push_enabled=False,
+        push_score=int(config.get("push_score", 80)),
+        dry_run_ai=False,
+        config=SignalConfig(
+            volume_multiplier=float(config.get("volume_multiplier", 2.0)),
+            oi_change_pct_15m=float(config.get("oi_change_pct_15m", 5.0)),
+            funding_abs_threshold=float(config.get("funding_abs_threshold", 0.0008)),
+            funding_change_threshold=float(config.get("funding_change_threshold", 0.0003)),
+            long_short_extreme=float(config.get("long_short_extreme", 0.75)),
+        ),
+        runtime_config=RuntimeConfig(),
+    )
+
+
+def snapshot_from_log_or_history(inst_id: str, at_time: datetime, assistant: OkxAiShortTermAssistant) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    log_item, delta = find_log_item_near(inst_id, at_time)
+    if log_item:
+        candles = {}
+        chart = log_item.get("chart") if isinstance(log_item.get("chart"), dict) else {}
+        chart_rows = chart.get("points") if isinstance(chart.get("points"), list) else []
+        if chart_rows:
+            # okx_signal_monitor.py 写入日志时保存的是供指标计算使用的 K 线顺序：
+            # 最新 K 线在前、越往后越旧。这里回放的是同一套评分逻辑，
+            # 因此必须保留原顺序，不能按 Web 画图的时间轴习惯反转。
+            candles["1m"] = chart_rows
+        for bar in ("3m", "5m", "15m", "1H", "4H"):
+            try:
+                candles[bar] = get_history_candles_before(inst_id, bar, at_time)
+            except Exception:
+                candles[bar] = []
+        if not candles.get("1m"):
+            candles["1m"] = get_history_candles_before(inst_id, "1m", at_time)
+        source_meta = {"source": "signal-monitor-log", "nearest_log_delta_seconds": delta}
+        base = log_item
+    else:
+        candles = {bar: get_history_candles_before(inst_id, bar, at_time) for bar in ("1m", "3m", "5m", "15m", "1H", "4H")}
+        source_meta = {"source": "rebuilt-kline", "nearest_log_delta_seconds": delta, "data_quality": "partial"}
+        base = {}
+
+    price = float(base.get("price") or (candles.get("1m", [{}])[0].get("close") if candles.get("1m") else 0.0))
+    volume = assistant._volume_stats(candles.get("1m", []))
+    profiles = {bar: trend_profile_from_candles(rows) for bar, rows in candles.items()}
+    volatility = assistant._volatility_context(inst_id, profiles)
+    dynamic = assistant._dynamic_thresholds(inst_id)
+    long_short = base.get("long_short_ratio") if isinstance(base.get("long_short_ratio"), dict) else {"available": False, "long_ratio": 0.0, "short_ratio": 0.0, "long_short_ratio": 0.0}
+    order_book = base.get("order_book") if isinstance(base.get("order_book"), dict) else {"available": False, "imbalance": 0.0, "imbalance_5": 0.0, "spread_pct": 0.0}
+    oi_change = float(base.get("oi_change_pct_15m") or 0.0)
+    funding_change = float(base.get("funding_change") or 0.0)
+    funding_rate = float(base.get("funding_rate") or 0.0)
+    context = assistant._market_context(price, candles, profiles, volume, float(base.get("open_interest") or 0.0), oi_change, funding_rate, funding_change, long_short, order_book, volatility, dynamic)
+    snapshot = {
+        "time": at_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "inst_id": inst_id,
+        "price": price,
+        "best_bid": price,
+        "best_ask": price,
+        "candles": candles,
+        "volume": volume,
+        "open_interest": base.get("open_interest"),
+        "oi_change_pct_15m": oi_change,
+        "oi_warmup_ready": bool(base.get("oi_warmup_ready", False)),
+        "funding_rate": funding_rate,
+        "funding_change": funding_change,
+        "funding_warmup_ready": bool(base.get("funding_warmup_ready", False)),
+        "long_short_ratio": long_short,
+        "order_book": order_book,
+        "trend_profiles": profiles,
+        "volatility": volatility,
+        "dynamic_thresholds": dynamic,
+        "instrument_profile": assistant._instrument_profile(inst_id),
+        "market_context": context,
+    }
+    return snapshot, source_meta
+
+
+def get_future_1m_candles(inst_id: str, at_time: datetime, minutes: int = 25) -> List[Dict[str, Any]]:
+    end_time = datetime.fromtimestamp(at_time.timestamp() + minutes * 60)
+    rows = get_history_candles_before(inst_id, "1m", end_time, limit=max(30, minutes + 8))
+    selected = []
+    for row in rows:
+        try:
+            row_time = parse_history_time(str(row.get("time", "")))
+        except Exception:
+            continue
+        if at_time < row_time <= end_time:
+            selected.append(row)
+    selected.sort(key=lambda item: item.get("time", ""))
+    return selected
+
+
+def parse_level_pair(text: Any) -> Tuple[float, float]:
+    if not text or text == "-":
+        return 0.0, 0.0
+    parts = [part.strip() for part in str(text).split("-")]
+    if len(parts) < 2:
+        value = float(parts[0])
+        return value, value
+    low, high = float(parts[0]), float(parts[1])
+    return (low, high) if low <= high else (high, low)
+
+
+def parse_targets(text: Any) -> List[float]:
+    if not text or text == "-":
+        return []
+    out = []
+    for part in str(text).replace("/", " ").split():
+        try:
+            out.append(float(part))
+        except ValueError:
+            continue
+    return out
+
+
+def evaluate_history_outcome(snapshot: Dict[str, Any], score: Dict[str, Any], future: List[Dict[str, Any]]) -> Dict[str, Any]:
+    price = float(snapshot.get("price") or 0.0)
+    direction = score.get("raw_direction") if score.get("raw_direction") in ("做多", "做空") else score.get("direction")
+    entry_low, entry_high = parse_level_pair(score.get("entry"))
+    stop = float(score.get("stop_loss")) if score.get("stop_loss") not in (None, "-") else 0.0
+    targets = parse_targets(score.get("take_profit"))
+    entry_touched = False
+    entry_price = 0.0
+    stop_hit = False
+    tp_hits = [False for _ in targets]
+    mfe = 0.0
+    mae = 0.0
+    returns = {}
+    for index, row in enumerate(future, start=1):
+        high = float(row.get("high") or 0.0)
+        low = float(row.get("low") or 0.0)
+        close = float(row.get("close") or 0.0)
+        if not entry_touched and entry_low and entry_high and high >= entry_low and low <= entry_high:
+            entry_touched = True
+            entry_price = entry_high if direction == "做多" else entry_low
+        ref = entry_price if entry_touched else price
+        if ref:
+            move_high = (high - ref) / ref * 100
+            move_low = (low - ref) / ref * 100
+            if direction == "做空":
+                move_high, move_low = -move_low, -move_high
+            mfe = max(mfe, move_high)
+            mae = min(mae, move_low)
+        if entry_touched and stop:
+            if direction == "做多" and low <= stop:
+                stop_hit = True
+            if direction == "做空" and high >= stop:
+                stop_hit = True
+        if entry_touched:
+            for target_index, target in enumerate(targets):
+                if direction == "做多" and high >= target:
+                    tp_hits[target_index] = True
+                if direction == "做空" and low <= target:
+                    tp_hits[target_index] = True
+        if index in (5, 15, 20) and price:
+            ret = (close - price) / price * 100
+            returns[f"{index}m"] = -ret if direction == "做空" else ret
+    return {
+        "future_points": len(future),
+        "entry_touched": entry_touched,
+        "entry_price_assumed": entry_price,
+        "stop_hit": stop_hit,
+        "take_profit_hits": tp_hits,
+        "mfe_pct": mfe,
+        "mae_pct": mae,
+        "returns": returns,
+    }
+
+
+def judge_history_reliability(score: Dict[str, Any], outcome: Dict[str, Any]) -> Dict[str, Any]:
+    notes = []
+    direction = score.get("raw_direction") or score.get("direction")
+    ret15 = outcome.get("returns", {}).get("15m")
+    direction_ok = ret15 is not None and ret15 > 0
+    if score.get("final_direction") == "观望":
+        notes.append("系统最终为观望，主要验证观察分和风险提示是否有意义。")
+    if not outcome.get("entry_touched"):
+        notes.append("后续走势未触达入场区，入场计划未成交。")
+    if outcome.get("stop_hit"):
+        notes.append("入场后触发止损，需结合MFE/MAE判断入场质量。")
+    if any(outcome.get("take_profit_hits", [])):
+        notes.append("后续触达至少一档止盈。")
+    return {
+        "direction": direction,
+        "direction_result": "正向" if direction_ok else ("反向/无效" if ret15 is not None else "样本不足"),
+        "entry_result": "触达" if outcome.get("entry_touched") else "未触达",
+        "risk_result": "止损触发" if outcome.get("stop_hit") else "未先触发止损",
+        "notes": notes,
+    }
+
+
+def run_history_test(inst_id: str, at_time_text: str) -> Dict[str, Any]:
+    if inst_id not in SUPPORTED_INSTRUMENTS:
+        raise ValueError("仅支持 BTC-USDT-SWAP 或 ETH-USDT-SWAP")
+    at_time = parse_history_time(at_time_text)
+    now = datetime.now()
+    delta_minutes = (now - at_time).total_seconds() / 60
+    if delta_minutes < 5 or delta_minutes > 90:
+        raise ValueError("请选择当前时间前5到90分钟内的时间点。")
+    assistant = build_history_assistant(load_config())
+    snapshot, source_meta = snapshot_from_log_or_history(inst_id, at_time, assistant)
+    signals = assistant.detect_signals(snapshot)
+    score = assistant.score_snapshot(snapshot, signals)
+    analysis = assistant._local_analysis(snapshot, signals, score)
+    future = get_future_1m_candles(inst_id, at_time, 25)
+    outcome = evaluate_history_outcome(snapshot, score, future)
+    verdict = judge_history_reliability(score, outcome)
+    return {
+        "ok": True,
+        "inst_id": inst_id,
+        "time": at_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source_meta,
+        "signals": signals,
+        "score": score,
+        "analysis": analysis,
+        "outcome": outcome,
+        "verdict": verdict,
+    }
+
+
 def open_log_dir() -> str:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -563,7 +925,7 @@ def open_log_dir() -> str:
                     "-ExecutionPolicy",
                     "Bypass",
                     "-Command",
-                    "Start-Sleep -Milliseconds 350; $shell = New-Object -ComObject WScript.Shell; $shell.AppActivate('logs') | Out-Null",
+                    "Start-Sleep -Milliseconds 350; $shell = New-Object -ComObject WScript.Shell; $shell.AppActivate('runtime_logs') | Out-Null",
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -611,7 +973,7 @@ h1{{margin:0 0 8px;font-size:28px}} p{{margin:0 0 24px;color:#cbd5e1}} label{{di
 button{{margin-top:22px;width:100%;border:0;border-radius:14px;padding:13px;background:linear-gradient(135deg,#60a5fa,#8b5cf6 58%,#14b8a6);color:white;font-weight:850;cursor:pointer}}
 .notice{{background:#fee2e2;color:#991b1b;border:1px solid #fecaca;padding:10px 12px;border-radius:12px;margin-bottom:14px}}
 </style></head><body>
-<video class="earth-video" autoplay muted loop playsinline preload="auto"><source src="/assets/earth_rotation.webm" type="video/webm"></video>
+<video class="earth-video" autoplay muted loop playsinline preload="auto"><source src="/web-assets/earth_rotation.webm" type="video/webm"></video>
 <div class="shade"></div><canvas id="login-bg"></canvas><div class="grid"></div>
 <form class="box" method="post" action="/login"><h1>OKX AI Assistant</h1><p>请输入账号密码进入本地控制台。</p>{notice}
 <label>用户名</label><input name="username" autocomplete="username" value="admin"><label>密码</label><div class="password-wrap"><input type="password" name="password" autocomplete="current-password"><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div>
@@ -677,18 +1039,54 @@ def render_page(message: str = "") -> bytes:
 .actions{{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap;position:sticky;bottom:0;margin-top:20px;padding:14px;border-radius:18px;background:rgba(255,255,255,.9);border:1px solid rgba(255,255,255,.9);box-shadow:var(--shadow);backdrop-filter:blur(12px)}} .action-group,.toolbar-right,.toolbar-left{{display:flex;align-items:center;gap:10px;flex-wrap:wrap}}
 button,.button{{border:0;border-radius:12px;padding:11px 16px;background:#f1f3f8;color:#263449;min-width:94px;justify-content:center;white-space:nowrap;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;font-size:14px;font-weight:650;transition:background .18s ease,color .18s ease,box-shadow .18s ease,transform .18s ease,opacity .18s ease}} button:disabled,.button.disabled{{cursor:not-allowed;opacity:.72}} .btn-save,.btn-log{{background:#ede9fe;color:#5b21b6}} .btn-run{{background:#dcfce7;color:#047857}} .btn-run.is-running{{background:linear-gradient(135deg,#ef4444,#f97316);color:#fff;box-shadow:0 10px 26px rgba(239,68,68,.24)}} .btn-run.is-starting{{background:linear-gradient(135deg,#60a5fa,#8b5cf6);color:#fff;box-shadow:0 10px 26px rgba(99,102,241,.25)}} .btn-danger{{background:#fee2e2;color:#b91c1c}} .btn-danger.is-ready{{background:#ef4444;color:#fff;box-shadow:0 10px 26px rgba(239,68,68,.22)}} .btn-test{{background:#e0f2fe;color:#0369a1}} .btn-view{{background:#f1f5f9;color:#334155}}
 .toolbar-card{{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:16px}} .toolbar-card::before{{display:none}} .coin-tabs{{display:inline-flex;gap:8px;padding:4px;border-radius:14px;background:#f1f5f9;border:1px solid #e2e8f0}} .coin-tab.active{{background:#8b6cf6;color:#fff}} .empty-coin{{display:inline-flex;align-items:center;padding:0 12px;color:#64748b;font-size:13px;font-weight:650}}
-.market-card{{background:#242424;border:1px solid #3a3a3a;border-radius:18px;margin:0;padding:18px 20px 16px;color:#f8fafc;box-shadow:0 12px 34px rgba(15,23,42,.16);overflow:hidden;height:calc(100vh - 40px);display:flex;flex-direction:column}} .monitor-card{{height:calc(100vh - 188px);min-height:520px}} .market-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:12px}} .market-title{{font-size:18px;font-weight:800;margin-bottom:4px}} .market-sub{{color:#a3a3a3;font-size:12px}} .market-price{{text-align:right}} .market-price strong{{display:block;font-size:24px;line-height:1.1}} .market-price span{{font-size:13px;color:#94a3b8}} .market-price.up span{{color:#22c55e}} .market-price.down span{{color:#fb7185}} .market-canvas-wrap{{position:relative;flex:1;min-height:0;border-top:1px solid #393939;background:linear-gradient(rgba(255,255,255,.055) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);background-size:100% 72px,72px 100%}} canvas{{width:100%;height:100%;display:block;cursor:grab}} canvas.dragging{{cursor:grabbing}} .market-loading{{position:absolute;inset:0;display:grid;place-items:center;color:#a3a3a3;pointer-events:none}} .snapshot-panel{{position:absolute;left:16px;top:16px;z-index:2;min-width:230px;max-width:min(420px,calc(100% - 32px));padding:12px 14px;border-radius:14px;background:rgba(15,23,42,.56);border:1px solid rgba(148,163,184,.20);box-shadow:0 12px 28px rgba(0,0,0,.18);backdrop-filter:blur(8px);font-size:12px;color:#dbeafe;pointer-events:none}} .snapshot-panel strong{{display:block;color:#fff;font-size:13px;margin-bottom:6px}} .snapshot-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 12px}} .snapshot-grid span{{color:#9ca3af}} .snapshot-grid b{{font-weight:700;color:#e5e7eb}} .market-time-range{{margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.08);color:#a3a3a3;font-size:12px;display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}}
-.log-window{{width:100%;min-height:calc(100vh - 250px);resize:vertical;border:1px solid #dbe4ef;border-radius:16px;padding:16px;background:#0f172a;color:#d1fae5;font-family:Consolas,"Courier New",monospace;font-size:13px;line-height:1.55;white-space:pre}} .notice{{background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0;padding:13px 15px;border-radius:14px;margin-bottom:16px}}
-@media(max-width:860px){{.app{{grid-template-columns:1fr}}.sidebar{{position:relative;height:auto}}.card{{grid-template-columns:1fr}}.field{{grid-template-columns:1fr}}}}
-</style></head><body><div class="app"><aside class="sidebar"><div class="brand"><span class="logo">O</span><span>OKX AI</span></div>
-<a class="nav-item active" href="#monitor" data-page-link="monitor">监控</a><a class="nav-item" href="#config" data-page-link="config">配置</a><a class="nav-item" href="#logs" data-page-link="logs">日志</a><a class="nav-item" href="#tests" data-page-link="tests">测试</a><a class="nav-item" href="#settings" data-page-link="settings">设置</a>
+	.market-card{{background:#242424;border:1px solid #3a3a3a;border-radius:18px;margin:0;padding:18px 20px 16px;color:#f8fafc;box-shadow:0 12px 34px rgba(15,23,42,.16);overflow:hidden;height:calc(100vh - 40px);display:flex;flex-direction:column}} .monitor-card{{height:calc(100vh - 188px);min-height:520px}} .market-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:12px}} .market-title{{font-size:18px;font-weight:800;margin-bottom:4px}} .market-sub{{color:#a3a3a3;font-size:12px}} .market-price{{text-align:right}} .market-price strong{{display:block;font-size:24px;line-height:1.1}} .market-price span{{font-size:13px;color:#94a3b8}} .market-price.up span{{color:#22c55e}} .market-price.down span{{color:#fb7185}} .market-canvas-wrap{{position:relative;flex:1;min-height:0;border-top:1px solid #393939;background:linear-gradient(rgba(255,255,255,.055) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);background-size:100% 72px,72px 100%}} canvas{{width:100%;height:100%;display:block;cursor:grab}} canvas.dragging{{cursor:grabbing}} .market-loading{{position:absolute;inset:0;display:grid;place-items:center;color:#a3a3a3;pointer-events:none}} .snapshot-panel{{position:absolute;left:16px;top:16px;z-index:2;min-width:300px;max-width:min(560px,calc(100% - 32px));max-height:calc(100% - 32px);overflow:auto;padding:12px 14px;border-radius:12px;background:rgba(15,23,42,.62);border:1px solid rgba(148,163,184,.20);box-shadow:0 12px 28px rgba(0,0,0,.18);backdrop-filter:blur(8px);font-size:12px;color:#dbeafe;pointer-events:none}} .snapshot-panel strong{{display:block;color:#fff;font-size:13px;margin-bottom:6px}} .snapshot-grid{{display:grid;grid-template-columns:minmax(76px,.8fr) minmax(96px,1.2fr);gap:4px 12px;align-items:start}} .snapshot-grid span{{color:#9ca3af}} .snapshot-grid b{{font-weight:700;color:#e5e7eb;word-break:break-word}} .market-time-range{{margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.08);color:#a3a3a3;font-size:12px;display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}}
+	.log-window{{width:100%;min-height:calc(100vh - 250px);resize:vertical;border:1px solid #dbe4ef;border-radius:16px;padding:16px;background:#0f172a;color:#d1fae5;font-family:Consolas,"Courier New",monospace;font-size:13px;line-height:1.55;white-space:pre}} .notice{{background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0;padding:13px 15px;border-radius:14px;margin-bottom:16px}}
+	.help-panel{{display:grid;grid-template-columns:1fr;gap:16px}} .help-card{{display:block;line-height:1.68}} .help-card::before{{display:none}} .help-card h3{{margin:18px 0 8px;font-size:16px;color:#111827}} .help-card h3:first-child{{margin-top:0}} .help-card p{{margin:6px 0;color:#475569;font-size:13px}} .help-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}} .help-item{{border:1px solid #e2e8f0;border-radius:12px;padding:12px;background:#f8fafc}} .help-item strong{{display:block;margin-bottom:4px;color:#1f2937}} .help-list{{margin:8px 0 0;padding-left:18px;color:#475569;font-size:13px}} .help-list li{{margin:4px 0}} .help-table{{width:100%;border-collapse:collapse;margin-top:10px;font-size:13px}} .help-table th,.help-table td{{border:1px solid #e2e8f0;padding:9px 10px;text-align:left;vertical-align:top}} .help-table th{{background:#f1f5f9;color:#334155}} .help-note{{border-left:4px solid #8b6cf6;background:#f5f3ff;padding:10px 12px;border-radius:10px;color:#4c1d95;font-size:13px;margin-top:10px}} code{{background:#eef2ff;color:#4338ca;border-radius:6px;padding:1px 5px}}
+	.history-result{{grid-column:1/-1;display:block;border:1px solid #e2e8f0;border-radius:14px;background:#f8fafc;padding:14px;min-height:86px;white-space:pre-wrap;font-family:Consolas,"Courier New",monospace;font-size:13px;color:#334155}}
+	@media(max-width:860px){{.app{{grid-template-columns:1fr}}.sidebar{{position:relative;height:auto}}.card{{grid-template-columns:1fr}}.field{{grid-template-columns:1fr}}}}
+	</style></head><body><div class="app"><aside class="sidebar"><div class="brand"><span class="logo">O</span><span>OKX AI</span></div>
+	<a class="nav-item active" href="#monitor" data-page-link="monitor">监控</a><a class="nav-item" href="#config" data-page-link="config">配置</a><a class="nav-item" href="#logs" data-page-link="logs">日志</a><a class="nav-item" href="#tests" data-page-link="tests">测试</a><a class="nav-item" href="#help" data-page-link="help">帮助</a><a class="nav-item" href="#settings" data-page-link="settings">设置</a>
 </aside><div class="content"><main>
 <form class="config-form" method="post" action="/save#config">{''.join(rows)}<div class="actions config-actions" data-page-actions="config"><div class="action-group"><button class="action-control btn-save" type="button" id="saveConfigBtn">另存为配置</button><button class="action-control btn-save" type="button" id="importConfigBtn">导入配置</button><a class="button action-control btn-save" href="/config-json#config">查看配置</a></div></div></form>
 <form class="settings-form" method="post" action="/save-auth#settings"><section class="card page-panel" data-page="settings"><h2>登录账号</h2><div class="field"><label>用户名</label><div><input type="text" name="auth_username" value="{esc(auth.get("username","admin"))}"><p>Web控制台登录用户名。</p></div></div><div class="field"><label>新密码</label><div><div class="password-wrap"><input type="password" name="auth_password" placeholder="留空则不修改"><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>建议首次部署后立即修改默认密码。</p></div></div></section><div class="actions settings-actions" data-page-actions="settings"><div class="action-group"><button class="action-control btn-save" type="submit">保存账号密码</button><a class="button action-control btn-view" href="/logout">切换账号</a><a class="button action-control btn-danger" href="/logout">退出登录</a></div></div></form>
 <div class="page-panel active" data-page="monitor"><section class="card toolbar-card"><div><h2>实时监控</h2><p class="section-sub">未启动时显示虚拟行情；启动后读取真实监控日志，鼠标滚轮可缩放，拖动可平移。</p></div><div class="toolbar-right"><div class="coin-tabs">{monitor_tabs}</div><button class="button btn-run action-control" type="button" id="monitorToggleBtn">开始监控</button></div></section><section class="market-card monitor-card"><div class="market-head"><div><div class="market-title" id="monitorTitle">{esc(monitor_initial or "未配置币种")} 实时走势</div><div class="market-sub" id="monitorMeta">{esc("虚拟行情预览 · 启动监控后自动切换真实数据" if monitor_initial else "请先在配置页选择监控币种")}</div></div><div class="market-price" id="monitorPrice"><strong>--</strong><span>生成模拟行情</span></div></div><div class="market-canvas-wrap"><canvas id="monitorChart"></canvas><div class="market-loading" id="monitorLoading">正在生成虚拟走势...</div><div class="snapshot-panel" id="snapshotPanel"><strong>Snapshot</strong><div class="snapshot-grid"><span>价格</span><b>--</b><span>时间</span><b>--</b><span>评分</span><b>--</b><span>方向</span><b>--</b></div></div></div><div class="market-time-range"><span id="monitorPointCount">数据点：0</span></div></section></div>
-<div class="page-panel" data-page="logs"><section class="card toolbar-card"><div><h2>实时日志</h2><p class="section-sub">仅显示本次启动监控后的JSON分析日志。默认保存：{esc(MONITOR_JSON_LOG_FILE)}</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="refreshLogBtn">刷新日志</button><button class="button btn-log" type="button" id="openLogDirBtn">打开日志目录</button><button class="button btn-log" type="button" id="clearLogBtn">清除窗口</button></div></section><section class="card" style="display:block;"><textarea class="log-window" id="logWindow" readonly>正在加载日志...</textarea><div class="toolbar-card" style="margin:14px 0 0;box-shadow:none;"><div><h2>保存日志</h2><p class="section-sub" id="saveLogHint">点击后弹出文件另存为窗口，可手动选择位置并输入文件名。</p></div><button class="btn-save" type="button" id="saveLogBtn">另存为日志文件</button></div></section></div>
-<div class="page-panel" data-page="tests"><section class="card toolbar-card"><div><h2>连通性测试</h2><p class="section-sub">测试AI接口和微信机器人推送配置是否可用。</p></div><div class="toolbar-right"><a class="button action-control btn-test" href="/test-ai#tests">测试AI</a><a class="button action-control btn-test" href="/test-push#tests">测试微信推送</a></div></section></div>
-</main></div></div>
+	<div class="page-panel" data-page="logs"><section class="card toolbar-card"><div><h2>实时日志</h2><p class="section-sub">仅显示本次启动监控后的JSON分析日志。默认保存：{esc(MONITOR_JSON_LOG_FILE)}</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="refreshLogBtn">刷新日志</button><button class="button btn-log" type="button" id="openLogDirBtn">打开日志目录</button><button class="button btn-log" type="button" id="clearLogBtn">清除窗口</button></div></section><section class="card" style="display:block;"><textarea class="log-window" id="logWindow" readonly>正在加载日志...</textarea><div class="toolbar-card" style="margin:14px 0 0;box-shadow:none;"><div><h2>保存日志</h2><p class="section-sub" id="saveLogHint">点击后弹出文件另存为窗口，可手动选择位置并输入文件名。</p></div><button class="btn-save" type="button" id="saveLogBtn">另存为日志文件</button></div></section></div>
+	<div class="page-panel" data-page="tests"><section class="card toolbar-card"><div><h2>连通性测试</h2><p class="section-sub">测试AI接口和微信机器人推送配置是否可用。</p></div><div class="toolbar-right"><a class="button action-control btn-test" href="/test-ai#tests">测试AI</a><a class="button action-control btn-test" href="/test-push#tests">测试微信推送</a></div></section><section class="card"><h2>近期历史回放测试</h2><div class="field"><label>币种</label><div><select id="historyInst"><option value="BTC-USDT-SWAP">BTC-USDT-SWAP</option><option value="ETH-USDT-SWAP">ETH-USDT-SWAP</option></select><p>建议选择已经在监控页启用并运行过的币种。</p></div></div><div class="field"><label>历史时间</label><div><input type="datetime-local" id="historyTime"><p>请选择当前时间前5到90分钟内的时间点，推荐15到30分钟前。</p></div></div><div class="field"><label>执行</label><div><button class="btn-test" type="button" id="historyTestBtn">运行回放</button><p>优先使用当时监控日志；没有日志时用近期K线重建，盘口/OI等会降级。</p></div></div><div class="history-result" id="historyResult">等待运行近期历史回放测试。</div></section></div>
+	<div class="page-panel" data-page="help"><section class="card toolbar-card"><div><h2>帮助</h2><p class="section-sub">指标采集、计算逻辑、评分体系、界面字段和推送内容说明。</p></div></section><div class="help-panel">
+	<section class="card help-card"><h2>采集参数、计算指标与评分产出</h2>
+	<h3>采集的数据</h3><div class="help-grid">
+	<div class="help-item"><strong>行情与K线</strong><p>采集 BTC-USDT-SWAP、ETH-USDT-SWAP 的 ticker、盘口买卖一档、1m/3m/5m/15m/1H/4H K线。K线字段包括时间、开高低收、成交量、是否收盘。</p></div>
+	<div class="help-item"><strong>合约资金数据</strong><p>采集 Open Interest、资金费率、5m账户多空比。OI和资金费率会保存本地短周期历史，用于计算15分钟变化。</p></div>
+	<div class="help-item"><strong>盘口数据</strong><p>采集前20档订单簿，计算 top5/top20 买卖量、盘口不平衡、价差百分比。盘口只作为短线确认，不单独决定方向。</p></div>
+	<div class="help-item"><strong>运行内统计</strong><p>保存成交量倍数、ATR百分比、盘口不平衡的近期样本，用分位数生成动态阈值；信号结算样本写入 <code>build/runtime_logs/signal_performance.jsonl</code>。</p></div>
+	</div>
+	<h3>计算的技术指标</h3><table class="help-table"><thead><tr><th>类别</th><th>指标</th><th>用途</th></tr></thead><tbody>
+	<tr><td>趋势</td><td>EMA9/20/60/120、MA120、结构高低点、ADX/+DI/-DI</td><td>判断趋势排列、趋势强度、短中周期是否共振，以及是否处于震荡弱趋势。</td></tr>
+	<tr><td>动量</td><td>RSI6/14/24、MACD、KDJ、K线实体占比、RSI背离</td><td>判断动能是否增强、过热、衰减或背离；KDJ用于短线入场时机确认。</td></tr>
+	<tr><td>波动</td><td>ATR、ATR%、布林带、布林带宽度</td><td>识别高波动、低波动、挤压蓄势；入场区、止损、止盈根据ATR和结构位生成。</td></tr>
+	<tr><td>量价</td><td>已收盘1m放量倍数、成交量方向、近5根量能趋势</td><td>判断突破或回踩是否有成交量确认，避免只看价格方向。</td></tr>
+	<tr><td>合约资金</td><td>OI 15m变化、资金费率、资金费率变化、多空比</td><td>判断新增仓、平仓、拥挤、过热和反身性风险。</td></tr>
+	</tbody></table>
+	<h3>评分体系</h3><p>系统先生成 <code>raw_direction</code>，再根据入场质量决定 <code>final_direction</code>。分数分为观察分和交易分：观察分用于判断市场是否值得关注，交易分用于判断是否适合执行。</p>
+	<ul class="help-list"><li><code>market_regime_score</code>：趋势、震荡、挤压、高波动等市场状态。</li><li><code>trend_score</code>：EMA/ADX/结构突破/多周期一致性。</li><li><code>momentum_score</code>：RSI、MACD、KDJ、背离和动能。</li><li><code>volume_price_score</code>：放量、量价方向、突破量能确认。</li><li><code>derivatives_score</code>：OI+价格组合、资金费率、多空拥挤。</li><li><code>orderbook_score</code>：top5/top20盘口支持和价差风险。</li><li><code>entry_quality_score</code>：价格距离EMA/ATR、入场区和等待确认。</li><li><code>risk_control_score</code>：资金费率、拥挤、高波动、背离、数据质量等风险控制。</li></ul>
+	<div class="help-note">可靠性判断：指标越多不是越可靠，关键看数据质量、周期共振、量价确认、资金数据是否同向，以及是否触达入场区。系统给出的是观察和风险提示，不是自动交易指令。</div>
+	</section>
+	<section class="card help-card"><h2>界面字段与推送内容解读</h2>
+	<h3>走势图 Snapshot</h3><table class="help-table"><thead><tr><th>字段</th><th>含义</th><th>解读方式</th></tr></thead><tbody>
+	<tr><td>观察/交易分</td><td><code>raw_total_score / final_trade_score</code></td><td>观察分高说明市场值得关注；交易分为0通常表示最终观望，等待入场条件或风险降低。</td></tr>
+	<tr><td>方向</td><td><code>raw_direction → final_direction</code></td><td>原始方向来自市场偏向；最终方向会被入场质量、风险和等待确认降级。</td></tr>
+	<tr><td>市场风险</td><td><code>market_risk_level</code></td><td>描述行情本身是否过热、拥挤、背离或冲突。高风险不等于一定反向。</td></tr>
+	<tr><td>交易动作</td><td><code>trade_action_level</code></td><td>描述当前是否适合执行：观望、等待确认、可关注、不建议。</td></tr>
+	<tr><td>OI / OI 15m</td><td>当前持仓量和15分钟变化</td><td>价格上涨+OI上涨偏新增仓推动；价格上涨+OI下降偏空头回补，追多质量下降。下跌同理反向理解。</td></tr>
+	<tr><td>资金费率</td><td>永续合约资金费率</td><td>绝对值过高说明单边拥挤，追单风险升高。</td></tr>
+	<tr><td>多头/空头</td><td>账户多空比例换算</td><td>极端比例代表拥挤风险，不直接代表马上反转。</td></tr>
+	<tr><td>放量倍数</td><td>最近已收盘1m成交量 / 前20根均量</td><td>放量表示活跃度提高，必须结合方向、结构、OI和盘口判断。</td></tr>
+	</tbody></table>
+	<h3>推送类型</h3><div class="help-grid"><div class="help-item"><strong>trade</strong><p>最终方向为做多或做空，且交易分达到推送阈值。重点看入场区、止损、止盈、失效条件。</p></div><div class="help-item"><strong>watch</strong><p>最终可能仍是观望，但观察分高且出现风险或异常信号，例如资金费率过热、RSI极端、布林挤压、多空拥挤。</p></div></div>
+	<h3>入场、止损、止盈与追踪</h3><ul class="help-list"><li>入场区由ATR、结构位、EMA/VWAP近似锚点生成，不是固定百分比。</li><li>止损优先参考结构失效位，并加ATR缓冲。</li><li>止盈按风险距离生成两档，偏向1R/2R思路。</li><li>在线追踪先等待价格触达入场区；触达判断优先使用最新1m K线 high/low。</li><li>追踪成交价是保守估算：做多按入场区上沿，做空按入场区下沿，并记录 <code>fill_assumption</code>。</li></ul>
+	<h3>常见误读</h3><ul class="help-list"><li>观察分高不代表必须交易，可能只是风险异常值得关注。</li><li>市场风险低不代表一定盈利，只代表当前拥挤/过热/冲突较少。</li><li>盘口不平衡可能是假挂单，当前只作为小权重确认。</li><li>AI分析会审计本地规则，但数据不足、预热不足或信号冲突时应优先观望。</li></ul>
+	</section></div></div>
+	</main></div></div>
 <script>
 function currentPage() {{
   return (location.hash || '#monitor').replace('#', '') || 'monitor';
@@ -790,8 +1188,8 @@ if (saveConfigBtn) {{
   }});
 }}
 const importConfigBtn = document.getElementById('importConfigBtn');
-if (importConfigBtn) {{
-  importConfigBtn.addEventListener('click', async function() {{
+	if (importConfigBtn) {{
+	  importConfigBtn.addEventListener('click', async function() {{
     try {{
       let file = null;
       if (window.showOpenFilePicker) {{
@@ -823,9 +1221,13 @@ if (importConfigBtn) {{
     }} catch (error) {{
       alert('导入配置失败：' + error);
     }}
-  }});
-}}
-let virtualTick=0;
+	  }});
+	}}
+	const historyTimeInput=document.getElementById('historyTime');
+	if(historyTimeInput&&!historyTimeInput.value){{const d=new Date(Date.now()-20*60*1000),p=n=>String(n).padStart(2,'0');historyTimeInput.value=d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes());}}
+	const historyTestBtn=document.getElementById('historyTestBtn');
+	if(historyTestBtn){{historyTestBtn.addEventListener('click',async function(){{const box=document.getElementById('historyResult'),inst=document.getElementById('historyInst').value,at=document.getElementById('historyTime').value;if(box)box.textContent='正在回放 '+inst+' @ '+at+' ...';historyTestBtn.disabled=true;try{{const response=await fetch('/api/history-test',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{inst_id:inst,time:at}}),cache:'no-store'}}),payload=await response.json();if(!response.ok||payload.ok===false)throw new Error(payload.error||'回放失败');const s=payload.score||{{}},o=payload.outcome||{{}},v=payload.verdict||{{}},src=payload.source||{{}};if(box)box.textContent=['来源: '+(src.source||'--')+(src.nearest_log_delta_seconds!=null?' / 日志偏差 '+src.nearest_log_delta_seconds+'s':''),'方向: '+(s.raw_direction||'--')+' -> '+(s.final_direction||s.direction||'--'),'观察/交易分: '+(s.raw_total_score??'--')+' / '+(s.final_trade_score??'--'),'市场风险/交易动作: '+(s.market_risk_level||s.risk_level||'--')+' / '+(s.trade_action_level||'--'),'入场: '+(s.entry||'-'),'止损: '+(s.stop_loss||'-'),'止盈: '+(s.take_profit||'-'),'后续K线点数: '+(o.future_points??0),'入场触达: '+(o.entry_touched?'是':'否')+' / 假设成交价 '+(o.entry_price_assumed||'--'),'止损触发: '+(o.stop_hit?'是':'否'),'止盈命中: '+JSON.stringify(o.take_profit_hits||[]),'MFE/MAE: '+fmt(o.mfe_pct,3)+'% / '+fmt(o.mae_pct,3)+'%','5m/15m/20m: '+JSON.stringify(o.returns||{{}}),'结论: '+(v.direction_result||'--')+'，'+(v.entry_result||'--')+'，'+(v.risk_result||'--'),'备注: '+((v.notes||[]).join('；')||'无')].join('\\n');}}catch(error){{if(box)box.textContent='回放失败：'+error;}}finally{{historyTestBtn.disabled=false;}}}});}}
+	let virtualTick=0;
 let configuredMonitorInsts={json.dumps(selected_instruments, ensure_ascii=False)};
 let monitorInst={json.dumps(monitor_initial, ensure_ascii=False)}, monitorPayload=null, monitorLiveMode=false;
 let monitorSeriesByInst={{}}, monitorLastTickerAt=0;
@@ -843,6 +1245,12 @@ function fmt(v,d){{const n=Number(v);return Number.isFinite(n)?n.toFixed(d):'--'
 function fmtPct(v){{const n=Number(v);return Number.isFinite(n)?n.toFixed(4)+'%':'--';}}
 function shortTime(t){{if(!t)return '--';const s=String(t);return s.length>=16?s.slice(11,16):s;}}
 function compactTime(t){{if(!t)return '--';const s=String(t);return s.length>=16?s.slice(5,16):s;}}
+function displayValue(v){{return v===undefined||v===null||v===''?'--':v;}}
+function compactList(v,limit){{if(!Array.isArray(v)||!v.length)return '--';return v.slice(0,limit||3).join(' / ')+(v.length>(limit||3)?' ...':'');}}
+function fmtScore(v){{const n=Number(v);return Number.isFinite(n)?String(Math.round(n)):'--';}}
+function fmtSignedPct(v,d){{const n=Number(v);return Number.isFinite(n)?(n>=0?'+':'')+n.toFixed(d)+'%':'--';}}
+function fmtBool(v){{return v===true?'是':(v===false?'否':'--');}}
+function summarizeLayers(layers){{if(!layers||typeof layers!=='object')return '--';const keys=['market_regime_score','trend_score','momentum_score','volume_price_score','derivatives_score','orderbook_score','entry_quality_score','risk_control_score'];return keys.filter(k=>layers[k]!==undefined&&layers[k]!==null).map(k=>k.replace('_score','').replace('market_regime','状态').replace('volume_price','量价').replace('entry_quality','入场').replace('risk_control','风控').replace('orderbook','盘口').replace('derivatives','合约').replace('momentum','动量').replace('trend','趋势')+':'+fmtScore(layers[k])).join(' / ')||'--';}}
 function updateChartFooter(points){{const c=document.getElementById('monitorPointCount');if(!c)return;c.textContent='数据点：'+((points&&points.length)||0);}}
 function parsePointTime(t){{const s=String(t||'');const m=s.match(/^(\\d{{4}})-(\\d{{2}})-(\\d{{2}})[ T](\\d{{2}}):(\\d{{2}})(?::(\\d{{2}}))?/);if(m)return new Date(Number(m[1]),Number(m[2])-1,Number(m[3]),Number(m[4]),Number(m[5]),Number(m[6]||0));const d=new Date(s);return Number.isFinite(d.getTime())?d:new Date();}}
 function formatPointTime(d){{const pad=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());}}
@@ -852,7 +1260,7 @@ function mergeClientPoints(existing,incoming,maxPoints){{const merged=[],indexBy
 function setMonitorSeries(points){{const series=mergeClientPoints([],points||[],20000);monitorSeriesByInst[monitorInst]=series;monitorPayload={{points:series}};return series;}}
 function appendMonitorPoints(points){{const series=mergeClientPoints(monitorSeriesByInst[monitorInst]||[],points||[],20000);monitorSeriesByInst[monitorInst]=series;monitorPayload={{points:series}};return series;}}
 function drawMonitorSeries(metaText){{const series=monitorSeriesByInst[monitorInst]||[];if(series.length){{drawChart('monitorChart',series,document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));document.getElementById('monitorTitle').textContent=monitorInst+' 实时走势';const m=document.getElementById('monitorMeta');if(m&&metaText)m.textContent=metaText;return true;}}return false;}}
-function snapshotHtml(point,title){{if(!point)return '<strong>Snapshot</strong><div class="snapshot-grid"><span>价格</span><b>--</b><span>时间</span><b>--</b><span>评分</span><b>--</b><span>方向</span><b>--</b></div>';const kind=point.kind==='history'?'历史K线':'实时快照';return '<strong>'+title+' · '+kind+'</strong><div class="snapshot-grid"><span>时间</span><b>'+compactTime(point.time)+'</b><span>价格</span><b>'+fmt(point.price,2)+'</b><span>评分</span><b>'+(point.score??'--')+'</b><span>方向</span><b>'+(point.direction||'--')+'</b><span>风险</span><b>'+(point.risk_level||'--')+'</b><span>OI</span><b>'+fmt(point.open_interest,2)+'</b><span>OI 15m</span><b>'+fmtPct(point.oi_change_pct_15m)+'</b><span>资金费率</span><b>'+fmt(point.funding_rate,6)+'</b><span>多头/空头</span><b>'+fmt(Number(point.long_ratio)*100,1)+'/'+fmt(Number(point.short_ratio)*100,1)+'%</b><span>放量倍数</span><b>'+fmt(point.volume_multiplier,2)+'</b></div>';}}
+	function snapshotHtml(point,title){{if(!point)return '<strong>Snapshot</strong><div class="snapshot-grid"><span>价格</span><b>--</b><span>时间</span><b>--</b><span>评分</span><b>--</b><span>方向</span><b>--</b></div>';const hasMetrics=point.raw_total_score!==undefined&&point.raw_total_score!==null,kind=point.kind==='history'?(hasMetrics?'历史K线+日志指标':'历史K线'):'实时快照',dir=(point.raw_direction&&point.final_direction&&point.raw_direction!==point.final_direction)?(point.raw_direction+' → '+point.final_direction):(point.final_direction||point.direction||'--'),scoreText='综合 '+fmtScore(point.score)+' / 观察 '+fmtScore(point.raw_total_score)+' / 交易 '+fmtScore(point.final_trade_score),riskText=(point.market_risk_level||point.risk_level||'--')+' / '+(point.trade_action_level||'--'),lsAvail=point.long_short_available===false?'不可用':'可用',longShort=fmt(Number(point.long_ratio)*100,1)+'/'+fmt(Number(point.short_ratio)*100,1)+'% ('+lsAvail+')',warmup='OI '+fmtBool(point.oi_warmup_ready)+' / 费率 '+fmtBool(point.funding_warmup_ready),volumeText=fmt(point.volume_multiplier,2)+'x / 阈值 '+fmt(point.volume_threshold_used,2)+'x / '+displayValue(point.volume_direction)+'/'+displayValue(point.volume_trend),bookText=fmtSignedPct(Number(point.order_book_imbalance)*100,1)+' / top5 '+fmtSignedPct(Number(point.order_book_imbalance_5)*100,1)+' / spread '+fmt(point.spread_pct,4)+'%',qualityText=(point.data_quality_reliable===true?'可靠':(point.data_quality_reliable===false?'不足':'--'))+' / 15m确认K '+displayValue(point.data_quality_count),signals=compactList(point.signals,4),waitFor=compactList(point.wait_for,3);return '<strong>'+title+' · '+kind+'</strong><div class="snapshot-grid"><span>时间</span><b>'+compactTime(point.time)+'</b><span>价格</span><b>'+fmt(point.price,2)+'</b><span>分数</span><b>'+scoreText+'</b><span>方向</span><b>'+dir+'</b><span>市场/策略</span><b>'+displayValue(point.market_regime)+' / '+displayValue(point.strategy_template)+'</b><span>风险/动作</span><b>'+riskText+'</b><span>入场质量</span><b>'+displayValue(point.entry_quality)+' / '+fmtScore(point.entry_quality_score)+'</b><span>风控分</span><b>'+fmtScore(point.risk_control_score)+'</b><span>入场</span><b>'+displayValue(point.entry)+'</b><span>止损/止盈</span><b>'+displayValue(point.stop_loss)+' / '+displayValue(point.take_profit)+'</b><span>等待条件</span><b>'+waitFor+'</b><span>信号</span><b>'+signals+'</b><span>数据质量</span><b>'+qualityText+'</b><span>预热</span><b>'+warmup+'</b><span>OI</span><b>'+fmt(point.open_interest,2)+'</b><span>OI 15m</span><b>'+fmtPct(point.oi_change_pct_15m)+'</b><span>资金费率</span><b>'+fmt(point.funding_rate,6)+' / 变化 '+fmt(point.funding_change,6)+'</b><span>多头/空头</span><b>'+longShort+'</b><span>放量</span><b>'+volumeText+'</b><span>ATR 15m</span><b>'+fmt(point.atr_pct_15m,4)+'% / '+displayValue(point.volatility_regime)+'</b><span>盘口</span><b>'+bookText+'</b><span>分层</span><b>'+summarizeLayers(point.layer_scores)+'</b></div>';}}
 function updateSnapshotPanel(point,title){{const panel=document.getElementById('snapshotPanel');if(panel)panel.innerHTML=snapshotHtml(point,title||'Snapshot');}}
 function drawTimeAxis(x,W,H,p,points,cw){{if(!points||points.length<2)return;const maxLabels=Math.max(2,Math.min(8,Math.floor(W/150))),step=Math.max(1,Math.floor((points.length-1)/(maxLabels-1)));x.fillStyle='rgba(229,231,235,.9)';x.font='12px Segoe UI, Microsoft YaHei, Arial';x.textAlign='center';x.textBaseline='top';for(let i=0;i<points.length;i+=step){{const px=p.l+cw*i/(points.length-1);x.fillText(shortTime(points[i].time),px,H-24);}}const lastIndex=points.length-1;if((lastIndex%step)!==0){{x.fillText(shortTime(points[lastIndex].time),W-p.r,H-24);}}}}
 function drawPriceAxis(x,W,H,p,mn,mx){{x.fillStyle='rgba(229,231,235,.82)';x.font='12px Segoe UI, Microsoft YaHei, Arial';x.textAlign='right';x.textBaseline='middle';for(let i=0;i<=4;i++){{const value=mx-(mx-mn)*i/4,y=p.t+(H-p.t-p.b)*i/4;x.fillText(value.toFixed(2),W-8,y);}}}}
@@ -862,9 +1270,9 @@ function drawVirtualMonitor(){{if(!monitorInst){{clearChartMessage('请先在配
 function setMonitorButtonState(state,text){{const btn=document.getElementById('monitorToggleBtn'),meta=document.getElementById('monitorMeta');if(!btn)return;btn.classList.remove('is-running','is-starting');btn.disabled=false;if(state==='starting'){{btn.classList.add('is-starting');btn.textContent='启动中...';btn.disabled=true;if(meta)meta.textContent=text||'正在启动监控进程...';}}else if(state==='running'){{btn.classList.add('is-running');btn.textContent='停止监控';if(meta&&text)meta.textContent=text;}}else if(state==='stopping'){{btn.classList.add('is-starting');btn.textContent='停止中...';btn.disabled=true;if(meta)meta.textContent=text||'正在停止监控进程...';}}else{{btn.textContent='开始监控';if(meta&&text)meta.textContent=text;}}}}
 async function syncMonitorStatus(){{try{{const r=await fetch('/api/status',{{cache:'no-store'}}),p=await r.json();setMonitorButtonState(p.running?'running':'stopped',p.text||'');return p;}}catch(e){{return null;}}}}
 function showRealtimeWaiting(clearChart){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}monitorLiveMode=true;const c=document.getElementById('monitorChart'),l=document.getElementById('monitorLoading'),m=document.getElementById('monitorMeta'),t=document.getElementById('monitorTitle'),p=document.getElementById('monitorPrice');if(clearChart&&c){{const r=c.getBoundingClientRect(),x=c.getContext('2d');c.width=Math.max(1,r.width);c.height=Math.max(1,r.height);x.clearRect(0,0,r.width,r.height);updateChartFooter([]);}}if(l){{l.style.display=clearChart?'grid':'none';l.textContent='监控已启动，正在等待真实价格数据...';}}if(m)m.textContent=clearChart?'实时监控已启动 · 等待第一条价格数据':'已获取最新价 · 等待完整分析数据';if(t)t.textContent=monitorInst+' 实时走势';if(clearChart&&p)p.innerHTML='<strong>--</strong><span>等待真实数据</span>';}}
-async function fetchMonitor(){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return null;}}try{{const r=await fetch('/api/monitor-data?inst_id='+encodeURIComponent(monitorInst),{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false){{clearChartMessage(p.error||'当前币种未配置，不能读取监控数据');return p;}}if(!p.running){{monitorLiveMode=false;monitorSeriesByInst[monitorInst]=[];drawVirtualMonitor();return p;}}monitorLiveMode=true;if(p.points&&p.points.length>0){{setMonitorSeries(p.points);const hasChart=p.source==='web-chart'||p.source==='monitor-chart';document.getElementById('monitorTitle').textContent=monitorInst+(hasChart?' 1m K线走势':' 实时走势');const meta=p.source==='web-chart'?'Web获取1m K线 · 指标读取monitor.py日志':(p.source==='monitor-chart'?'monitor.py 1m K线兜底 · 指标读取日志':'读取monitor.py实时日志 · 等待K线');drawMonitorSeries(meta+' · '+new Date().toLocaleTimeString());}}else if(!drawMonitorSeries('保留最近走势 · 等待K线/日志')){{showRealtimeWaiting(false);}}return p;}}catch(e){{if(monitorLiveMode){{if(!drawMonitorSeries('保留最近走势 · 等待K线/日志'))showRealtimeWaiting(false);}}else drawVirtualMonitor();return null;}}}}
+async function fetchMonitor(){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return null;}}try{{const r=await fetch('/api/monitor-data?inst_id='+encodeURIComponent(monitorInst),{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false){{clearChartMessage(p.error||'当前币种未配置，不能读取监控数据');return p;}}if(!p.running){{monitorLiveMode=false;monitorSeriesByInst[monitorInst]=[];drawVirtualMonitor();return p;}}monitorLiveMode=true;if(p.points&&p.points.length>0){{setMonitorSeries(p.points);const hasChart=p.source==='web-chart'||p.source==='signal-monitor-chart';document.getElementById('monitorTitle').textContent=monitorInst+(hasChart?' 1m K线走势':' 实时走势');const meta=p.source==='web-chart'?'Web获取1m K线 · 指标读取okx_signal_monitor.py日志':(p.source==='signal-monitor-chart'?'okx_signal_monitor.py 1m K线兜底 · 指标读取日志':'读取okx_signal_monitor.py实时日志 · 等待K线');drawMonitorSeries(meta+' · '+new Date().toLocaleTimeString());}}else if(!drawMonitorSeries('保留最近走势 · 等待K线/日志')){{showRealtimeWaiting(false);}}return p;}}catch(e){{if(monitorLiveMode){{if(!drawMonitorSeries('保留最近走势 · 等待K线/日志'))showRealtimeWaiting(false);}}else drawVirtualMonitor();return null;}}}}
 function sleep(ms){{return new Promise(resolve=>setTimeout(resolve,ms));}}
-async function bootstrapMonitorChart(){{monitorLastTickerAt=0;for(let i=0;i<16;i++){{const payload=await fetchMonitor();if(payload&&(payload.source==='web-chart'||payload.source==='monitor-chart')&&payload.points&&payload.points.length>0)break;await sleep(i<4?500:1000);}}}}
+async function bootstrapMonitorChart(){{monitorLastTickerAt=0;for(let i=0;i<16;i++){{const payload=await fetchMonitor();if(payload&&(payload.source==='web-chart'||payload.source==='signal-monitor-chart')&&payload.points&&payload.points.length>0)break;await sleep(i<4?500:1000);}}}}
 function redrawMonitorCached(){{if(drawMonitorSeries())return;const series=virtualSeriesByInst[monitorInst]||[];if(series.length){{drawChart('monitorChart',series,document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));document.getElementById('monitorTitle').textContent=monitorInst+' 虚拟走势';}}else{{drawVirtualMonitor();}}}}
 bindMonitorTabs();
 const monitorToggleBtn=document.getElementById('monitorToggleBtn');
@@ -902,7 +1310,7 @@ if (saveLogBtn) {{
       const hint = document.getElementById('saveLogHint');
       if (window.showSaveFilePicker) {{
         const handle = await showSaveFilePicker({{
-          suggestedName: 'okx_ai_monitor_json.log',
+          suggestedName: 'okx_signal_analysis.jsonl',
           types: [{{ description: '日志文件', accept: {{ 'text/plain': ['.log', '.txt'] }} }}]
         }});
         const writable = await handle.createWritable();
@@ -914,10 +1322,10 @@ if (saveLogBtn) {{
         const url = URL.createObjectURL(blob);
         const link = document.createElement('a');
         link.href = url;
-        link.download = 'okx_ai_monitor_json.log';
+        link.download = 'okx_signal_analysis.jsonl';
         link.click();
         URL.revokeObjectURL(url);
-        if (hint) hint.textContent = '已触发下载：okx_ai_monitor_json.log。';
+        if (hint) hint.textContent = '已触发下载：okx_signal_analysis.jsonl。';
       }}
     }} catch (error) {{
       alert('保存日志失败：' + error);
@@ -963,7 +1371,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def send_asset(self, request_path: str) -> None:
-        name = urllib.parse.unquote(request_path.removeprefix("/assets/"))
+        name = urllib.parse.unquote(request_path.removeprefix("/web-assets/"))
         asset_path = (ASSETS_DIR / name).resolve()
         try:
             asset_path.relative_to(ASSETS_DIR.resolve())
@@ -986,7 +1394,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urllib.parse.urlparse(self.path).path
-        if path.startswith("/assets/"):
+        if path.startswith("/web-assets/"):
             self.send_asset(path)
             return
         if path == "/login":
@@ -1086,6 +1494,15 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=400)
             return
+        if path == "/api/history-test":
+            try:
+                payload = json.loads(raw or "{}")
+                inst_id = str(payload.get("inst_id", "BTC-USDT-SWAP")).strip() or "BTC-USDT-SWAP"
+                at_time = str(payload.get("time", "")).strip()
+                self.send_json(run_history_test(inst_id, at_time))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
         if path == "/save-auth":
             auth = load_auth()
             username = str(form.get("auth_username", auth.get("username", "admin"))).strip() or "admin"
@@ -1110,7 +1527,7 @@ def main() -> int:
         server = ThreadingHTTPServer((HOST, PORT), Handler)
     except OSError as exc:
         print(f"配置页面启动失败: {exc}")
-        print(f"可能是端口 {PORT} 被占用。可以设置 CONFIG_WEB_PORT 后重试。")
+        print(f"可能是端口 {PORT} 被占用。可以设置 WEB_CONTROL_PANEL_PORT 后重试。")
         return 1
     url = f"http://{HOST}:{PORT}"
     print(f"配置页面已启动: {url}")

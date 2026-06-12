@@ -6,8 +6,8 @@ set "PY="
 
 if exist ".venv\Scripts\python.exe" (
     set "PY=.venv\Scripts\python.exe"
-) else if exist ".python\python.exe" (
-    set "PY=.python\python.exe"
+) else if exist "build\python_runtime\python.exe" (
+    set "PY=build\python_runtime\python.exe"
 )
 
 if not defined PY (
@@ -28,19 +28,19 @@ if not defined PY (
 
 if not defined PY (
     echo [config] Python 3.8+ not found.
-    echo Please run install_windows.bat first.
+    echo Please run setup_windows_runtime.bat first.
     pause
     exit /b 1
 )
 
-if not exist "%~dp0config_web.py" (
-    echo [config] config_web.py not found.
+if not exist "%~dp0web_control_panel.py" (
+    echo [config] web_control_panel.py not found.
     pause
     exit /b 1
 )
 
-if not exist "%~dp0config.json" (
-    echo [config] config.json not found.
+if not exist "%~dp0build\local_state\trading_assistant_config.json" (
+    echo [config] build\local_state\trading_assistant_config.json not found.
     pause
     exit /b 1
 )
@@ -51,7 +51,7 @@ echo [config] using Python: %PY%
 echo [config] open http://127.0.0.1:8765 if the browser does not open automatically.
 echo.
 
-%PY% "%~dp0config_web.py"
+%PY% "%~dp0web_control_panel.py"
 if %ERRORLEVEL% NEQ 0 (
     echo.
     echo [config] config web exited with error: %ERRORLEVEL%

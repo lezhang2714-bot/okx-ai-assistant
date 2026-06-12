@@ -11,7 +11,7 @@ if not defined PY (
 if not defined PY (
     echo.
     echo Python was installed, but this terminal cannot find it yet.
-    echo Please close this window and run install_windows.bat again.
+    echo Please close this window and run setup_windows_runtime.bat again.
     pause
     exit /b 1
 )
@@ -75,7 +75,7 @@ if %ERRORLEVEL% NEQ 0 (
 echo.
 echo [install] done
 echo Next:
-echo   config_windows.bat
+echo   start_web_control_panel_windows.bat
 echo.
 echo Web login default:
 echo   user: admin
@@ -110,10 +110,10 @@ if exist "%LocalAppData%\Programs\Python\Python312\python.exe" (
         exit /b 0
     )
 )
-if exist "%CD%\.python\python.exe" (
-    "%CD%\.python\python.exe" -c "import sys; raise SystemExit(0 if sys.version_info >= (3,8) else 1)" >nul 2>nul
+if exist "%CD%\build\python_runtime\python.exe" (
+    "%CD%\build\python_runtime\python.exe" -c "import sys; raise SystemExit(0 if sys.version_info >= (3,8) else 1)" >nul 2>nul
     if %ERRORLEVEL% EQU 0 (
-        set "PY=%CD%\.python\python.exe"
+        set "PY=%CD%\build\python_runtime\python.exe"
         set "USE_PORTABLE=1"
         exit /b 0
     )
@@ -180,7 +180,7 @@ exit /b 0
 
 :install_python_portable
 set "PY="
-set "PORTABLE_DIR=%CD%\.python"
+set "PORTABLE_DIR=%CD%\build\python_runtime"
 set "PORTABLE_ZIP=%TEMP%\python-3.12.10-embed-amd64.zip"
 set "PORTABLE_URL=https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip"
 set "GETPIP=%TEMP%\get-pip.py"
