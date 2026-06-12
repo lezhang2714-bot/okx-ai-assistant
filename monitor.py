@@ -7,14 +7,10 @@ Scope:
     - Provide analysis and suggestions only.
     - No auto order, no martingale, no grid.
 
-<<<<<<< Updated upstream
-Optional AI:
-=======
 Install:
     pip install python-okx
 
 Optional AI (OpenAI / DeepSeek):
->>>>>>> Stashed changes
     pip install openai
     export AI_API_KEY="..."           # 或 OPENAI_API_KEY
     export AI_BASE_URL="https://api.deepseek.com"  # DeepSeek; OpenAI留空
@@ -693,18 +689,6 @@ class OkxAiShortTermAssistant:
                 # 本地综合评分，包括：各项打分、总分、建议、操作区间、风险等级、K线趋势；
                 score = self.score_snapshot(snapshot, signals)
 
-<<<<<<< Updated upstream
-                # 有信号产生则进行AI分析，节省AI成本；否则，进行本地分析（本地分析结果封装成AI返回格式）
-                analysis = self.analyze_with_ai(snapshot, signals, score) if signals else self._local_analysis(snapshot, signals, score)
-
-                # 快照、信号、评分、分析结果打印到控制台
-                # self._print_console(snapshot, signals, score, analysis)
-
-                # 微信推送判断与处理：有信号 and 80分以上 and 功能使能 才会推送
-                self.push_if_needed(snapshot, signals, score, analysis)
-                
-                # 记录JSON日志到文件
-=======
                 # 只有触发信号才调用AI；否则用本地规则输出简要分析，节省AI成本。
                 # analysis = self.analyze_with_ai(snapshot, signals, score) if signals else self._local_analysis(snapshot, signals, score)
                 analysis = self.analyze_with_ai(snapshot, signals, score)
@@ -713,7 +697,6 @@ class OkxAiShortTermAssistant:
                 # 推送判断与处理
                 self.push_if_needed(snapshot, signals, score, analysis)
                 # # 记录JSON日志
->>>>>>> Stashed changes
                 self.log_result(snapshot, signals, score, analysis)
 
             except Exception as exc:
