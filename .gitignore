@@ -1,5 +1,8 @@
 build/
+local_state/
 __pycache__/
 *.py[cod]
 .venv/
 logs/
+config/api_secrets.env
+config/web_console_auth.json

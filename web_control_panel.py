@@ -45,12 +45,19 @@ except ModuleNotFoundError:
     trend_profile_from_candles = signal_monitor_module.trend_profile_from_candles
 
 BUILD_DIR = SCRIPT_DIR / "build"
-LOCAL_STATE_DIR = BUILD_DIR / "local_state"
+CONFIG_DIR = SCRIPT_DIR / "config"
+PORTABLE_STATE_DIR = SCRIPT_DIR / "local_state"
+LEGACY_STATE_DIR = BUILD_DIR / "local_state"
 ASSETS_DIR = SCRIPT_DIR / "web_assets"
 LOG_DIR = BUILD_DIR / "runtime_logs"
-CONFIG_FILE = LOCAL_STATE_DIR / "trading_assistant_config.json"
-ENV_FILE = LOCAL_STATE_DIR / "api_secrets.env"
-AUTH_FILE = LOCAL_STATE_DIR / "web_console_auth.json"
+DEFAULT_CONFIG_FILE = CONFIG_DIR / "trading_assistant_config.json"
+DEFAULT_AUTH_FILE = CONFIG_DIR / "web_console_auth.default.json"
+PORTABLE_CONFIG_FILE = PORTABLE_STATE_DIR / "trading_assistant_config.json"
+PORTABLE_ENV_FILE = PORTABLE_STATE_DIR / "api_secrets.env"
+PORTABLE_AUTH_FILE = PORTABLE_STATE_DIR / "web_console_auth.json"
+LEGACY_CONFIG_FILE = LEGACY_STATE_DIR / "trading_assistant_config.json"
+LEGACY_ENV_FILE = LEGACY_STATE_DIR / "api_secrets.env"
+LEGACY_AUTH_FILE = LEGACY_STATE_DIR / "web_console_auth.json"
 USER_STATE_DIR = (Path(os.getenv("LOCALAPPDATA")) / "OKX_AI_Assistant") if os.getenv("LOCALAPPDATA") else (Path.home() / ".okx_ai_assistant")
 USER_CONFIG_FILE = USER_STATE_DIR / "trading_assistant_config.json"
 USER_ENV_FILE = USER_STATE_DIR / "api_secrets.env"
@@ -73,6 +80,18 @@ CONFIG_FIELDS = [
     ("基础运行", "interval", "number", "轮询间隔(秒)", "默认5秒执行一轮监控。"),
     ("基础运行", "runtime", "number", "运行时长(秒)", "0表示一直运行，300表示运行5分钟。"),
     ("基础运行", "flag", "choice", "OKX环境", "0正式环境，1模拟盘。"),
+    ("策略模式", "strategy_mode", "strategy_choice", "策略周期", "超短线捕捉1-15分钟急速波动；短线关注5m/15m结构；中线关注1H/4H趋势。"),
+    ("策略模式", "risk_preference", "risk_choice", "风险偏好", "保守提高确认门槛，激进更早提示机会。"),
+    ("策略模式", "signal_trade_enabled", "checkbox", "交易信号", "允许推送做多/做空交易信号。"),
+    ("策略模式", "signal_watch_enabled", "checkbox", "观察信号", "允许推送资金费率、背离、布林收口等观察型风险信号。"),
+    ("策略模式", "signal_spike_enabled", "checkbox", "急速异动提醒", "并行捕捉5-10分钟急速涨跌，即使主策略不是超短线也会提示。"),
+    ("策略模式", "ai_output_style", "ai_style_choice", "AI输出风格", "稳健确认偏保守；动量捕捉更关注短时波动；趋势跟随更关注顺势结构。"),
+    ("高级策略", "allow_scalp_trade", "checkbox", "允许超短线交易建议", "关闭时超短线只做异动提醒；开启后可给入场/止损/止盈。"),
+    ("高级策略", "allow_counter_4h_scalp", "checkbox", "允许逆4H短打", "仅影响超短线，开启后不因4H反向直接压低动量单。"),
+    ("高级策略", "allow_oi_divergence_momentum", "checkbox", "允许OI背离动量单", "仅影响超短线，允许价涨仓减这类逼空/回补型上涨提示。"),
+    ("高级策略", "scalp_move_pct_5m", "number", "5分钟急速阈值%", "最近5根已收盘1m K线涨跌幅超过该值时触发超短线动量评分。"),
+    ("高级策略", "scalp_move_pct_10m", "number", "10分钟急速阈值%", "最近10根已收盘1m K线涨跌幅超过该值时触发超短线动量评分。"),
+    ("AI与推送", "watch_push_score", "number", "观察/异动推送分", "观察信号和急速异动提醒达到该分数才推送。"),
     ("AI与推送", "ai_enabled", "checkbox", "启用AI分析", "触发信号后调用AI。"),
     ("AI与推送", "dry_run_ai", "checkbox", "AI dry-run", "只生成AI请求数据，不真实调用AI。"),
     ("AI与推送", "push_enabled", "checkbox", "启用微信推送", "满足信号和评分条件时通过 Server酱 推送到个人微信。"),
@@ -95,12 +114,65 @@ ENV_FIELDS = [
 ]
 
 
+def default_config() -> Dict[str, Any]:
+    return {
+        "inst_ids": ["BTC-USDT-SWAP", "ETH-USDT-SWAP"],
+        "interval": 5,
+        "runtime": 0,
+        "flag": "0",
+        "strategy_mode": "short",
+        "risk_preference": "standard",
+        "signal_trade_enabled": True,
+        "signal_watch_enabled": True,
+        "signal_spike_enabled": True,
+        "ai_output_style": "steady",
+        "allow_scalp_trade": False,
+        "allow_counter_4h_scalp": False,
+        "allow_oi_divergence_momentum": False,
+        "scalp_move_pct_5m": 0.22,
+        "scalp_move_pct_10m": 0.35,
+        "ai_enabled": False,
+        "dry_run_ai": False,
+        "push_enabled": False,
+        "push_score": 80,
+        "watch_push_score": 80,
+        "volume_multiplier": 2.0,
+        "oi_change_pct_15m": 5.0,
+        "funding_abs_threshold": 0.0008,
+        "funding_change_threshold": 0.0003,
+        "long_short_extreme": 0.75,
+        "retry_times": 3,
+        "retry_backoff": 1.5,
+        "push_cooldown_seconds": 900,
+        "log_max_bytes": 10485760,
+    }
+
+
+def migrate_legacy_build_state() -> None:
+    for source, target in (
+        (LEGACY_CONFIG_FILE, PORTABLE_CONFIG_FILE),
+        (LEGACY_ENV_FILE, PORTABLE_ENV_FILE),
+        (LEGACY_AUTH_FILE, PORTABLE_AUTH_FILE),
+    ):
+        if not source.exists() or target.exists():
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+        except OSError:
+            continue
+
+
 def esc(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
 
 def active_config_file() -> Path:
-    return USER_CONFIG_FILE if USER_CONFIG_FILE.exists() else CONFIG_FILE
+    migrate_legacy_build_state()
+    for path in (PORTABLE_CONFIG_FILE, USER_CONFIG_FILE, DEFAULT_CONFIG_FILE):
+        if path.exists():
+            return path
+    return DEFAULT_CONFIG_FILE
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -110,7 +182,11 @@ def load_json(path: Path, default: Any) -> Any:
 
 
 def load_config() -> Dict[str, Any]:
-    return load_json(active_config_file(), {})
+    config = default_config()
+    loaded = load_json(active_config_file(), {})
+    if isinstance(loaded, dict):
+        config.update(loaded)
+    return config
 
 
 def configured_instruments() -> List[str]:
@@ -123,11 +199,11 @@ def configured_instruments() -> List[str]:
 def save_config(config: Dict[str, Any]) -> Path:
     text = json.dumps(config, indent=2, ensure_ascii=False) + "\n"
     try:
-        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(text, encoding="utf-8")
+        PORTABLE_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PORTABLE_CONFIG_FILE.write_text(text, encoding="utf-8")
         if USER_CONFIG_FILE.exists():
             USER_CONFIG_FILE.write_text(text, encoding="utf-8")
-        return CONFIG_FILE
+        return PORTABLE_CONFIG_FILE
     except PermissionError:
         USER_STATE_DIR.mkdir(parents=True, exist_ok=True)
         USER_CONFIG_FILE.write_text(text, encoding="utf-8")
@@ -135,7 +211,8 @@ def save_config(config: Dict[str, Any]) -> Path:
 
 
 def load_auth() -> Dict[str, str]:
-    for path in (USER_AUTH_FILE, AUTH_FILE):
+    migrate_legacy_build_state()
+    for path in (PORTABLE_AUTH_FILE, USER_AUTH_FILE, DEFAULT_AUTH_FILE):
         if path.exists():
             return load_json(path, {"username": "admin", "password": "admin123"})
     save_auth("admin", "admin123")
@@ -146,9 +223,9 @@ def save_auth(username: str, password: str) -> Path:
     data = {"username": username.strip() or "admin", "password": password.strip() or "admin123"}
     text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
     try:
-        AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
-        AUTH_FILE.write_text(text, encoding="utf-8")
-        return AUTH_FILE
+        PORTABLE_AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PORTABLE_AUTH_FILE.write_text(text, encoding="utf-8")
+        return PORTABLE_AUTH_FILE
     except PermissionError:
         USER_STATE_DIR.mkdir(parents=True, exist_ok=True)
         USER_AUTH_FILE.write_text(text, encoding="utf-8")
@@ -157,7 +234,8 @@ def save_auth(username: str, password: str) -> Path:
 
 def load_env() -> Dict[str, str]:
     env: Dict[str, str] = {}
-    for path in (ENV_FILE, USER_ENV_FILE):
+    migrate_legacy_build_state()
+    for path in (PORTABLE_ENV_FILE, USER_ENV_FILE):
         if not path.exists():
             continue
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -182,9 +260,9 @@ def save_env(env: Dict[str, str]) -> Path:
     ]
     text = "\n".join(lines)
     try:
-        ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ENV_FILE.write_text(text, encoding="utf-8")
-        return ENV_FILE
+        PORTABLE_ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PORTABLE_ENV_FILE.write_text(text, encoding="utf-8")
+        return PORTABLE_ENV_FILE
     except PermissionError:
         USER_STATE_DIR.mkdir(parents=True, exist_ok=True)
         USER_ENV_FILE.write_text(text, encoding="utf-8")
@@ -217,8 +295,8 @@ def update_from_form(form: Dict[str, Any]) -> Path:
     for _, key, kind, _, _ in CONFIG_FIELDS:
         if kind == "checkbox":
             config[key] = parse_bool(form, key)
-        elif kind == "choice":
-            config[key] = str(form.get(key, "0"))
+        elif kind in ("choice", "strategy_choice", "risk_choice", "ai_style_choice"):
+            config[key] = str(form.get(key, config.get(key, "0")))
         else:
             raw = str(form.get(key, "")).strip()
             old = config.get(key)
@@ -284,7 +362,28 @@ def build_monitor_args(config: Dict[str, Any]) -> List[str]:
         str(config.get("funding_change_threshold", 0.0003)),
         "--long-short-extreme",
         str(config.get("long_short_extreme", 0.75)),
+        "--strategy-mode",
+        str(config.get("strategy_mode", "short")),
+        "--risk-preference",
+        str(config.get("risk_preference", "standard")),
+        "--ai-output-style",
+        str(config.get("ai_output_style", "steady")),
+        "--scalp-move-pct-5m",
+        str(config.get("scalp_move_pct_5m", 0.22)),
+        "--scalp-move-pct-10m",
+        str(config.get("scalp_move_pct_10m", 0.35)),
+        "--watch-push-score",
+        str(config.get("watch_push_score", config.get("push_score", 80))),
     ]
+    args.append("--trade-signals" if config.get("signal_trade_enabled", True) else "--no-trade-signals")
+    args.append("--watch-signals" if config.get("signal_watch_enabled", True) else "--no-watch-signals")
+    args.append("--spike-alerts" if config.get("signal_spike_enabled", True) else "--no-spike-alerts")
+    if config.get("allow_scalp_trade"):
+        args.append("--allow-scalp-trade")
+    if config.get("allow_counter_4h_scalp"):
+        args.append("--allow-counter-4h-scalp")
+    if config.get("allow_oi_divergence_momentum"):
+        args.append("--allow-oi-divergence-momentum")
     if config.get("ai_enabled"):
         args.append("--ai")
     if config.get("dry_run_ai"):
@@ -761,6 +860,18 @@ def build_history_assistant(config: Dict[str, Any]) -> OkxAiShortTermAssistant:
             funding_abs_threshold=float(config.get("funding_abs_threshold", 0.0008)),
             funding_change_threshold=float(config.get("funding_change_threshold", 0.0003)),
             long_short_extreme=float(config.get("long_short_extreme", 0.75)),
+            strategy_mode=str(config.get("strategy_mode", "short")),
+            risk_preference=str(config.get("risk_preference", "standard")),
+            signal_trade_enabled=bool(config.get("signal_trade_enabled", True)),
+            signal_watch_enabled=bool(config.get("signal_watch_enabled", True)),
+            signal_spike_enabled=bool(config.get("signal_spike_enabled", True)),
+            ai_output_style=str(config.get("ai_output_style", "steady")),
+            allow_scalp_trade=bool(config.get("allow_scalp_trade", False)),
+            allow_counter_4h_scalp=bool(config.get("allow_counter_4h_scalp", False)),
+            allow_oi_divergence_momentum=bool(config.get("allow_oi_divergence_momentum", False)),
+            scalp_move_pct_5m=float(config.get("scalp_move_pct_5m", 0.22)),
+            scalp_move_pct_10m=float(config.get("scalp_move_pct_10m", 0.35)),
+            watch_push_score=int(config.get("watch_push_score", config.get("push_score", 80))),
         ),
         runtime_config=RuntimeConfig(),
     )
@@ -1249,7 +1360,7 @@ def reliability_level(total: int, mature_rate_pct: float, edge_pct: float, trade
     return score, level
 
 
-def accuracy_report(inst_id: str, horizon_seconds: int = 5, max_points: int = 360, scope: str = "session") -> Dict[str, Any]:
+def accuracy_report(inst_id: str, horizon_seconds: int = 5, max_points: int = 2400, scope: str = "session") -> Dict[str, Any]:
     if inst_id not in SUPPORTED_INSTRUMENTS:
         raise ValueError("仅支持 BTC-USDT-SWAP 或 ETH-USDT-SWAP")
     horizon_seconds = max(5, min(3600, int(horizon_seconds or 5)))
@@ -1375,6 +1486,8 @@ def accuracy_report(inst_id: str, horizon_seconds: int = 5, max_points: int = 36
         rolling.append({
             "time": row["time"],
             "accuracy_pct": sum(1 for item in sample if item["hit"]) / len(sample) * 100 if sample else 0.0,
+            "price": row["price"],
+            "future_price": row["future_price"],
             "return_pct": row["actual_return_pct"],
             "hit": row["hit"],
             "direction": row["final_direction"],
@@ -1470,6 +1583,36 @@ def field_html(key: str, label: str, kind: str, help_text: str, value: Any) -> s
             f'<option value="1" {"selected" if str(value) == "1" else ""}>1 模拟盘</option>'
             "</select>"
         )
+    elif kind == "strategy_choice":
+        current = str(value or "short")
+        options = (
+            ("scalp", "超短线"),
+            ("short", "短线（推荐）"),
+            ("swing", "中线"),
+        )
+        control = '<select name="' + esc(key) + '">' + "".join(
+            f'<option value="{esc(opt)}" {"selected" if current == opt else ""}>{esc(text)}</option>' for opt, text in options
+        ) + "</select>"
+    elif kind == "risk_choice":
+        current = str(value or "standard")
+        options = (
+            ("conservative", "保守"),
+            ("standard", "标准（推荐）"),
+            ("aggressive", "激进"),
+        )
+        control = '<select name="' + esc(key) + '">' + "".join(
+            f'<option value="{esc(opt)}" {"selected" if current == opt else ""}>{esc(text)}</option>' for opt, text in options
+        ) + "</select>"
+    elif kind == "ai_style_choice":
+        current = str(value or "steady")
+        options = (
+            ("steady", "稳健确认"),
+            ("momentum", "动量捕捉"),
+            ("trend", "趋势跟随"),
+        )
+        control = '<select name="' + esc(key) + '">' + "".join(
+            f'<option value="{esc(opt)}" {"selected" if current == opt else ""}>{esc(text)}</option>' for opt, text in options
+        ) + "</select>"
     else:
         step = "any" if isinstance(value, float) else "1"
         control = f'<input type="number" step="{step}" name="{esc(key)}" value="{esc(value)}">'
@@ -1612,7 +1755,7 @@ button,.button{{border:0;border-radius:12px;padding:11px 16px;background:#f1f3f8
 	<h3>推送类型</h3><div class="help-grid"><div class="help-item"><strong>trade</strong><p>最终方向为做多或做空，且交易分达到推送阈值。重点看入场区、止损、止盈、失效条件。</p></div><div class="help-item"><strong>watch</strong><p>最终可能仍是观望，但观察分高且出现风险或异常信号，例如资金费率过热、RSI极端、布林挤压、多空拥挤。</p></div></div>
 	<h3>入场、止损、止盈与追踪</h3><ul class="help-list"><li>入场区由ATR、结构位、EMA/VWAP近似锚点生成，不是固定百分比。</li><li>止损优先参考结构失效位，并加ATR缓冲。</li><li>止盈按风险距离生成两档，偏向1R/2R思路。</li><li>在线追踪先等待价格触达入场区；触达判断优先使用最新1m K线 high/low。</li><li>追踪成交价是保守估算：做多按入场区上沿，做空按入场区下沿，并记录 <code>fill_assumption</code>。</li><li>近期历史回放优先使用本地 <code>build/runtime_logs/okx_signal_analysis.jsonl</code> 的后续1m K线；没有日志时才用OKX历史K线兜底。</li></ul>
 	<h3>回放测试解读</h3><ul class="help-list"><li><code>来源</code> 表示评分快照来自监控日志或K线重建；日志偏差越小越接近所选时间。</li><li><code>后续数据</code> 表示验证后续走势的数据来源，优先为 <code>signal-monitor-log</code>。</li><li><code>后续K线点数</code> 为0时不具备验证意义，通常说明所选时间之后没有持续监控日志，或OKX兜底数据未取到。</li><li><code>MFE/MAE</code> 表示入场后最大顺向/逆向波动；未触达入场区时只是观察方向的价格波动。</li><li><code>5m/15m/20m</code> 用目标时间后的收盘价计算方向表现，适合验证观察方向，不等于真实成交收益。</li></ul>
-	<h3>本地文件位置</h3><ul class="help-list"><li>运行日志保存在 <code>build/runtime_logs</code>，配置、密钥和登录认证保存在 <code>build/local_state</code>。</li><li><code>build</code> 是本地运行目录，已在 <code>.gitignore</code> 中忽略，不应提交。</li><li>页面资源保留在 <code>web_assets</code>，源码入口是 <code>web_control_panel.py</code> 和 <code>okx_signal_monitor.py</code>。</li></ul>
+	<h3>本地文件位置</h3><ul class="help-list"><li>运行日志保存在 <code>build/runtime_logs</code>，默认配置模板保存在 <code>config</code>，本机密钥和登录认证保存在 <code>local_state</code>。</li><li><code>build</code> 是运行时产物目录，<code>local_state</code> 保存本机私密状态，均不应提交。</li><li>页面资源保留在 <code>web_assets</code>，源码入口是 <code>web_control_panel.py</code> 和 <code>okx_signal_monitor.py</code>。</li></ul>
 	<h3>常见误读</h3><ul class="help-list"><li>观察分高不代表必须交易，可能只是风险异常值得关注。</li><li>市场风险低不代表一定盈利，只代表当前拥挤/过热/冲突较少。</li><li>盘口不平衡可能是假挂单，当前只作为小权重确认。</li><li>最终方向为观望时，入场/止损/止盈为 <code>-</code> 是正常结果。</li><li>AI分析会审计本地规则，但数据不足、预热不足或信号冲突时应优先观望。</li></ul>
 	</section></div></div>
 	</main></div></div>
@@ -1762,6 +1905,15 @@ const importConfigBtn = document.getElementById('importConfigBtn');
 	async function fetchAccuracy(){{const canvas=document.getElementById('accuracyChart');if(!canvas)return;const inst=(document.getElementById('accuracyInst')||{{}}).value||'BTC-USDT-SWAP',h=(document.getElementById('accuracyHorizon')||{{}}).value||'5',scope=(document.getElementById('accuracyScope')||{{}}).value||'session',note=document.getElementById('accuracyNote');try{{if(note)note.textContent='正在统计实时预测压测...';const r=await fetch('/api/accuracy-data?inst_id='+encodeURIComponent(inst)+'&horizon='+encodeURIComponent(h)+'&scope='+encodeURIComponent(scope),{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'统计失败');const s=p.summary||{{}};updateAccuracySummary(s);drawAccuracyChart(p.points||[]);if(note)note.textContent=(p.scope==='session'?'本次启动后':'全部历史')+' · 等级 '+(s.reliability_level||'--')+' · 分数 '+fmt(s.reliability_score,1)+' · 已验证/日志 '+(s.total??0)+'/'+(s.raw_log_total??s.total??0)+' · 观望按区间机会验证，做多/做空按入场-止损-止盈路径验证 · 窗口 '+(p.horizon_seconds||h)+' 秒。';}}catch(e){{updateAccuracySummary({{}});drawAccuracyChart([]);if(note)note.textContent='预测压测统计失败：'+e;}}}}
 	function updateAccuracySummary(s){{const box=document.getElementById('accuracySummary');if(!box)return;const edge=s.model_edge_pct;const edgeText=edge!=null?(edge>=0?'+':'')+fmt(edge,1)+'pct':'--';const vals=[['可靠性等级',(s.reliability_level||'--')+' / '+(s.reliability_score!=null?fmt(s.reliability_score,1):'--')],['已验证/日志',(s.total??0)+' / '+(s.raw_log_total??s.total??0)],['待验证/成熟率',(s.pending_total??0)+' / '+(s.mature_rate_pct!=null?fmt(s.mature_rate_pct,1)+'%':'--')],['决策合理率',s.decision_accuracy_pct!=null?fmt(s.decision_accuracy_pct,1)+'% / '+(s.decision_total??0):'--'],['相对观望基准',edgeText+' / 基准 '+(s.baseline_watch_pct!=null?fmt(s.baseline_watch_pct,1)+'%':'--')],['观望区间可靠率',s.watch_reasonable_pct!=null?fmt(s.watch_reasonable_pct,1)+'% / '+(s.watch_total??0):'--'],['交易建议合理率',s.trade_signal_accuracy_pct!=null?fmt(s.trade_signal_accuracy_pct,1)+'% / '+(s.trade_signal_total??0):'--'],['入场触达/未成交',fmt(s.entry_touch_pct,1)+'% / '+fmt(s.no_fill_pct,1)+'%'],['止盈/止损',fmt(s.take_profit_pct,1)+'% / '+fmt(s.stop_hit_pct,1)+'%'],['交易胜率',fmt(s.trade_win_rate_pct,1)+'% / '+(s.trade_resolved_total??0)],['MFE/MAE均值',fmt(s.avg_mfe_pct,3)+'% / '+fmt(s.avg_mae_pct,3)+'%'],['趋势倾向命中率',s.trend_bias_accuracy_pct!=null?fmt(s.trend_bias_accuracy_pct,1)+'% / '+(s.trend_bias_total??0):'--']];box.innerHTML=vals.map(v=>'<div><span>'+v[0]+'</span><b>'+v[1]+'</b></div>').join('');}}
 	function drawAccuracyChart(points){{const c=document.getElementById('accuracyChart');if(!c)return;const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=Math.max(1,r.width*d);c.height=Math.max(1,r.height*d);const x=c.getContext('2d');x.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,p={{l:48,r:22,t:20,b:34}},cw=W-p.l-p.r,ch=H-p.t-p.b,topH=ch*.58,gap=18,botTop=p.t+topH+gap,botH=ch-topH-gap;x.clearRect(0,0,W,H);x.fillStyle='#0f172a';x.fillRect(0,0,W,H);x.strokeStyle='rgba(148,163,184,.22)';x.lineWidth=1;for(let i=0;i<=4;i++){{const y=p.t+topH*i/4;x.beginPath();x.moveTo(p.l,y);x.lineTo(W-p.r,y);x.stroke();x.fillStyle='rgba(203,213,225,.82)';x.font='11px Segoe UI, Arial';x.textAlign='right';x.textBaseline='middle';x.fillText(String(100-i*25)+'%',p.l-8,y);}}const zeroY=botTop+botH/2;x.strokeStyle='rgba(203,213,225,.42)';x.beginPath();x.moveTo(p.l,zeroY);x.lineTo(W-p.r,zeroY);x.stroke();x.fillStyle='rgba(203,213,225,.82)';x.textAlign='right';x.fillText('涨跌0',p.l-8,zeroY);if(!points.length){{x.fillStyle='rgba(203,213,225,.8)';x.textAlign='center';x.font='13px Segoe UI, Microsoft YaHei';x.fillText('暂无可验证样本：启动监控后等待下一轮价格日志即可出现',W/2,H/2);return;}}const step=cw/Math.max(1,points.length-1),retMax=Math.max(.02,...points.map(o=>Math.abs(Number(o.return_pct)||0)));points.forEach((o,i)=>{{const px=p.l+step*i,ret=Number(o.return_pct)||0,barH=Math.min(botH/2-4,Math.abs(ret)/retMax*(botH/2-4));x.fillStyle=ret>=0?'rgba(248,113,113,.78)':'rgba(34,197,94,.78)';x.fillRect(px-Math.max(1,step*.32),ret>=0?zeroY-barH:zeroY,Math.max(2,step*.64),barH);x.fillStyle=o.hit?'#38bdf8':'#f59e0b';x.beginPath();x.arc(px,p.t+topH-(Number(o.accuracy_pct)||0)/100*topH,2.8,0,7);x.fill();}});x.beginPath();points.forEach((o,i)=>{{const px=p.l+step*i,py=p.t+topH-(Number(o.accuracy_pct)||0)/100*topH;if(i===0)x.moveTo(px,py);else x.lineTo(px,py);}});x.strokeStyle='#60a5fa';x.lineWidth=2;x.stroke();x.fillStyle='rgba(203,213,225,.9)';x.textAlign='left';x.textBaseline='top';x.font='12px Segoe UI, Microsoft YaHei';x.fillText('上半区：蓝线=最近25次滚动决策合理率，青点=合理，橙点=不合理',p.l,p.t+4);x.fillText('下半区：柱子=验证窗口后的真实涨跌，红=涨，绿=跌',p.l,botTop+4);x.textAlign='center';x.textBaseline='top';for(let i=0;i<points.length;i+=Math.max(1,Math.floor(points.length/5))){{x.fillText(compactTime(points[i].time),p.l+step*i,H-24);}}}}
+	function drawAccuracyChart(points){{const c=document.getElementById('accuracyChart');if(!c)return;const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=Math.max(1,r.width*d);c.height=Math.max(1,r.height*d);const x=c.getContext('2d');x.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,p={{l:54,r:28,t:24,b:38}},cw=W-p.l-p.r,ch=H-p.t-p.b;x.clearRect(0,0,W,H);x.fillStyle='#0f172a';x.fillRect(0,0,W,H);x.strokeStyle='rgba(148,163,184,.22)';x.lineWidth=1;for(let i=0;i<=4;i++){{const y=p.t+ch*i/4;x.beginPath();x.moveTo(p.l,y);x.lineTo(W-p.r,y);x.stroke();}}if(!points.length){{x.fillStyle='rgba(203,213,225,.82)';x.textAlign='center';x.textBaseline='middle';x.font='13px Segoe UI, Microsoft YaHei';x.fillText('No mature accuracy samples yet. Start monitoring and wait for future price points.',W/2,H/2);return;}}const clean=points.filter(o=>Number.isFinite(Number(o.price)));if(!clean.length){{x.fillStyle='rgba(203,213,225,.82)';x.textAlign='center';x.textBaseline='middle';x.font='13px Segoe UI, Microsoft YaHei';x.fillText('No price data in accuracy samples yet.',W/2,H/2);return;}}const dirValue=o=>{{const v=String((o&&o.direction)||'');if(v==='\\u505a\\u591a')return 1;if(v==='\\u505a\\u7a7a')return -1;return 0;}},priceVals=clean.map(o=>Number(o.price)),mn=Math.min(...priceVals),mx=Math.max(...priceVals),priceRange=Math.max(0.000001,mx-mn);let pred=0;const predVals=clean.map(o=>{{pred+=dirValue(o);return pred;}}),pmn=Math.min(...predVals),pmx=Math.max(...predVals),predRange=Math.max(1,pmx-pmn),step=cw/Math.max(1,clean.length-1),xAt=i=>p.l+step*i,priceY=o=>p.t+ch-(Number(o.price)-mn)/priceRange*ch,predY=i=>p.t+ch-(predVals[i]-pmn)/predRange*ch;function line(color,width,yFn){{x.beginPath();clean.forEach((o,i)=>{{const px=xAt(i),py=yFn(o,i);if(i===0)x.moveTo(px,py);else x.lineTo(px,py);}});x.strokeStyle=color;x.lineWidth=width;x.stroke();}}line('#60a5fa',2.2,priceY);line('#fbbf24',2.2,(o,i)=>predY(i));clean.forEach((o,i)=>{{const px=xAt(i),py=priceY(o);x.fillStyle=o.hit?'#22d3ee':'#fb7185';x.beginPath();x.arc(px,py,3,0,Math.PI*2);x.fill();}});x.fillStyle='rgba(226,232,240,.92)';x.font='12px Segoe UI, Microsoft YaHei';x.textAlign='left';x.textBaseline='top';x.fillText('blue: price curve',p.l,p.t+4);x.fillStyle='#fbbf24';x.fillText('yellow: predicted direction curve (long up, watch flat, short down)',p.l+130,p.t+4);x.fillStyle='rgba(226,232,240,.78)';x.textAlign='right';x.textBaseline='middle';x.fillText(fmt(mx,2),p.l-8,p.t);x.fillText(fmt((mx+mn)/2,2),p.l-8,p.t+ch/2);x.fillText(fmt(mn,2),p.l-8,p.t+ch);x.textAlign='left';x.fillText('pred +',W-p.r+6,p.t);x.fillText('pred -',W-p.r+6,p.t+ch);x.textAlign='center';x.textBaseline='top';for(let i=0;i<clean.length;i+=Math.max(1,Math.floor(clean.length/5))){{x.fillStyle='rgba(203,213,225,.78)';x.fillText(compactTime(clean[i].time),xAt(i),H-26);}}}}
+	const accuracyView={{points:[],start:0,end:1,yZoom:1,yPan:0,drag:null}};
+	function clamp(v,a,b){{return Math.max(a,Math.min(b,v));}}
+	function accuracyDirectionValue(o){{const v=String((o&&o.direction)||'');if(v==='\\u505a\\u591a')return 1;if(v==='\\u505a\\u7a7a')return -1;return 0;}}
+	function resetAccuracyView(){{accuracyView.start=0;accuracyView.end=1;accuracyView.yZoom=1;accuracyView.yPan=0;}}
+	function visibleAccuracyPoints(){{const pts=accuracyView.points||[];if(pts.length<=2)return pts;const n=pts.length,span=Math.max(0.001,accuracyView.end-accuracyView.start),a=Math.floor(accuracyView.start*(n-1)),b=Math.min(n,Math.max(a+2,Math.ceil((accuracyView.start+span)*(n-1))+1));return pts.slice(a,b);}}
+	function drawAccuracyChart(points){{if(Array.isArray(points)){{accuracyView.points=points.filter(o=>Number.isFinite(Number(o&&o.price)));resetAccuracyView();}}const c=document.getElementById('accuracyChart');if(!c)return;const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=Math.max(1,r.width*d);c.height=Math.max(1,r.height*d);const x=c.getContext('2d');x.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,p={{l:58,r:46,t:24,b:40}},cw=W-p.l-p.r,ch=H-p.t-p.b;x.clearRect(0,0,W,H);x.fillStyle='#0f172a';x.fillRect(0,0,W,H);x.strokeStyle='rgba(148,163,184,.22)';x.lineWidth=1;for(let i=0;i<=4;i++){{const y=p.t+ch*i/4;x.beginPath();x.moveTo(p.l,y);x.lineTo(W-p.r,y);x.stroke();}}const clean=visibleAccuracyPoints();if(!clean.length){{x.fillStyle='rgba(203,213,225,.82)';x.textAlign='center';x.textBaseline='middle';x.font='13px Segoe UI, Microsoft YaHei';x.fillText('No mature accuracy samples yet. Start monitoring and wait for future price points.',W/2,H/2);return;}}const priceVals=clean.map(o=>Number(o.price)),mn=Math.min(...priceVals),mx=Math.max(...priceVals),priceRange=Math.max(0.000001,mx-mn);let pred=0;const predVals=clean.map(o=>{{pred+=accuracyDirectionValue(o);return pred;}}),pmn=Math.min(...predVals),pmx=Math.max(...predVals),predRange=Math.max(1,pmx-pmn),step=cw/Math.max(1,clean.length-1),xAt=i=>p.l+step*i,yFromNorm=n=>p.t+ch*(0.5-(n-(0.5+accuracyView.yPan))*accuracyView.yZoom),priceY=o=>yFromNorm((Number(o.price)-mn)/priceRange),predY=i=>yFromNorm((predVals[i]-pmn)/predRange);function line(color,width,yFn){{x.beginPath();clean.forEach((o,i)=>{{const px=xAt(i),py=yFn(o,i);if(i===0)x.moveTo(px,py);else x.lineTo(px,py);}});x.strokeStyle=color;x.lineWidth=width;x.stroke();}}line('#60a5fa',2.2,priceY);line('#fbbf24',2.2,(o,i)=>predY(i));clean.forEach((o,i)=>{{const px=xAt(i),py=priceY(o);x.fillStyle=o.hit?'#22d3ee':'#fb7185';x.beginPath();x.arc(px,py,2.8,0,Math.PI*2);x.fill();}});x.fillStyle='rgba(226,232,240,.92)';x.font='12px Segoe UI, Microsoft YaHei';x.textAlign='left';x.textBaseline='top';x.fillText('blue: price curve',p.l,p.t+4);x.fillStyle='#fbbf24';x.fillText('yellow: predicted direction curve',p.l+130,p.t+4);x.fillStyle='rgba(226,232,240,.78)';x.textAlign='right';x.textBaseline='middle';x.fillText(fmt(mx,2),p.l-8,p.t);x.fillText(fmt((mx+mn)/2,2),p.l-8,p.t+ch/2);x.fillText(fmt(mn,2),p.l-8,p.t+ch);x.textAlign='left';x.fillText('pred +',W-p.r+6,p.t);x.fillText('pred -',W-p.r+6,p.t+ch);x.textAlign='center';x.textBaseline='top';for(let i=0;i<clean.length;i+=Math.max(1,Math.floor(clean.length/5))){{x.fillStyle='rgba(203,213,225,.78)';x.fillText(compactTime(clean[i].time),xAt(i),H-26);}}x.textAlign='right';x.fillStyle='rgba(203,213,225,.68)';x.fillText(clean.length+'/'+accuracyView.points.length+' pts',W-p.r,H-26);}}
+	function setupAccuracyChartInteractions(){{const c=document.getElementById('accuracyChart');if(!c||c.dataset.panZoomBound)return;c.dataset.panZoomBound='1';c.addEventListener('wheel',e=>{{if(!accuracyView.points.length)return;e.preventDefault();const rect=c.getBoundingClientRect(),mx=(e.clientX-rect.left)/Math.max(1,rect.width),factor=e.deltaY>0?1.18:0.85;if(e.shiftKey){{accuracyView.yZoom=clamp(accuracyView.yZoom/factor,0.35,12);}}else{{const span=accuracyView.end-accuracyView.start,newSpan=clamp(span*factor,Math.min(1,30/Math.max(30,accuracyView.points.length)),1),anchor=accuracyView.start+span*mx;accuracyView.start=clamp(anchor-newSpan*mx,0,1-newSpan);accuracyView.end=accuracyView.start+newSpan;}}drawAccuracyChart();}},{{passive:false}});c.addEventListener('mousedown',e=>{{accuracyView.drag={{x:e.clientX,y:e.clientY,start:accuracyView.start,end:accuracyView.end,yPan:accuracyView.yPan}};c.classList.add('dragging');}});window.addEventListener('mousemove',e=>{{const g=accuracyView.drag;if(!g)return;const rect=c.getBoundingClientRect(),dx=(e.clientX-g.x)/Math.max(1,rect.width),dy=(e.clientY-g.y)/Math.max(1,rect.height),span=g.end-g.start;accuracyView.start=clamp(g.start-dx*span,0,1-span);accuracyView.end=accuracyView.start+span;accuracyView.yPan=clamp(g.yPan+dy/Math.max(0.35,accuracyView.yZoom),-2,2);drawAccuracyChart();}});window.addEventListener('mouseup',()=>{{accuracyView.drag=null;c.classList.remove('dragging');}});c.addEventListener('dblclick',()=>{{resetAccuracyView();drawAccuracyChart();}});}}
+	setupAccuracyChartInteractions();
 	let virtualTick=0;
 let configuredMonitorInsts={json.dumps(selected_instruments, ensure_ascii=False)};
 let monitorInst={json.dumps(monitor_initial, ensure_ascii=False)}, monitorPayload=null, monitorLiveMode=false;
@@ -1978,8 +2130,9 @@ class Handler(BaseHTTPRequestHandler):
             inst_id = params.get("inst_id", ["BTC-USDT-SWAP"])[0]
             horizon = int(params.get("horizon", ["5"])[0])
             scope = params.get("scope", ["session"])[0]
+            max_points = max(100, min(10000, int(params.get("max_points", ["2400"])[0])))
             try:
-                self.send_json(accuracy_report(inst_id, horizon, scope=scope))
+                self.send_json(accuracy_report(inst_id, horizon, max_points=max_points, scope=scope))
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=400)
         elif path == "/api/open-log-dir":
@@ -2066,7 +2219,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/save-and-run":
             self.send_html(render_page(f"配置已保存，{start_monitor()}。"))
         else:
-            note = "" if env_path == ENV_FILE else f" 密钥已保存到用户目录：{env_path}"
+            note = "" if env_path == PORTABLE_ENV_FILE else f" 密钥已保存到用户目录：{env_path}"
             self.send_html(render_page(f"配置已保存。{note}"))
 
 

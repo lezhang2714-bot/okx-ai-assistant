@@ -6,6 +6,8 @@ set "PY="
 
 if exist ".venv\Scripts\python.exe" (
     set "PY=.venv\Scripts\python.exe"
+) else if exist ".python\python.exe" (
+    set "PY=.python\python.exe"
 ) else if exist "build\python_runtime\python.exe" (
     set "PY=build\python_runtime\python.exe"
 )
@@ -35,12 +37,6 @@ if not defined PY (
 
 if not exist "%~dp0web_control_panel.py" (
     echo [config] web_control_panel.py not found.
-    pause
-    exit /b 1
-)
-
-if not exist "%~dp0build\local_state\trading_assistant_config.json" (
-    echo [config] build\local_state\trading_assistant_config.json not found.
     pause
     exit /b 1
 )
