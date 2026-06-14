@@ -1807,7 +1807,7 @@ class OkxAiShortTermAssistant:
 
     def _ai_env_config(self) -> Tuple[str, str, str]:
         api_key = (os.getenv("AI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
-        base_url = os.getenv("AI_BASE_URL", "https://api.deepseek.com").strip()
+        base_url = os.getenv("AI_BASE_URL", "https://www.right.codes/codex/v1").strip()
         model = (os.getenv("AI_MODEL") or DEFAULT_AI_MODEL).strip()
         return api_key, base_url, model
 

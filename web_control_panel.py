@@ -126,9 +126,15 @@ CONFIG_FIELDS = [
     ("网络与日志", "log_max_bytes", "number", "日志最大字节", "超过后轮转为.1文件。"),
 ]
 
+ENV_DEFAULTS = {
+    "AI_MODEL": "gpt-5.5",
+    "AI_BASE_URL": "https://www.right.codes/codex/v1",
+}
+
 ENV_FIELDS = [
-    ("OPENAI_API_KEY", "OpenAI API Key", "AI接口密钥。"),
+    ("OPENAI_API_KEY", "AI API Key", "OpenAI 兼容接口密钥，适用于各类模型。"),
     ("AI_MODEL", "AI模型", "默认gpt-5.5，可改为更便宜模型。"),
+    ("AI_BASE_URL", "AI Base URL", "OpenAI兼容接口地址，默认 https://www.right.codes/codex/v1。"),
     ("WECHAT_SEND_KEY", "微信推送 SendKey", "Server酱 SendKey，用于推送到个人微信。在 https://sct.ftqq.com 获取。"),
 ]
 
@@ -274,7 +280,8 @@ def save_env(env: Dict[str, str]) -> Path:
         "# OKX AI短线助手环境变量配置",
         "",
         f'OPENAI_API_KEY="{env.get("OPENAI_API_KEY", "")}"',
-        f'AI_MODEL="{env.get("AI_MODEL", "gpt-5.5")}"',
+        f'AI_MODEL="{env.get("AI_MODEL", ENV_DEFAULTS["AI_MODEL"])}"',
+        f'AI_BASE_URL="{env.get("AI_BASE_URL", ENV_DEFAULTS["AI_BASE_URL"])}"',
         f'WECHAT_SEND_KEY="{env.get("WECHAT_SEND_KEY", "")}"',
         "",
     ]
@@ -795,12 +802,13 @@ def point_from_log_item(item: Dict[str, Any], price: float) -> Dict[str, Any]:
 def test_ai_connection() -> str:
     env = build_child_env()
     api_key = env.get("OPENAI_API_KEY", "")
-    model = env.get("AI_MODEL", "gpt-5.5")
+    base_url = env.get("AI_BASE_URL", ENV_DEFAULTS["AI_BASE_URL"]).strip()
+    model = env.get("AI_MODEL", ENV_DEFAULTS["AI_MODEL"])
     if not api_key:
-        return "AI测试失败：OPENAI_API_KEY未配置。"
+        return "AI测试失败：AI API Key 未配置。"
     try:
         from openai import OpenAI
-        client = OpenAI(api_key=api_key)
+        client = OpenAI(api_key=api_key, base_url=base_url)
         response = client.responses.create(model=model, input="请回复：AI接口连通性测试成功。")
         return f"AI测试成功：{getattr(response, 'output_text', response)}"
     except Exception as exc:
@@ -1825,6 +1833,19 @@ def field_html(key: str, label: str, kind: str, help_text: str, value: Any) -> s
     return f'<div class="field"><label>{esc(label)}</label><div>{control}<p>{esc(help_text)}</p></div></div>'
 
 
+def masked_input_html(name: str, value: Any, masked: bool = True) -> str:
+    safe_name = esc(name)
+    safe_value = esc(value)
+    if masked:
+        return (
+            f'<div class="password-wrap">'
+            f'<input type="password" name="{safe_name}" value="{safe_value}">'
+            f'<button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏内容"></button>'
+            f"</div>"
+        )
+    return f'<input type="text" name="{safe_name}" value="{safe_value}">'
+
+
 def render_login(message: str = "") -> bytes:
     notice = f'<div class="notice">{esc(message)}</div>' if message else ""
     body = f"""<!doctype html>
@@ -1888,9 +1909,9 @@ def render_page(message: str = "") -> bytes:
     rows.append("</section>")
     rows.append('<section class="card page-section" data-page="config"><h2>AI密钥与微信推送</h2>')
     for key, label, help_text in ENV_FIELDS:
-        value = env.get(key, "gpt-5.5" if key == "AI_MODEL" else "")
-        input_type = "password" if "KEY" in key else "text"
-        rows.append(f'<div class="field"><label>{esc(label)}</label><div><input type="{input_type}" name="env_{esc(key)}" value="{esc(value)}"><p>{esc(help_text)}</p></div></div>')
+        value = env.get(key, ENV_DEFAULTS.get(key, ""))
+        input_html = masked_input_html(f"env_{key}", value, masked="KEY" in key)
+        rows.append(f'<div class="field"><label>{esc(label)}</label><div>{input_html}<p>{esc(help_text)}</p></div></div>')
     rows.append("</section>")
 
     body = f"""<!doctype html>
