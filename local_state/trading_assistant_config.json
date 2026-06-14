@@ -2,7 +2,8 @@
   "inst_ids": [
     "BTC-USDT-SWAP"
   ],
-  "interval": 10,
+  "interval": 5,
+  "record_replay_enabled": true,
   "runtime": 0,
   "flag": "0",
   "strategy_mode": "short",

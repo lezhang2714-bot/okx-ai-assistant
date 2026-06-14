@@ -94,6 +94,9 @@ CACHE_TTL_SECONDS = {
 # 默认保存到build/runtime_logs目录，便于把运行时日志和工程源码分离。
 LOG_DIR = Path(__file__).resolve().parent / "build" / "runtime_logs"
 LOG_FILE = LOG_DIR / "okx_signal_analysis.jsonl"
+REPLAY_DATASET_FILE = LOG_DIR / "replay_dataset.jsonl"
+REPLAY_LOG_FILE = LOG_DIR / "replay_analysis.jsonl"
+REPLAY_DATASET_VERSION = "1.0"
 SIGNAL_PERFORMANCE_FILE = LOG_DIR / "signal_performance.jsonl"
 SIGNAL_PERFORMANCE_MAX_BYTES = 10 * 1024 * 1024
 SIGNAL_PERFORMANCE_LOAD_BYTES = 2 * 1024 * 1024
@@ -203,6 +206,64 @@ class RuntimeConfig:
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_time_text(value: str) -> datetime:
+    text = str(value or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"unsupported time format: {value}")
+
+
+def deep_copy_json(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def load_replay_dataset(path: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    if not path.exists():
+        raise FileNotFoundError(f"replay dataset not found: {path}")
+    meta: Dict[str, Any] = {}
+    frames: List[Dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        item = json.loads(line)
+        if item.get("type") == "meta":
+            meta = item
+        elif item.get("type") == "frame":
+            frames.append(item)
+    if not frames:
+        raise ValueError("replay dataset has no frames")
+    required = ("time", "inst_id", "ticker", "candles", "open_interest", "funding_rate", "long_short_ratio", "order_book")
+    for index, frame in enumerate(frames):
+        missing = [key for key in required if key not in frame]
+        if missing:
+            raise ValueError(f"replay frame #{index + 1} missing fields: {', '.join(missing)}")
+        for bar in BAR_CHANNELS:
+            if bar not in frame["candles"]:
+                raise ValueError(f"replay frame #{index + 1} missing candles.{bar}")
+    frames.sort(key=lambda frame: (frame.get("time", ""), frame.get("inst_id", "")))
+    return meta, frames
+
+
+def replay_dataset_stats(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {"exists": False, "path": str(path), "frame_count": 0, "inst_ids": [], "interval_seconds": 0}
+    meta, frames = load_replay_dataset(path)
+    inst_ids = sorted({str(frame.get("inst_id", "")) for frame in frames if frame.get("inst_id")})
+    return {
+        "exists": True,
+        "path": str(path),
+        "frame_count": len(frames),
+        "inst_ids": inst_ids,
+        "interval_seconds": int(meta.get("interval_seconds") or 0),
+        "recorded_at": str(meta.get("recorded_at") or ""),
+        "version": str(meta.get("version") or REPLAY_DATASET_VERSION),
+    }
 
 
 def ms_to_text(ts_ms: Any) -> str:
@@ -948,6 +1009,79 @@ class OkxAiShortTermAssistant:
         self.ai_circuit_open_until = 0.0
         self.ai_last_probe_at = 0.0
 
+        # 回放/录制：录制保存 collect_snapshot 原始输入；回放时注入同一套 collect/analyze 链路。
+        self.replay_mode = False
+        self.replay_log_file = LOG_FILE
+        self.record_replay_file: Optional[Path] = None
+        self.replay_frame: Optional[Dict[str, Any]] = None
+        self.replay_now_ts: Optional[float] = None
+        self._record_replay_meta_written = False
+
+    def _now_ts(self) -> float:
+        if self.replay_now_ts is not None:
+            return self.replay_now_ts
+        return time.time()
+
+    def _now_text(self) -> str:
+        if self.replay_now_ts is not None:
+            return datetime.fromtimestamp(self.replay_now_ts).strftime("%Y-%m-%d %H:%M:%S")
+        return now_text()
+
+    def _set_replay_clock(self, time_text: str) -> None:
+        self.replay_now_ts = parse_time_text(time_text).timestamp()
+
+    def _replay_source(self, inst_id: str) -> Optional[Dict[str, Any]]:
+        frame = self.replay_frame
+        if not frame or frame.get("inst_id") != inst_id:
+            return None
+        return frame
+
+    def _ensure_replay_meta(self) -> None:
+        if not self.record_replay_file or self._record_replay_meta_written:
+            return
+        self.record_replay_file.parent.mkdir(parents=True, exist_ok=True)
+        if self.record_replay_file.exists() and self.record_replay_file.stat().st_size > 0:
+            self._record_replay_meta_written = True
+            return
+        meta = {
+            "type": "meta",
+            "version": REPLAY_DATASET_VERSION,
+            "recorded_at": now_text(),
+            "interval_seconds": self.interval,
+            "inst_ids": list(self.instruments),
+            "source": "live-collect_snapshot",
+        }
+        with self.record_replay_file.open("w", encoding="utf-8") as file:
+            file.write(json.dumps(meta, ensure_ascii=False) + "\n")
+        self._record_replay_meta_written = True
+
+    def _append_replay_frame(
+        self,
+        inst_id: str,
+        ticker: Dict[str, float],
+        candles: Dict[str, List[Dict[str, Any]]],
+        open_interest: float,
+        funding_rate: float,
+        long_short: Dict[str, float],
+        order_book: Dict[str, Any],
+    ) -> None:
+        if not self.record_replay_file:
+            return
+        self._ensure_replay_meta()
+        frame = {
+            "type": "frame",
+            "time": self._now_text(),
+            "inst_id": inst_id,
+            "ticker": deep_copy_json(ticker),
+            "candles": deep_copy_json(candles),
+            "open_interest": open_interest,
+            "funding_rate": funding_rate,
+            "long_short_ratio": deep_copy_json(long_short),
+            "order_book": deep_copy_json(order_book),
+        }
+        with self.record_replay_file.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(frame, ensure_ascii=False) + "\n")
+
     def collect_snapshot(self, inst_id: str) -> Dict[str, Any]:
         # 获取当前时刻的成交价、买入挂单价、卖出挂单价。
         ticker = self._get_ticker(inst_id)
@@ -971,6 +1105,9 @@ class OkxAiShortTermAssistant:
         # 获取订单簿前20档深度，用于判断短线买卖盘压力。
         # 订单簿变化很快，所以只作为入场确认和风险修正，不单独决定方向。
         order_book = self._get_order_book(inst_id)
+
+        if self.record_replay_file and not self.replay_mode:
+            self._append_replay_frame(inst_id, ticker, candles, open_interest, funding_rate, long_short, order_book)
 
         # 记录当前OI和资金费率。API本身60秒缓存，按分钟写样本即可，避免重复采样污染15m变化和分位数。
         self._remember_metric(self.oi_history[inst_id], open_interest, METRIC_SAMPLE_INTERVAL_SECONDS)
@@ -1007,7 +1144,7 @@ class OkxAiShortTermAssistant:
         self._remember_metric(self.book_imbalance_history[inst_id], order_book.get("imbalance", 0.0), METRIC_SAMPLE_INTERVAL_SECONDS)
 
         return {
-            "time": now_text(),
+            "time": self._now_text(),
             "inst_id": inst_id,
             "price": ticker.get("last", 0.0),
             "best_bid": ticker.get("bid_px", 0.0),
@@ -1977,49 +2114,55 @@ class OkxAiShortTermAssistant:
             "analysis": analysis,
         }
         self._rotate_log_if_needed()
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with LOG_FILE.open("a", encoding="utf-8") as file:
+        log_path = self.replay_log_file if self.replay_mode else LOG_FILE
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if self.replay_mode:
+                file.flush()
+
+    def _process_inst(self, inst_id: str) -> None:
+        snapshot = self.collect_snapshot(inst_id)
+        signals = self.detect_signals(snapshot)
+        score = self.score_snapshot(snapshot, signals)
+        snapshot["signal_tracking"] = self.update_signal_tracking(snapshot, signals, score)
+        analysis = self.analyze_with_ai(snapshot, signals, score) if signals else self._local_analysis(snapshot, signals, score)
+        print(f"[{snapshot['time']}] {inst_id} analysis by {analysis.get('provider')}: {analysis.get('content')}")
+        if not self.replay_mode:
+            self.push_if_needed(snapshot, signals, score, analysis)
+        self.log_result(snapshot, signals, score, analysis)
+
+    def run_replay(self, frames: List[Dict[str, Any]], replay_interval: float = 0.0) -> None:
+        self.replay_mode = True
+        if self.replay_log_file == LOG_FILE:
+            self.replay_log_file = REPLAY_LOG_FILE
+        self.replay_log_file.parent.mkdir(parents=True, exist_ok=True)
+        total = len(frames)
+        print(f"[{now_text()}] replay start: {total} frames -> {self.replay_log_file}")
+        for index, frame in enumerate(frames, start=1):
+            inst_id = str(frame.get("inst_id", ""))
+            if inst_id not in self.instruments:
+                print(f"[{now_text()}] replay skip unknown inst_id={inst_id}")
+                continue
+            self.replay_frame = frame
+            self._set_replay_clock(str(frame.get("time", "")))
+            try:
+                self._process_inst(inst_id)
+            except Exception as exc:
+                print(f"[{self._now_text()}] replay frame {index}/{total} failed: {exc}")
+            finally:
+                self.replay_frame = None
+            if replay_interval > 0 and index < total:
+                time.sleep(replay_interval)
+        print(f"[{now_text()}] replay finished: {total} frames")
 
     def run_once(self) -> None:
         # 定时执行：遍历所有支持币种，完成数据采集、阈值检测、综合评分、AI分析、微信推送、日志存储等全部功能。
         for inst_id in self.instruments:
             try:
-                # 采集当前币种基础数据快照,包括：
-                # 当前时间戳、币种、当前成交价、买入挂单价、卖出挂单价、21条k线、1m成交量、oi、oi变化率、资金费率、费率变化量、多空比
-                snapshot = self.collect_snapshot(inst_id)
-
-                # 阈值检测，通过阈值判断是否有用户关注的信号产生:信号格式为多个type和desc
-                # {
-                #     "type": "volume_spike",
-                #     "desc": "1m volume multiplier 3.21x"
-                # }
-                # 放量倍数、持仓率、资金费率、资金费率变化量、多头占比、空头占比
-                # 返回是一个数组，有信号变化就加入数组，没有信号产生，数组就是空
-                signals = self.detect_signals(snapshot)
-
-                # 本地综合评分，包括：各项打分、总分、建议、操作区间、风险等级、K线趋势；
-                score = self.score_snapshot(snapshot, signals)
-
-                # 在线信号追踪：登记新信号，并结算之前到期的5m/15m/1H观察样本。
-                # 这一步只做统计复盘，不下单、不推送、不改变当前分析结论。
-                snapshot["signal_tracking"] = self.update_signal_tracking(snapshot, signals, score)
-
-                # 有信号产生则进行AI分析，节省AI成本；否则，进行本地分析（本地分析结果封装成AI返回格式）
-                analysis = self.analyze_with_ai(snapshot, signals, score) if signals else self._local_analysis(snapshot, signals, score)
-                # analysis = self.analyze_with_ai(snapshot, signals, score)
-                print(f"[{now_text()}] {inst_id} analysis by {analysis.get('provider')}: {analysis.get('content')}")
-                # 快照、信号、评分、分析结果打印到控制台
-                # self._print_console(snapshot, signals, score, analysis)
-
-                # 微信推送判断与处理：有信号 and 80分以上 and 功能使能 才会推送
-                self.push_if_needed(snapshot, signals, score, analysis)
-                
-                # 记录JSON日志到文件
-                self.log_result(snapshot, signals, score, analysis)
-
+                self._process_inst(inst_id)
             except Exception as exc:
-                print(f"[{now_text()}] {inst_id} collect/analyze failed: {exc}")
+                print(f"[{self._now_text()}] {inst_id} collect/analyze failed: {exc}")
 
     def run_forever(self, runtime: int) -> None:
         # 主循环：默认永久运行；runtime>0时，到指定秒数自动退出，用于实现定时任务。
@@ -2043,7 +2186,7 @@ class OkxAiShortTermAssistant:
         # 3. 后续每轮用当前价格更新最大顺向波动(MFE)和最大逆向波动(MAE)；
         # 4. 到5m、15m、1H时结算样本，并聚合到策略模板维度；
         # 4. 日志里保存结算结果，后续可以统计哪些指标组合真的有效。
-        now_ts = time.time()
+        now_ts = self._now_ts()
         price = to_float(snapshot.get("price"))
         inst_id = snapshot.get("inst_id", "")
         closed = []
@@ -2318,6 +2461,14 @@ class OkxAiShortTermAssistant:
         return self._okx_call(f"{label}-rest", rest_func)
 
     def _get_ticker(self, inst_id: str) -> Dict[str, float]:
+        frame = self._replay_source(inst_id)
+        if frame:
+            ticker = frame.get("ticker") if isinstance(frame.get("ticker"), dict) else {}
+            return {
+                "last": to_float(ticker.get("last")),
+                "bid_px": to_float(ticker.get("bid_px")),
+                "ask_px": to_float(ticker.get("ask_px")),
+            }
         # 为避免API访问频繁，用缓存记录，在配置的有效时间段内返回缓存数据，否则才去API重新获取。
         response = self._cached(
             f"ticker:{inst_id}",
@@ -2346,6 +2497,11 @@ class OkxAiShortTermAssistant:
         }
 
     def _get_candles(self, inst_id: str, bar: str) -> List[Dict[str, Any]]:
+        frame = self._replay_source(inst_id)
+        if frame:
+            candles = frame.get("candles") if isinstance(frame.get("candles"), dict) else {}
+            rows = candles.get(bar)
+            return deep_copy_json(rows) if isinstance(rows, list) else []
         # 每个周期取KLINE_LIMIT根K线：当前K线 + 足够多的历史K线。
         # 200根能让EMA120/MA120在去掉未收盘K线后仍保持稳定，同时给MACD/ADX/ATR留下缓冲。
         response = self._cached(
@@ -2369,6 +2525,9 @@ class OkxAiShortTermAssistant:
         return [candle_to_dict(row) for row in data if isinstance(row, list)]
 
     def _get_open_interest(self, inst_id: str) -> float:
+        frame = self._replay_source(inst_id)
+        if frame:
+            return to_float(frame.get("open_interest"))
         # 获取合约Open Interest。OI上涨通常说明有新仓进入市场。
         response = self._cached(
             f"open_interest:{inst_id}",
@@ -2389,6 +2548,9 @@ class OkxAiShortTermAssistant:
         return to_float(item.get("oi")) or to_float(item.get("oiCcy"))
 
     def _get_funding_rate(self, inst_id: str) -> float:
+        frame = self._replay_source(inst_id)
+        if frame:
+            return to_float(frame.get("funding_rate"))
         # 获取当前资金费率。正费率通常表示多头付费给空头，负费率相反。
         response = self._cached(
             f"funding_rate:{inst_id}",
@@ -2411,6 +2573,21 @@ class OkxAiShortTermAssistant:
         return to_float(item.get("fundingRate"))
 
     def _get_long_short_ratio(self, inst_id: str) -> Dict[str, float]:
+        frame = self._replay_source(inst_id)
+        if frame:
+            payload = frame.get("long_short_ratio") if isinstance(frame.get("long_short_ratio"), dict) else {}
+            ratio = to_float(payload.get("long_short_ratio"))
+            long_ratio = to_float(payload.get("long_ratio"))
+            short_ratio = to_float(payload.get("short_ratio"))
+            available = payload.get("available")
+            if available is None:
+                available = ratio > 0
+            return {
+                "long_short_ratio": ratio,
+                "long_ratio": long_ratio,
+                "short_ratio": short_ratio,
+                "available": bool(available),
+            }
         # 获取当前5m周期内的多空比，并换算成百分比；
         try:
             response = self._cached(
@@ -2439,6 +2616,10 @@ class OkxAiShortTermAssistant:
         }
 
     def _get_order_book(self, inst_id: str) -> Dict[str, Any]:
+        frame = self._replay_source(inst_id)
+        if frame:
+            payload = frame.get("order_book") if isinstance(frame.get("order_book"), dict) else {}
+            return deep_copy_json(payload)
         # 获取前20档订单簿深度。短线入场时，盘口买卖量不平衡能提示“突破是否有跟随资金”。
         # 注意：订单簿是瞬时数据，会被撤单、挂单墙诱导影响，所以这里只作为辅助确认，不作为方向核心。
         try:
@@ -2529,7 +2710,7 @@ class OkxAiShortTermAssistant:
         # - 最新值仍然能参与当前一轮计算；
         # - 历史队列不会被重复值撑满；
         # - 15m/1H这类按时间寻找旧值的逻辑仍然准确。
-        now_ts = time.time()
+        now_ts = self._now_ts()
         numeric_value = to_float(value)
         if history and min_interval_seconds > 0 and now_ts - history[-1][0] < min_interval_seconds:
             history[-1] = (history[-1][0], numeric_value)
@@ -2778,7 +2959,7 @@ class OkxAiShortTermAssistant:
         # 找到N分钟前附近的旧值。刚启动不足N分钟时，会退化为最早采样值。
         if not history:
             return 0.0
-        threshold = time.time() - minutes * 60
+        threshold = self._now_ts() - minutes * 60
         candidate = history[0][1]
         for ts, value in history:
             if ts >= threshold:
@@ -3530,6 +3711,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scalp-move-pct-5m", type=float, default=env_float("SCALP_MOVE_PCT_5M", 0.22))
     parser.add_argument("--scalp-move-pct-10m", type=float, default=env_float("SCALP_MOVE_PCT_10M", 0.35))
     parser.add_argument("--watch-push-score", type=int, default=env_int("WATCH_PUSH_SCORE", DEFAULT_PUSH_SCORE))
+    parser.add_argument("--record-replay", action="store_true", default=os.getenv("RECORD_REPLAY", "0") == "1")
+    parser.add_argument(
+        "--record-replay-file",
+        default=os.getenv("RECORD_REPLAY_FILE", str(REPLAY_DATASET_FILE)),
+        help="Append live collect_snapshot frames to this JSONL file",
+    )
+    parser.add_argument("--replay-file", default=os.getenv("REPLAY_FILE", ""), help="Replay dataset JSONL and exit")
+    parser.add_argument("--replay-interval", type=float, default=env_float("REPLAY_INTERVAL", 0.0))
+    parser.add_argument(
+        "--replay-log-file",
+        default=os.getenv("REPLAY_LOG_FILE", str(REPLAY_LOG_FILE)),
+        help="Analysis JSONL output path when replaying",
+    )
 
     # add_argument只是向实例中注册参数，parse_args才是真正解析命令行参数的地方。会优先检测py执行时有没有传入参数，没有才会使用default；
     return parser.parse_args()
@@ -3572,6 +3766,17 @@ def main() -> int:
             log_max_bytes=max(args.log_max_bytes, 1024 * 1024),
         ),
     )
+    if args.record_replay:
+        assistant.record_replay_file = Path(args.record_replay_file)
+    if args.replay_file:
+        assistant.replay_log_file = Path(args.replay_log_file)
+        assistant.push_enabled = False
+        _, frames = load_replay_dataset(Path(args.replay_file))
+        try:
+            assistant.run_replay(frames, max(float(args.replay_interval), 0.0))
+        except KeyboardInterrupt:
+            print("Replay stopped.")
+        return 0
     try:
         assistant.run_forever(args.runtime)
     except KeyboardInterrupt:
