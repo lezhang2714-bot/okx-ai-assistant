@@ -22,6 +22,10 @@ Production tuning:
     export LOG_MAX_BYTES=10485760
     export VOLUME_MULTIPLIER=2.0
     export OI_CHANGE_PCT_15M=5.0
+    export AI_REQUEST_TIMEOUT=30
+    export AI_CIRCUIT_FAIL_THRESHOLD=3
+    export AI_CIRCUIT_COOLDOWN_SECONDS=120
+    export AI_PROBE_INTERVAL_SECONDS=60
 """
 
 import argparse
@@ -59,6 +63,12 @@ DEFAULT_AI_MODEL = "gpt-5.5"
 OKX_BASE_URL = "https://www.okx.com"
 DEFAULT_RETRY_TIMES = 3
 DEFAULT_RETRY_BACKOFF_SECONDS = 1.5
+DEFAULT_AI_REQUEST_TIMEOUT = 30.0
+DEFAULT_AI_PROBE_TIMEOUT = 10.0
+DEFAULT_AI_CIRCUIT_FAIL_THRESHOLD = 3
+DEFAULT_AI_CIRCUIT_COOLDOWN_SECONDS = 120
+DEFAULT_AI_PROBE_INTERVAL_SECONDS = 60
+DEFAULT_AI_RATE_LIMIT_BACKOFF_SECONDS = 30.0
 DEFAULT_PUSH_COOLDOWN_SECONDS = 900
 DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024
 WARMUP_MINUTES = 15
@@ -486,6 +496,64 @@ def retry_call(label: str, func: Any, retry_times: int, retry_backoff: float) ->
     raise RuntimeError(f"{label} failed after {retry_times} retries: {last_error}")
 
 
+RETRYABLE_AI_ERROR_NAMES = {
+    "APIConnectionError",
+    "APITimeoutError",
+    "InternalServerError",
+    "RateLimitError",
+    "TimeoutError",
+    "ConnectionError",
+    "ConnectError",
+    "ReadTimeout",
+    "WriteTimeout",
+    "RemoteProtocolError",
+}
+NON_RETRYABLE_AI_STATUS = {400, 401, 403, 404, 422}
+
+
+def ai_error_status_code(exc: Exception) -> Optional[int]:
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    response = getattr(exc, "response", None)
+    if response is not None:
+        response_status = getattr(response, "status_code", None)
+        if isinstance(response_status, int):
+            return response_status
+    return None
+
+
+def is_auth_ai_error(exc: Exception) -> bool:
+    status = ai_error_status_code(exc)
+    return status in (401, 403)
+
+
+def is_rate_limit_ai_error(exc: Exception) -> bool:
+    if exc.__class__.__name__ == "RateLimitError":
+        return True
+    return ai_error_status_code(exc) == 429
+
+
+def is_connection_ai_error(exc: Exception) -> bool:
+    if exc.__class__.__name__ in {"APIConnectionError", "APITimeoutError", "ConnectionError", "ConnectError"}:
+        return True
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    return False
+
+
+def is_retryable_ai_error(exc: Exception) -> bool:
+    if is_auth_ai_error(exc):
+        return False
+    status = ai_error_status_code(exc)
+    if status is not None:
+        if status in NON_RETRYABLE_AI_STATUS:
+            return False
+        if status in (429, 500, 502, 503, 504):
+            return True
+    return exc.__class__.__name__ in RETRYABLE_AI_ERROR_NAMES
+
+
 def http_get_json(
     path: str,
     params: Dict[str, str],
@@ -872,6 +940,13 @@ class OkxAiShortTermAssistant:
         self.signal_performance: Dict[str, Dict[str, Any]] = {}
         self.last_signal_track_at: Dict[str, float] = {}
         self._load_signal_performance()
+
+        # AI 连接状态：请求重试 + client 重建 + 熔断探活。
+        self._ai_client: Any = None
+        self._ai_client_config: Tuple[str, str] = ("", "")
+        self.ai_fail_streak = 0
+        self.ai_circuit_open_until = 0.0
+        self.ai_last_probe_at = 0.0
 
     def collect_snapshot(self, inst_id: str) -> Dict[str, Any]:
         # 获取当前时刻的成交价、买入挂单价、卖出挂单价。
@@ -1575,6 +1650,190 @@ class OkxAiShortTermAssistant:
             "swing": self._swing_strategy_view(snapshot, score),
         }
 
+    def _ai_request_timeout(self) -> float:
+        return max(5.0, env_float("AI_REQUEST_TIMEOUT", DEFAULT_AI_REQUEST_TIMEOUT))
+
+    def _ai_probe_timeout(self) -> float:
+        return max(3.0, env_float("AI_PROBE_TIMEOUT", DEFAULT_AI_PROBE_TIMEOUT))
+
+    def _ai_circuit_fail_threshold(self) -> int:
+        return max(1, env_int("AI_CIRCUIT_FAIL_THRESHOLD", DEFAULT_AI_CIRCUIT_FAIL_THRESHOLD))
+
+    def _ai_circuit_cooldown(self) -> int:
+        return max(10, env_int("AI_CIRCUIT_COOLDOWN_SECONDS", DEFAULT_AI_CIRCUIT_COOLDOWN_SECONDS))
+
+    def _ai_probe_interval(self) -> int:
+        return max(15, env_int("AI_PROBE_INTERVAL_SECONDS", DEFAULT_AI_PROBE_INTERVAL_SECONDS))
+
+    def _ai_rate_limit_backoff(self) -> float:
+        return max(5.0, env_float("AI_RATE_LIMIT_BACKOFF_SECONDS", DEFAULT_AI_RATE_LIMIT_BACKOFF_SECONDS))
+
+    def _ai_env_config(self) -> Tuple[str, str, str]:
+        api_key = (os.getenv("AI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+        base_url = os.getenv("AI_BASE_URL", "https://api.deepseek.com").strip()
+        model = (os.getenv("AI_MODEL") or DEFAULT_AI_MODEL).strip()
+        return api_key, base_url, model
+
+    def _reset_ai_client(self) -> None:
+        self._ai_client = None
+        self._ai_client_config = ("", "")
+
+    def _get_ai_client(self, api_key: str, base_url: str) -> Any:
+        from openai import OpenAI
+
+        config = (api_key, base_url)
+        if self._ai_client is not None and self._ai_client_config == config:
+            return self._ai_client
+
+        previous = self._ai_client_config
+        self._ai_client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=self._ai_request_timeout(),
+            max_retries=0,
+        )
+        self._ai_client_config = config
+        if previous != ("", "") and previous != config:
+            self.ai_fail_streak = 0
+            self.ai_circuit_open_until = 0.0
+            print(f"[{now_text()}] AI client reloaded after config change")
+        return self._ai_client
+
+    def _ai_circuit_state(self) -> str:
+        threshold = self._ai_circuit_fail_threshold()
+        if self.ai_fail_streak < threshold:
+            return "closed"
+        if time.time() < self.ai_circuit_open_until:
+            return "open"
+        return "half_open"
+
+    def _record_ai_success(self) -> None:
+        if self.ai_fail_streak or self.ai_circuit_open_until:
+            print(f"[{now_text()}] AI connection recovered, circuit closed")
+        self.ai_fail_streak = 0
+        self.ai_circuit_open_until = 0.0
+
+    def _record_ai_failure(self, exc: Exception) -> None:
+        threshold = self._ai_circuit_fail_threshold()
+        if is_auth_ai_error(exc) or not is_retryable_ai_error(exc):
+            self.ai_fail_streak = threshold
+        else:
+            self.ai_fail_streak += 1
+        if self.ai_fail_streak >= threshold:
+            self.ai_circuit_open_until = time.time() + self._ai_circuit_cooldown()
+            print(
+                f"[{now_text()}] AI circuit opened for {self._ai_circuit_cooldown()}s "
+                f"after failure: {exc}"
+            )
+        self._reset_ai_client()
+
+    def _ai_fallback_result(
+        self,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        score: Dict[str, Any],
+        content: str,
+        ai_status: str,
+        exc: Optional[Exception] = None,
+    ) -> Dict[str, Any]:
+        result = {
+            "provider": "local",
+            "ai_status": ai_status,
+            "content": content,
+            "fallback": self._local_analysis(snapshot, signals, score),
+        }
+        if exc is not None:
+            result["error"] = str(exc)
+        return result
+
+    def _chat_completion_with_retry(self, client: Any, model: str, prompt: str) -> Any:
+        last_error: Optional[Exception] = None
+        retry_times = self.runtime_config.retry_times
+        retry_backoff = self.runtime_config.retry_backoff
+        api_key, base_url, _ = self._ai_env_config()
+
+        for attempt in range(1, retry_times + 1):
+            try:
+                return client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                    timeout=self._ai_request_timeout(),
+                )
+            except Exception as exc:
+                last_error = exc
+                if not is_retryable_ai_error(exc):
+                    raise
+                if attempt >= retry_times:
+                    break
+                sleep_seconds = retry_backoff * attempt
+                if is_rate_limit_ai_error(exc):
+                    sleep_seconds = max(sleep_seconds, self._ai_rate_limit_backoff())
+                print(
+                    f"[{now_text()}] ai-chat failed, retry {attempt}/{retry_times}: {exc}; "
+                    f"sleep {sleep_seconds:.1f}s"
+                )
+                if is_connection_ai_error(exc):
+                    self._reset_ai_client()
+                    client = self._get_ai_client(api_key, base_url)
+                time.sleep(sleep_seconds)
+
+        raise RuntimeError(f"ai-chat failed after {retry_times} retries: {last_error}")
+
+    def _probe_ai_connection(self, model: str) -> bool:
+        api_key, base_url, _ = self._ai_env_config()
+        if not api_key:
+            return False
+        try:
+            client = self._get_ai_client(api_key, base_url)
+            client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=5,
+                temperature=0.0,
+                timeout=self._ai_probe_timeout(),
+            )
+            return True
+        except Exception as exc:
+            print(f"[{now_text()}] AI probe failed: {exc}")
+            self._reset_ai_client()
+            return False
+
+    def _maybe_probe_ai_connection(self, model: str) -> bool:
+        now = time.time()
+        if now - self.ai_last_probe_at < self._ai_probe_interval():
+            return False
+        self.ai_last_probe_at = now
+        print(f"[{now_text()}] AI circuit probing...")
+        if self._probe_ai_connection(model):
+            self._record_ai_success()
+            return True
+        self.ai_fail_streak = self._ai_circuit_fail_threshold()
+        self.ai_circuit_open_until = time.time() + self._ai_circuit_cooldown()
+        return False
+
+    def _build_ai_success_result(
+        self,
+        base_url: str,
+        model: str,
+        output_text: str,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        score: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        parsed = extract_json_object(output_text)
+        valid, errors = self._validate_ai_result(parsed)
+        return {
+            "provider": "deepseek" if "deepseek" in base_url else "openai",
+            "model": model,
+            "ai_status": "closed",
+            "content": output_text,
+            "parsed": parsed,
+            "valid_json": valid,
+            "validation_errors": errors,
+            "fallback": None if valid else self._local_analysis(snapshot, signals, score),
+        }
+
     def analyze_with_ai(
         self,
         snapshot: Dict[str, Any],
@@ -1582,70 +1841,66 @@ class OkxAiShortTermAssistant:
         score: Dict[str, Any],
     ) -> Dict[str, Any]:
         # AI模块只在触发信号后由run_once调用。
-        # 如果没有开启AI、没有安装openai包、没有配置Key或请求失败，都会回退到本地规则分析。
+        # 三层稳健机制：请求重试、client重建、熔断后轻量探活自动恢复。
         if not self.ai_enabled:
             return self._local_analysis(snapshot, signals, score)
-        
+
         if self.dry_run_ai:
-            # dry-run用于调试：可以看到发给AI的数据，但不会产生真实API费用。
             payload = self._ai_payload(snapshot, signals, score)
             return {
                 "provider": "dry-run",
                 "content": "AI dry-run enabled. Payload prepared but not sent.",
                 "payload": payload,
             }
-           
+
         try:
-            from openai import OpenAI
+            from openai import OpenAI  # noqa: F401
         except ImportError:
             return {
                 "provider": "local",
                 "content": "openai package is not installed; fallback to local analysis.",
                 "fallback": self._local_analysis(snapshot, signals, score),
             }
-        
-        api_key = os.getenv("AI_API_KEY") or os.getenv("OPENAI_API_KEY")
-        base_url = os.getenv("AI_BASE_URL", "https://api.deepseek.com")
-        model = os.getenv("AI_MODEL", "deepseek-flash")
 
+        api_key, base_url, model = self._ai_env_config()
         if not api_key:
             return {
                 "provider": "local",
                 "content": "AI_API_KEY or OPENAI_API_KEY is not configured; fallback to local analysis.",
                 "fallback": self._local_analysis(snapshot, signals, score),
-            }   
-        
-        client = OpenAI(api_key=api_key, base_url=base_url)
-        prompt = self._ai_prompt(snapshot, signals, score)
-    
-        try:
-            # 使用 Chat Completions API，兼容 OpenAI 和 DeepSeek。
-            response = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-            )
-    
-            output_text = response.choices[0].message.content
-            parsed = extract_json_object(output_text)
-            valid, errors = self._validate_ai_result(parsed)
-            return {
-                "provider": "deepseek" if "deepseek" in base_url else "openai",
-                "model": model,
-                "content": output_text,
-                "parsed": parsed,
-                "valid_json": valid,
-                "validation_errors": errors,
-                "fallback": None if valid else self._local_analysis(snapshot, signals, score),
             }
+
+        circuit_state = self._ai_circuit_state()
+        if circuit_state == "open":
+            self._maybe_probe_ai_connection(model)
+            if self._ai_circuit_state() != "closed":
+                return self._ai_fallback_result(
+                    snapshot,
+                    signals,
+                    score,
+                    "AI circuit open; using local analysis until probe succeeds.",
+                    "circuit_open",
+                )
+
+        prompt = self._ai_prompt(snapshot, signals, score)
+        try:
+            client = self._get_ai_client(api_key, base_url)
+            response = self._chat_completion_with_retry(client, model, prompt)
+            output_text = response.choices[0].message.content
+            self._record_ai_success()
+            return self._build_ai_success_result(base_url, model, output_text, snapshot, signals, score)
         except Exception as exc:
             print(f"[{now_text()}] AI request failed: {exc}")
-        
-            return {
-                "provider": "local",
-                "content": f"AI request failed: {exc}; fallback to local analysis.",
-                "fallback": self._local_analysis(snapshot, signals, score),
-            }
+            self._record_ai_failure(exc)
+            ai_status = self._ai_circuit_state()
+            return self._ai_fallback_result(
+                snapshot,
+                signals,
+                score,
+                f"AI request failed: {exc}; fallback to local analysis.",
+                ai_status,
+                exc,
+            )
 
     def push_if_needed(
         self,
