@@ -9,5 +9,7 @@
   "risk_preference": "standard",
   "ai_enabled": false,
   "push_enabled": false,
-  "push_score": 80
+  "push_score": 75,
+  "watch_push_score": 65,
+  "spike_push_score": 62
 }

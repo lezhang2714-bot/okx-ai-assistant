@@ -74,6 +74,7 @@ DEFAULT_AI_RATE_LIMIT_BACKOFF_SECONDS = 30.0
 DEFAULT_PUSH_COOLDOWN_SECONDS = 900
 DEFAULT_AI_CALL_MIN_INTERVAL_SECONDS = 60
 DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024
+WECHAT_PUSH_MAX_DESP = 28000
 TRADE_TRIGGER_SIGNALS = frozenset(
     {"volume_spike", "structure_break", "oi_change", "order_book_imbalance", "macd_momentum_change"}
 )
@@ -109,6 +110,8 @@ REPLAY_DATASET_VERSION = "1.0"
 SIGNAL_PERFORMANCE_FILE = LOG_DIR / "signal_performance.jsonl"
 SIGNAL_PERFORMANCE_MAX_BYTES = 10 * 1024 * 1024
 SIGNAL_PERFORMANCE_LOAD_BYTES = 2 * 1024 * 1024
+PAPER_INITIAL_CAPITAL = 10000.0
+PAPER_ACCOUNT_FILE = LOG_DIR / "paper_account.json"
 
 
 def console_verbose_enabled() -> bool:
@@ -293,7 +296,7 @@ STRATEGY_PROFILES = {
             "trend": 1.0,
             "momentum": 1.0,
             "volume_price": 1.0,
-            "derivatives": 1.0,
+            "derivatives": 1.15,
             "orderbook": 0.8,
             "risk_control": 1.0,
         },
@@ -349,6 +352,7 @@ class SignalConfig:
     scalp_move_pct_5m: float = 0.22
     scalp_move_pct_10m: float = 0.35
     watch_push_score: int = DEFAULT_PUSH_SCORE
+    spike_push_score: int = 62
 
 
 @dataclass
@@ -1077,6 +1081,36 @@ SIGNAL_TYPE_LABELS = {
     "order_book_imbalance": "盘口失衡",
 }
 
+TRIGGER_REASON_LABELS = {
+    "trade_signal": "交易类信号",
+    "multi_signal": "多信号共振",
+    "sentiment_leading": "情绪领先结构",
+    "sentiment_structure_conflict": "情绪与结构冲突",
+    "sentiment_signals": "衍生品情绪",
+    "raw_score_high": "本地高分",
+    "multi_watch": "多观察类信号",
+    "scalp_spike": "超短线异动",
+    "funding_extreme": "资金费率极端",
+}
+
+RISK_PREFERENCE_LABELS = {
+    "conservative": "保守",
+    "standard": "标准",
+    "aggressive": "激进",
+}
+
+PUSH_KIND_LABELS = {
+    "trade": "交易提醒",
+    "watch": "观察提醒",
+    "spike": "急速异动",
+}
+
+DECISION_SOURCE_LABELS = {
+    "ai": "AI分析",
+    "local": "本地规则",
+    "local_fallback": "本地兜底",
+}
+
 
 def compact_candles(candles: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
     # 给AI看的K线证据：保留最近limit根的时间、OHLC、成交量、是否确认。
@@ -1186,6 +1220,10 @@ class OkxAiShortTermAssistant:
         self.signal_performance: Dict[str, Dict[str, Any]] = {}
         self.last_signal_track_at: Dict[str, float] = {}
         self._load_signal_performance()
+
+        # 方向跟单模拟账户：监控/回放会话开始时重置为 $10,000，按 final_direction 满仓跟单。
+        self.paper_session_started_at = ""
+        self.paper_accounts: Dict[str, Dict[str, Any]] = {}
 
         # AI 连接状态：请求重试 + client 重建 + 熔断探活。
         self._ai_client: Any = None
@@ -1481,7 +1519,10 @@ class OkxAiShortTermAssistant:
         }
 
         profiles = snapshot.get("trend_profiles", {})
-        context = snapshot.get("market_context", {})
+        context = dict(snapshot.get("market_context", {}))
+        sentiment_meta = self._sentiment_direction_meta(snapshot, context)
+        context["sentiment_meta"] = sentiment_meta
+        snapshot["market_context"] = context
         volatility = snapshot.get("volatility", {})
         signal_types = {item["type"] for item in signals}
         strategy_profile = self._strategy_profile()
@@ -1500,7 +1541,12 @@ class OkxAiShortTermAssistant:
         if direction_guard:
             final_direction = "\u89c2\u671b"
         entry_plan = self._suggest_levels(snapshot, final_direction)
-        if self._should_downgrade_direction(direction_guard, entry_plan, raw_total_score):
+        sentiment_led = (
+            raw_direction in ("做多", "做空")
+            and sentiment_meta.get("direction") == raw_direction
+            and int(sentiment_meta.get("strength", 0) or 0) >= 3
+        )
+        if self._should_downgrade_direction(direction_guard, entry_plan, raw_total_score, sentiment_led=sentiment_led):
             final_direction = "观望"
             entry_plan = self._suggest_levels(snapshot, final_direction)
         final_trade_score = raw_total_score if final_direction in ("做多", "做空") else 0
@@ -1534,6 +1580,7 @@ class OkxAiShortTermAssistant:
             "entry_plan": entry_plan,
             "direction_guard": direction_guard,
             "confidence": raw_total_score,
+            "sentiment_meta": sentiment_meta,
             "strategy_mode": strategy_profile["mode"],
             "strategy_label": strategy_profile["label"],
             "risk_preference": self._risk_preference(),
@@ -1654,10 +1701,21 @@ class OkxAiShortTermAssistant:
             derivatives_score -= 2
         if abs(oi_change) >= 2 and snapshot.get("oi_warmup_ready"):
             derivatives_score += 2
+        sentiment = context.get("sentiment_meta") if isinstance(context.get("sentiment_meta"), dict) else {}
+        if sentiment.get("direction") == direction and int(sentiment.get("strength", 0) or 0) >= 2:
+            derivatives_score += min(3, int(sentiment.get("strength", 0) or 0))
+        if snapshot.get("funding_warmup_ready") and abs(funding_change := to_float(snapshot.get("funding_change"))) >= self.config.funding_change_threshold:
+            if direction == "做多" and funding_change < 0:
+                derivatives_score += 2
+            elif direction == "做空" and funding_change > 0:
+                derivatives_score += 2
         if abs(funding) >= self.config.funding_abs_threshold:
-            derivatives_score -= 4
-        if max(long_short.get("long_ratio", 0.0), long_short.get("short_ratio", 0.0)) >= self.config.long_short_extreme:
             derivatives_score -= 3
+        if max(long_short.get("long_ratio", 0.0), long_short.get("short_ratio", 0.0)) >= self.config.long_short_extreme:
+            if sentiment.get("direction") != direction:
+                derivatives_score -= 3
+            else:
+                derivatives_score -= 1
 
         # 6. 盘口层：top5和top20同时支持时才显著加分，价差过宽则扣分。
         orderbook_score = 4
@@ -1717,7 +1775,7 @@ class OkxAiShortTermAssistant:
             "trend_score": max(0, min(16, int(round(weighted_scores["trend_score"])))),
             "momentum_score": max(0, min(12, int(round(weighted_scores["momentum_score"])))),
             "volume_price_score": max(0, min(12, int(round(weighted_scores["volume_price_score"])))),
-            "derivatives_score": max(0, min(12, int(round(weighted_scores["derivatives_score"])))),
+            "derivatives_score": max(0, min(14, int(round(weighted_scores["derivatives_score"])))),
             "orderbook_score": max(0, min(8, int(round(weighted_scores["orderbook_score"])))),
             "entry_quality_score": max(0, min(14, int(round(weighted_scores["entry_quality_score"])))),
             "risk_control_score": max(0, min(14, int(round(weighted_scores["risk_control_score"])))),
@@ -1867,7 +1925,13 @@ class OkxAiShortTermAssistant:
             return "做多", "momentum", f"30-60分钟强势上行约{long_move:.2f}%，按中线动量跟踪。"
         if short_momentum and short_move >= threshold_60m * 0.85:
             return "做空", "momentum", f"30-60分钟强势下行约{short_move:.2f}%，按中线动量跟踪。"
-        return "观望", "neutral", "1H/4H/15m尚未形成可跟踪的中线结构，继续观察。"
+        return self._merge_sentiment_direction_lead(
+            snapshot,
+            context,
+            "观望",
+            "neutral",
+            "1H/4H/15m尚未形成可跟踪的中线结构，继续观察。",
+        )
 
     def _swing_raw_direction(self, snapshot: Dict[str, Any], context: Dict[str, Any]) -> str:
         return self._swing_direction_meta(snapshot, context)[0]
@@ -1891,6 +1955,119 @@ class OkxAiShortTermAssistant:
                 "take_profit": f"{price - target_gap:.2f} / {price - target_gap * 1.8:.2f}",
             }
         return {"entry": "-", "stop_loss": "-", "take_profit": "-"}
+
+    def _sentiment_direction_meta(self, snapshot: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        """合约/盘口/拥挤度合成的情绪方向提示，用于价格结构尚未确认时的领先判断。"""
+        funding = to_float(snapshot.get("funding_rate"))
+        funding_change = to_float(snapshot.get("funding_change"))
+        long_short = snapshot.get("long_short_ratio", {})
+        long_ratio = to_float(long_short.get("long_ratio"))
+        short_ratio = to_float(long_short.get("short_ratio"))
+        oi_state = str(context.get("oi_price_state") or "")
+        order_book_bias = str(context.get("order_book_bias") or "neutral")
+        price_change_15m = to_float(context.get("price_change_15m"))
+        oi_change = to_float(snapshot.get("oi_change_pct_15m"))
+        long_points = 0
+        short_points = 0
+        factors: List[str] = []
+
+        if oi_state == "price_up_oi_up_new_longs_or_short_pressure":
+            long_points += 2
+            factors.append("价涨OI增")
+        elif oi_state == "price_down_oi_up_new_shorts_or_long_pressure":
+            short_points += 2
+            factors.append("价跌OI增")
+        elif oi_state == "price_up_oi_down_short_covering":
+            long_points += 1
+            factors.append("空头回补")
+        elif oi_state == "price_down_oi_down_long_deleveraging":
+            short_points += 1
+            factors.append("多头去杠杆")
+
+        if snapshot.get("oi_warmup_ready") and abs(oi_change) >= 2:
+            if price_change_15m > 0.05:
+                long_points += 1
+                factors.append("OI配合上涨")
+            elif price_change_15m < -0.05:
+                short_points += 1
+                factors.append("OI配合下跌")
+
+        if snapshot.get("funding_warmup_ready") and abs(funding_change) >= self.config.funding_change_threshold:
+            if funding_change > 0:
+                short_points += 1
+                factors.append("费率上行")
+            else:
+                long_points += 1
+                factors.append("费率下行")
+
+        if long_ratio >= self.config.long_short_extreme:
+            short_points += 1
+            factors.append("多头拥挤")
+        elif short_ratio >= self.config.long_short_extreme:
+            long_points += 1
+            factors.append("空头拥挤")
+
+        if order_book_bias == "bid_support":
+            long_points += 1
+            factors.append("盘口买单")
+        elif order_book_bias == "ask_pressure":
+            short_points += 1
+            factors.append("盘口卖压")
+
+        direction = "观望"
+        strength = 0
+        if long_points >= 3 and long_points >= short_points + 1:
+            direction = "做多"
+            strength = long_points
+        elif short_points >= 3 and short_points >= long_points + 1:
+            direction = "做空"
+            strength = short_points
+
+        return {
+            "direction": direction,
+            "strength": strength,
+            "long_points": long_points,
+            "short_points": short_points,
+            "factors": factors,
+            "summary": "、".join(factors[:4]) if factors else "情绪中性",
+        }
+
+    def _merge_sentiment_direction_lead(
+        self,
+        snapshot: Dict[str, Any],
+        context: Dict[str, Any],
+        price_direction: str,
+        price_tier: str,
+        price_summary: str,
+    ) -> Tuple[str, str, str]:
+        """价格路径为观望时，允许足够强的情绪信号给出领先方向。"""
+        if price_direction in ("做多", "做空") and price_tier not in ("neutral",):
+            return price_direction, price_tier, price_summary
+
+        sentiment = context.get("sentiment_meta")
+        if not isinstance(sentiment, dict):
+            sentiment = self._sentiment_direction_meta(snapshot, context)
+        if sentiment.get("direction") not in ("做多", "做空"):
+            return price_direction, price_tier, price_summary
+
+        risk = self._risk_preference()
+        min_strength = {"conservative": 4, "standard": 3, "aggressive": 2}.get(risk, 3)
+        if int(sentiment.get("strength", 0) or 0) < min_strength:
+            return price_direction, price_tier, price_summary
+
+        profiles = snapshot.get("trend_profiles", {})
+        trend_15m = profiles.get("15m", {}).get("trend")
+        trend_5m = profiles.get("5m", {}).get("trend")
+        sent_dir = str(sentiment.get("direction"))
+        if sent_dir == "做多" and trend_15m == "down" and trend_5m == "down":
+            return price_direction, price_tier, price_summary
+        if sent_dir == "做空" and trend_15m == "up" and trend_5m == "up":
+            return price_direction, price_tier, price_summary
+
+        if price_direction == "观望" or price_tier == "neutral":
+            summary = f"合约/情绪领先：{sentiment.get('summary', '情绪转强')}"
+            return sent_dir, "sentiment", summary
+        return price_direction, price_tier, price_summary
 
     def _short_move_thresholds(self, snapshot: Dict[str, Any]) -> Tuple[float, float]:
         """短线动量阈值：10/20 分钟涨跌幅，明显高于超短线 5/10 分钟脉冲。"""
@@ -1973,7 +2150,13 @@ class OkxAiShortTermAssistant:
                 return "做多", "pressure", "激进模式：短窗压力偏多且15m未反向。"
             if pressure == "down" and trade_down >= 1 and trend_5m != "up" and trend_15m != "up":
                 return "做空", "pressure", "激进模式：短窗压力偏空且15m未反向。"
-        return "观望", "neutral", "5m/15m尚未同向确认，等待结构或20分钟延伸。"
+        return self._merge_sentiment_direction_lead(
+            snapshot,
+            context,
+            "观望",
+            "neutral",
+            "5m/15m尚未同向确认，等待结构或20分钟延伸。",
+        )
 
     def _short_raw_direction(self, snapshot: Dict[str, Any], context: Dict[str, Any]) -> str:
         return self._short_direction_meta(snapshot, context)[0]
@@ -2012,12 +2195,16 @@ class OkxAiShortTermAssistant:
         direction_guard: str,
         entry_plan: Dict[str, Any],
         raw_total_score: int,
+        sentiment_led: bool = False,
     ) -> bool:
         if direction_guard:
             return True
         score_floor = self._direction_confirm_score_floor()
         mode = self._strategy_mode()
         quality = entry_plan.get("quality", "")
+        if sentiment_led and quality == "wait_confirmation":
+            if raw_total_score >= max(52, int(score_floor * 0.58)):
+                return False
         if mode == "scalp":
             if quality != "wait_confirmation":
                 return False
@@ -2122,6 +2309,12 @@ class OkxAiShortTermAssistant:
         pressure = context.get("recent_price_pressure")
         trade_up = int(context.get("trade_up", 0) or 0)
         trade_down = int(context.get("trade_down", 0) or 0)
+        sentiment = context.get("sentiment_meta") if isinstance(context.get("sentiment_meta"), dict) else {}
+        sentiment_support = (
+            sentiment.get("direction") == direction
+            and int(sentiment.get("strength", 0) or 0) >= 3
+            and risk != "conservative"
+        )
         if mode == "scalp":
             if risk == "aggressive":
                 return ""
@@ -2133,8 +2326,12 @@ class OkxAiShortTermAssistant:
         if mode == "swing":
             bias = context.get("bias", "neutral")
             if direction == "做多" and pressure == "down" and bias != "long":
+                if sentiment_support and (bias == "long" or context.get("bias_softened")):
+                    return ""
                 return "recent_price_pressure_down_blocks_long"
             if direction == "做空" and pressure == "up" and bias != "short":
+                if sentiment_support and (bias == "short" or context.get("bias_softened")):
+                    return ""
                 return "recent_price_pressure_up_blocks_short"
             return ""
         if mode == "short":
@@ -2146,15 +2343,25 @@ class OkxAiShortTermAssistant:
                 return ""
             if direction == "做空" and move_20m <= -momentum_floor:
                 return ""
+            if sentiment_support:
+                return ""
             bias = context.get("bias", "neutral")
             if direction == "做多" and pressure == "down" and bias != "long" and trade_up < 1:
+                if sentiment_support:
+                    return ""
                 return "recent_price_pressure_down_blocks_long"
             if direction == "做空" and pressure == "up" and bias != "short" and trade_down < 1:
+                if sentiment_support:
+                    return ""
                 return "recent_price_pressure_up_blocks_short"
             min_trade_votes = 2 if risk == "conservative" else 1
             if direction == "做多" and pressure == "neutral" and trade_up < min_trade_votes:
+                if sentiment_support and trade_up >= 1:
+                    return ""
                 return "neutral_price_pressure_blocks_long_without_5m_15m_alignment"
             if direction == "做空" and pressure == "neutral" and trade_down < min_trade_votes:
+                if sentiment_support and trade_down >= 1:
+                    return ""
                 return "neutral_price_pressure_blocks_short_without_5m_15m_alignment"
             return ""
         if direction == "做多" and pressure == "down":
@@ -2193,6 +2400,8 @@ class OkxAiShortTermAssistant:
                 short_score = max(short_score, 60)
             elif tier == "pressure":
                 short_score = max(short_score, 58)
+            elif tier == "sentiment":
+                short_score = max(short_score, 61)
         else:
             short_score = min(short_score, 72)
         levels = self._short_levels(snapshot, direction) if direction in ("做多", "做空") else {
@@ -2202,7 +2411,10 @@ class OkxAiShortTermAssistant:
         }
         action = score.get("trade_action_level", "观望")
         if direction in ("做多", "做空"):
-            action = "动量跟踪" if tier == "momentum" else "等待结构位"
+            if tier == "sentiment":
+                action = "情绪领先"
+            else:
+                action = "动量跟踪" if tier == "momentum" else "等待结构位"
         return {
             "mode": "short",
             "label": STRATEGY_PROFILES["short"]["label"],
@@ -2235,6 +2447,8 @@ class OkxAiShortTermAssistant:
                 swing_score = max(swing_score, 62)
             elif tier == "momentum" and move_strength >= threshold_30m:
                 swing_score = max(swing_score, 60)
+            elif tier == "sentiment":
+                swing_score = max(swing_score, 61)
         else:
             swing_score = min(swing_score, 72)
         levels = self._swing_levels(snapshot, direction) if direction in ("做多", "做空") else {
@@ -2575,7 +2789,7 @@ class OkxAiShortTermAssistant:
         if (
             self.config.signal_spike_enabled
             and scalp_view.get("action_level") in ("急速异动", "可短打")
-            and scalp_view.get("score", 0) >= self.config.watch_push_score
+            and scalp_view.get("score", 0) >= self.config.spike_push_score
         ):
             level = "L3"
             reasons.append("scalp_spike")
@@ -2584,11 +2798,26 @@ class OkxAiShortTermAssistant:
             level = "L3"
             reasons.append("funding_extreme")
 
+        sentiment_meta = score.get("sentiment_meta") if isinstance(score.get("sentiment_meta"), dict) else {}
+        if sentiment_meta.get("direction") in ("做多", "做空") and int(sentiment_meta.get("strength", 0) or 0) >= 3:
+            if score.get("raw_direction") == sentiment_meta.get("direction") and level == "L1":
+                level = "L2"
+                reasons.append("sentiment_leading")
+            elif score.get("raw_direction") in ("做多", "做空") and score.get("final_direction") == "观望":
+                if level != "L3":
+                    level = "L2"
+                reasons.append("sentiment_structure_conflict")
+
         if level != "L3":
             l2_hit = False
             if len(signals) >= 2:
                 l2_hit = True
                 reasons.append("multi_signal")
+            elif signal_types.intersection({"oi_change", "funding_fast_change", "long_short_extreme"}) and int(
+                sentiment_meta.get("strength", 0) or 0
+            ) >= 2:
+                l2_hit = True
+                reasons.append("sentiment_signals")
             elif signal_types.intersection(TRADE_TRIGGER_SIGNALS):
                 l2_hit = True
                 reasons.append("trade_signal")
@@ -2640,6 +2869,8 @@ class OkxAiShortTermAssistant:
             "take_profit": score.get("take_profit"),
             "market_regime": score.get("market_regime"),
             "trade_action_level": score.get("trade_action_level"),
+            "sentiment_direction": (score.get("sentiment_meta") or {}).get("direction"),
+            "sentiment_strength": (score.get("sentiment_meta") or {}).get("strength"),
             "signal_types": [item.get("type", "") for item in signals],
         }
 
@@ -2800,6 +3031,8 @@ class OkxAiShortTermAssistant:
         if recommendation == "spike":
             if not self.config.signal_spike_enabled:
                 return ""
+            if final_decision.get("confidence", 0) < self.config.spike_push_score:
+                return ""
             return "spike"
 
         if recommendation == "watch":
@@ -2830,10 +3063,11 @@ class OkxAiShortTermAssistant:
         snapshot: Dict[str, Any],
         signals: List[Dict[str, Any]],
         score: Dict[str, Any],
+        trigger: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         # 仅在 evaluate_ai_trigger 判定 should_call_ai 后调用。
         if self.dry_run_ai:
-            payload = self._ai_payload(snapshot, signals, score)
+            payload = self._ai_payload(snapshot, signals, score, trigger)
             return {
                 "provider": "dry-run",
                 "content": "AI dry-run enabled. Payload prepared but not sent.",
@@ -2869,7 +3103,7 @@ class OkxAiShortTermAssistant:
                     "circuit_open",
                 )
 
-        prompt = self._ai_prompt(snapshot, signals, score)
+        prompt = self._ai_prompt(snapshot, signals, score, trigger)
         try:
             client = self._get_ai_client(api_key, base_url)
             response = self._chat_completion_with_retry(client, model, prompt)
@@ -2896,6 +3130,7 @@ class OkxAiShortTermAssistant:
         final_decision: Dict[str, Any],
         analysis: Optional[Dict[str, Any]],
         local_score: Dict[str, Any],
+        trigger: Optional[Dict[str, Any]] = None,
     ) -> None:
         push_kind = self.push_gate(final_decision, signals)
         if not push_kind:
@@ -2918,7 +3153,16 @@ class OkxAiShortTermAssistant:
             self.last_push_at[push_key] = time.time()
             return
 
-        self._push_wechat(send_key, snapshot, signals, final_decision, analysis or {}, push_kind, local_score)
+        self._push_wechat(
+            send_key,
+            snapshot,
+            signals,
+            final_decision,
+            analysis or {},
+            push_kind,
+            local_score,
+            trigger=trigger or {},
+        )
         self.last_push_at[push_key] = time.time()
 
     def log_result(
@@ -2956,6 +3200,7 @@ class OkxAiShortTermAssistant:
             "instrument_profile": snapshot.get("instrument_profile", {}),
             "market_context": snapshot.get("market_context", {}),
             "signal_tracking": snapshot.get("signal_tracking", {}),
+            "paper_account": snapshot.get("paper_account", {}),
             "signals": signals,
             "score": score,
             "local_trigger": trigger,
@@ -2978,16 +3223,21 @@ class OkxAiShortTermAssistant:
 
         analysis: Optional[Dict[str, Any]] = None
         if trigger["should_call_ai"]:
-            analysis = self.analyze_with_ai(snapshot, signals, score)
+            analysis = self.analyze_with_ai(snapshot, signals, score, trigger)
             trigger["ai_invoked"] = True
             self.last_ai_call_at[inst_id] = self._now_ts()
             self.last_ai_fingerprint[inst_id] = trigger["fingerprint"]
 
         final_decision = self.merge_final_decision(analysis, score, signals, trigger)
         snapshot["signal_tracking"] = self.update_signal_tracking(snapshot, signals, final_decision)
+        snapshot["paper_account"] = self.update_paper_account(
+            inst_id,
+            to_float(snapshot.get("price")),
+            str(final_decision.get("direction", "观望") or "观望"),
+        )
         self._log_console_summary(snapshot, signals, final_decision, analysis, trigger)
         if not self.replay_mode:
-            self.push_if_needed(snapshot, signals, final_decision, analysis, score)
+            self.push_if_needed(snapshot, signals, final_decision, analysis, score, trigger)
         self.log_result(snapshot, signals, score, analysis, trigger, final_decision)
 
     def run_replay(self, frames: List[Dict[str, Any]], replay_interval: float = 0.0) -> None:
@@ -2995,6 +3245,7 @@ class OkxAiShortTermAssistant:
         if self.replay_log_file == LOG_FILE:
             self.replay_log_file = REPLAY_LOG_FILE
         self.replay_log_file.parent.mkdir(parents=True, exist_ok=True)
+        self.reset_paper_accounts(session_label="replay")
         total = len(frames)
         console_info(f"[{now_text()}] replay start: {total} frames -> {self.replay_log_file}")
         for index, frame in enumerate(frames, start=1):
@@ -3024,6 +3275,7 @@ class OkxAiShortTermAssistant:
 
     def run_forever(self, runtime: int) -> None:
         # 主循环：默认永久运行；runtime>0时，到指定秒数自动退出，用于实现定时任务。
+        self.reset_paper_accounts(session_label="live")
         log_note = f"json_log={LOG_FILE}" if self.runtime_config.analysis_log_enabled else "json_log=off"
         console_info(
             f"[{now_text()}] monitor start: {', '.join(self.instruments)} "
@@ -3036,6 +3288,111 @@ class OkxAiShortTermAssistant:
                 console_info(f"[{now_text()}] runtime {runtime}s reached; exit.")
                 break
             time.sleep(self.interval)
+
+    def _new_paper_state(self) -> Dict[str, Any]:
+        return {
+            "initial_capital": PAPER_INITIAL_CAPITAL,
+            "cash": PAPER_INITIAL_CAPITAL,
+            "equity": PAPER_INITIAL_CAPITAL,
+            "pnl_usd": 0.0,
+            "pnl_pct": 0.0,
+            "position": "flat",
+            "position_label": "空仓",
+            "entry_price": 0.0,
+            "basis_equity": 0.0,
+            "direction": "观望",
+            "trade_count": 0,
+        }
+
+    def reset_paper_accounts(self, session_label: str = "live") -> None:
+        self.paper_session_started_at = self._now_text()
+        self.paper_accounts = {inst_id: self._new_paper_state() for inst_id in self.instruments}
+        self._persist_paper_accounts(session_label=session_label)
+
+    def _paper_position_from_direction(self, direction: str) -> str:
+        if direction == "做多":
+            return "long"
+        if direction == "做空":
+            return "short"
+        return "flat"
+
+    def _paper_position_label(self, position: str) -> str:
+        return {"long": "做多", "short": "做空", "flat": "空仓"}.get(position, "空仓")
+
+    def _mark_paper_equity(self, state: Dict[str, Any], price: float) -> None:
+        position = state.get("position", "flat")
+        entry_price = to_float(state.get("entry_price"), 0.0)
+        basis_equity = to_float(state.get("basis_equity"), 0.0)
+        if position == "long" and entry_price > 0:
+            equity = basis_equity * (price / entry_price)
+        elif position == "short" and entry_price > 0:
+            equity = basis_equity * (1 + (entry_price - price) / entry_price)
+        else:
+            equity = to_float(state.get("cash"), PAPER_INITIAL_CAPITAL)
+        initial = to_float(state.get("initial_capital"), PAPER_INITIAL_CAPITAL)
+        state["equity"] = equity
+        state["pnl_usd"] = equity - initial
+        state["pnl_pct"] = (state["pnl_usd"] / initial * 100) if initial else 0.0
+
+    def _close_paper_position(self, state: Dict[str, Any], price: float) -> None:
+        position = state.get("position", "flat")
+        entry_price = to_float(state.get("entry_price"), 0.0)
+        basis_equity = to_float(state.get("basis_equity"), 0.0)
+        if position == "long" and entry_price > 0:
+            state["cash"] = basis_equity * (price / entry_price)
+        elif position == "short" and entry_price > 0:
+            state["cash"] = basis_equity * (1 + (entry_price - price) / entry_price)
+        state["position"] = "flat"
+        state["position_label"] = "空仓"
+        state["entry_price"] = 0.0
+        state["basis_equity"] = 0.0
+
+    def _open_paper_position(self, state: Dict[str, Any], position: str, price: float, direction: str) -> None:
+        state["position"] = position
+        state["position_label"] = self._paper_position_label(position)
+        state["entry_price"] = price
+        state["basis_equity"] = to_float(state.get("cash"), PAPER_INITIAL_CAPITAL)
+        state["cash"] = 0.0
+        state["direction"] = direction
+        state["trade_count"] = int(state.get("trade_count", 0) or 0) + 1
+
+    def update_paper_account(self, inst_id: str, price: float, direction: str) -> Dict[str, Any]:
+        """按 final_direction 满仓跟单：方向变化时换仓，观望时空仓；1x、不计费。"""
+        if inst_id not in self.instruments:
+            return {}
+        if price <= 0:
+            return dict(self.paper_accounts.get(inst_id, {}))
+
+        state = self.paper_accounts.setdefault(inst_id, self._new_paper_state())
+        target = self._paper_position_from_direction(direction)
+        current = state.get("position", "flat")
+        if target != current:
+            if current != "flat":
+                self._close_paper_position(state, price)
+            if target != "flat":
+                self._open_paper_position(state, target, price, direction)
+            else:
+                state["direction"] = "观望"
+                state["position_label"] = "空仓"
+        else:
+            state["direction"] = direction
+            if target != "flat":
+                state["position_label"] = self._paper_position_label(target)
+        self._mark_paper_equity(state, price)
+        self._persist_paper_accounts()
+        return dict(state)
+
+    def _persist_paper_accounts(self, session_label: str = "live") -> None:
+        PAPER_ACCOUNT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "session_label": session_label,
+            "session_started_at": self.paper_session_started_at or self._now_text(),
+            "initial_capital": PAPER_INITIAL_CAPITAL,
+            "note": "方向跟单模拟，非真实成交",
+            "accounts": self.paper_accounts,
+        }
+        with PAPER_ACCOUNT_FILE.open("w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False)
 
     def update_signal_tracking(
         self,
@@ -3719,12 +4076,13 @@ class OkxAiShortTermAssistant:
         if regime in ("trend_up", "trend_down") and adx_15m < 16:
             regime = "mixed"
             bias = "neutral"
+        bias_softened = False
         if bias == "long" and recent_price_pressure == "down":
             regime = "mixed"
-            bias = "neutral"
+            bias_softened = True
         elif bias == "short" and recent_price_pressure == "up":
             regime = "mixed"
-            bias = "neutral"
+            bias_softened = True
 
         recent_15m = confirmed_candles(candles.get("15m", []))
         old_close = to_float(recent_15m[min(4, len(recent_15m) - 1)].get("close")) if recent_15m else price
@@ -3748,6 +4106,8 @@ class OkxAiShortTermAssistant:
             warnings.append("ADX偏弱，趋势有效性不足")
         if profiles.get("15m", {}).get("divergence") in ("bearish", "bullish"):
             warnings.append(f"15m RSI出现{profiles.get('15m', {}).get('divergence')}背离")
+        if bias_softened:
+            warnings.append("短窗价格与结构bias反向，保留bias供情绪/结构综合判断")
         if abs(to_float(macd_15m.get("hist_slope"))) < abs(to_float(macd_15m.get("hist"))) * 0.15 and abs(to_float(macd_15m.get("hist"))) > 0:
             warnings.append("MACD柱体变化放缓，动能可能衰减")
         if rsi_15m > 78 or rsi_15m < 22:
@@ -3762,6 +4122,7 @@ class OkxAiShortTermAssistant:
         return {
             "regime": regime,
             "bias": bias,
+            "bias_softened": bias_softened,
             "trend_votes": trend_votes,
             "up_count": up_count,
             "down_count": down_count,
@@ -3959,7 +4320,7 @@ class OkxAiShortTermAssistant:
     def _push_kind(self, score: Dict[str, Any], signals: List[Dict[str, Any]]) -> str:
         signal_types = {item.get("type") for item in signals}
         scalp_view = score.get("strategy_views", {}).get("scalp", {})
-        if self.config.signal_spike_enabled and scalp_view.get("action_level") in ("急速异动", "可短打") and scalp_view.get("score", 0) >= self.config.watch_push_score:
+        if self.config.signal_spike_enabled and scalp_view.get("action_level") in ("急速异动", "可短打") and scalp_view.get("score", 0) >= self.config.spike_push_score:
             return "spike"
         if self.config.signal_trade_enabled and score.get("final_trade_score", 0) >= self.push_score and score.get("direction") in ("做多", "做空"):
             return "trade"
@@ -4023,6 +4384,7 @@ class OkxAiShortTermAssistant:
         snapshot: Dict[str, Any],
         signals: List[Dict[str, Any]],
         score: Dict[str, Any],
+        trigger: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         # 发送给AI的数据分成三层：
         # 1. raw_evidence：原始证据，让AI能复核趋势、放量、OI/funding变化。
@@ -4074,6 +4436,7 @@ class OkxAiShortTermAssistant:
                 "long_short_extreme": self.config.long_short_extreme,
                 "push_score": self.push_score,
                 "watch_push_score": self.config.watch_push_score,
+                "spike_push_score": self.config.spike_push_score,
                 "strategy_mode": self._strategy_mode(),
                 "risk_preference": self._risk_preference(),
                 "signal_types_enabled": {
@@ -4092,6 +4455,11 @@ class OkxAiShortTermAssistant:
                     "downgraded_to_wait": score.get("raw_direction") != score.get("final_direction"),
                 },
                 "signal_evidence": self._signal_evidence(snapshot, signals),
+            },
+            "local_trigger": {
+                "level": (trigger or {}).get("level", "L0"),
+                "reasons": (trigger or {}).get("reasons", []),
+                "fingerprint": (trigger or {}).get("fingerprint", ""),
             },
         }
 
@@ -4203,16 +4571,26 @@ class OkxAiShortTermAssistant:
         snapshot: Dict[str, Any],
         signals: List[Dict[str, Any]],
         score: Dict[str, Any],
+        trigger: Optional[Dict[str, Any]] = None,
     ) -> str:
         # Prompt明确约束AI：只做分析，不自动下单，不承诺收益，并要求固定字段。
-        payload = self._ai_payload(snapshot, signals, score)
+        cfg = self.config
+        trigger = trigger or {}
+        trigger_level = trigger.get("level", "L0")
+        trigger_reasons = trigger.get("reasons") or []
+        trigger_reasons_text = "、".join(str(x) for x in trigger_reasons) or "无"
+        payload = self._ai_payload(snapshot, signals, score, trigger)
         return (
             "你是欧易OKX USDT永续合约多策略分析助手，只分析BTC-USDT-SWAP和ETH-USDT-SWAP。"
-            # "你的任务是根据实时行情、多周期K线、EMA/MA/RSI/MACD/KDJ/BOLL/ADX/ATR结构画像、成交量、OI、资金费率、多空比、订单簿和本地规则评分，"
+            "你的输出会写入本地日志，并可能经微信推送给人工复核；"
+            "字段 push_recommendation 会参与是否推送，请与下方阈值一致。\n\n"
+            "【本次触发上下文】\n"
+            f"- 本地 AI 触发级别: {trigger_level}（见 local_trigger.level）\n"
+            f"- 触发原因: {trigger_reasons_text}\n"
+            f"- 推送阈值（confidence 对照）: trade≥{self.push_score}, watch≥{cfg.watch_push_score}, spike≥{cfg.spike_push_score}\n\n"
             "你的任务是根据实时行情、多周期K线、EMA/MA/RSI/MACD/KDJ/BOLL/ADX/ATR结构画像、成交量、OI、资金费率、多空比、订单簿，"
-            ""
-            # "先审计程序规则结果是否可信，再输出短线交易观察建议。\n\n"
-            "直接根据原始数据和本地触发的 signals 独立判断；local_trigger.local_hint 与 rule_outputs 仅供参考，不得机械照搬。\n\n"
+            "直接根据原始数据和本地触发的 signals 独立判断；"
+            "rule_outputs.local_hint 与 rule_outputs.score 仅供参考，不得机械照搬。\n\n"
             "硬性限制：\n"
             "1. 只提供分析和风险提示，不允许表示系统会自动下单。\n"
             "2. 不允许承诺收益，不允许使用稳赚、必涨、必跌等确定性表述。\n"
@@ -4220,21 +4598,31 @@ class OkxAiShortTermAssistant:
             "4. 如果long_short_ratio.available=false，需要说明多空比不可用，不要凭空编造多空比。\n"
             "5. 如果oi_warmup_ready=false或funding_warmup_ready=false，需要降低对15分钟变化类指标的权重。\n\n"
             f"策略要求：当前主策略为{score.get('strategy_label')}，风险偏好为{score.get('risk_preference')}，AI输出风格为{score.get('ai_output_style')}。"
-            "可参考 strategy_views 解释超短线/短线/中线差异，但最终 direction 与 push_recommendation 必须由你独立给出。"
+            "可参考 score.strategy_views 解释超短线/短线/中线差异，但最终 direction 与 push_recommendation 必须由你独立给出。"
             "超短线只看1m/3m/5m与15m过滤，4H只做背景；短线看5m/15m和1H确认；中线看1H/4H结构。"
             "如果超短线出现急速异动但主策略不是超短线，应在 push_recommendation 中用 spike 或 watch 表达，不要包装成中线趋势。\n\n"
             "分析步骤：\n"
-            "1. 规则审计：根据raw_evidence和signal_evidence，判断程序触发的signals是否有原始数据支持。\n"
-            "2. 市场状态：优先参考market_context.regime/bias，区分趋势、震荡、高波动、混合状态。\n"
-            "3. 趋势：根据K线原始数据、EMA9/20/60/120、MA120、ADX和结构高低点判断1m、3m、5m、15m、1H、4H方向。\n"
-            "4. 动量：用RSI、MACD柱体变化、KDJ和K线实体质量判断是否过热、背离或动能衰减。\n"
-            "5. 量能：复核已收盘1m成交量、量价方向、动态分位数和突破放量确认。\n"
-            "6. 合约资金：根据OI+价格组合、资金费率、多空比判断新增仓、平仓和拥挤风险。\n"
-            "7. 订单簿：只作为入场确认，不允许单独用盘口不平衡决定方向；注意top5/top20分歧和价差。\n"
-            "8. 回测反馈：signal_tracking只是在线复盘统计，样本少时不能过度依赖。\n"
-            "9. 风险：结合ATR止损距离、资金费率、趋势冲突、信号数量、预热状态给出风险等级。\n"
-            "10. 建议：direction 只能是做多、做空、观望；push_recommendation 只能是 none/watch/trade/spike；"
-            "confidence 为 0-100 的把握度。若不应推送则 push_recommendation=none。\n\n"
+            "1. 规则审计：根据 raw_evidence 和 signal_evidence，判断程序触发的 signals 是否有原始数据支持。\n"
+            "2. 情绪与方向：读 score.sentiment_meta 与 market_context，判断情绪/领先方向是否支持或削弱本地方向；"
+            "若 rule_outputs.direction_audit.downgraded_to_wait=true，说明 raw_direction 被降级，需在 rule_audit 中解释。\n"
+            "3. 市场状态：优先参考 market_context.regime/bias，区分趋势、震荡、高波动、混合状态。\n"
+            "4. 趋势：根据K线原始数据、EMA9/20/60/120、MA120、ADX和结构高低点判断1m、3m、5m、15m、1H、4H方向。\n"
+            "5. 动量：用RSI、MACD柱体变化、KDJ和K线实体质量判断是否过热、背离或动能衰减。\n"
+            "6. 量能：复核已收盘1m成交量、量价方向、动态分位数和突破放量确认。\n"
+            "7. 合约资金：根据OI+价格组合、资金费率、多空比判断新增仓、平仓和拥挤风险。\n"
+            "8. 订单簿：只作为入场确认，不允许单独用盘口不平衡决定方向；注意 top5/top20 分歧和价差。\n"
+            "9. 回测反馈：signal_tracking 只是在线复盘统计，样本少时不能过度依赖。\n"
+            "10. 价位与可执行性：结合 score.entry_plan 评估；做多时 stop_loss 应低于入场、take_profit 应高于入场；"
+            "做空时 stop_loss 应高于入场、take_profit 应低于入场。"
+            "若仅为「等待结构位」或缺少明确价位，direction 应为观望，不可标可执行 trade。\n"
+            "11. 风险：结合ATR止损距离、资金费率、趋势冲突、信号数量、预热状态给出 risk_level。\n"
+            "12. 推送建议：direction 只能是做多、做空、观望；push_recommendation 只能是 none/watch/trade/spike；"
+            f"confidence 为 0-100。默认倾向 none，避免无效骚扰。规则："
+            f"trade=做多/做空且 confidence≥{self.push_score} 且 entry_plan 可执行；"
+            f"watch=观望且 confidence≥{cfg.watch_push_score} 且存在 watch 类信号"
+            "（funding_hot/rsi_extreme/rsi_divergence/boll_squeeze/long_short_extreme/funding_fast_change）或值得提醒的结构/风险；"
+            f"spike=local_trigger.level 为 L3 或 scalp 急速异动且 direction 为做多/做空且 confidence≥{cfg.spike_push_score}；"
+            "rule_audit.overall=不可信 时通常 none，最多 watch；downgraded_to_wait 时通常不应 trade/spike。\n\n"
             "必须只输出一个合法JSON对象，不要输出Markdown代码块，不要输出JSON以外的解释。"
             "JSON字段必须完全包含：\n"
             "{\n"
@@ -4379,6 +4767,128 @@ class OkxAiShortTermAssistant:
             labels.append(SIGNAL_TYPE_LABELS.get(signal_type, signal_type))
         return labels[:limit]
 
+    def _label_risk_preference(self, value: Any) -> str:
+        key = str(value or "standard").strip().lower()
+        return RISK_PREFERENCE_LABELS.get(key, key or "标准")
+
+    def _label_trigger_reasons(self, reasons: List[Any]) -> str:
+        labels = []
+        for item in reasons:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            labels.append(TRIGGER_REASON_LABELS.get(text, text))
+        return "、".join(labels) if labels else "-"
+
+    def _label_decision_source(self, final_decision: Dict[str, Any], analysis: Dict[str, Any]) -> str:
+        source = str(final_decision.get("decision_source", analysis.get("provider", "local")) or "local")
+        return DECISION_SOURCE_LABELS.get(source, source)
+
+    def _ai_push_was_invoked(self, analysis: Dict[str, Any], trigger: Dict[str, Any]) -> bool:
+        if trigger.get("ai_invoked"):
+            return True
+        if not analysis:
+            return False
+        if str(analysis.get("content") or "").strip():
+            return True
+        return analysis.get("provider") not in (None, "", "local-rule")
+
+    def _format_full_ai_push_lines(self, analysis: Dict[str, Any]) -> List[str]:
+        lines: List[str] = []
+        if not analysis:
+            lines.append("- 本轮未返回 AI 内容")
+            return lines
+
+        provider = display_push_value(analysis.get("provider"), "-")
+        model = display_push_value(analysis.get("model"), "-")
+        if provider != "-" or model != "-":
+            lines.append(f"- 接口：{provider} | 模型：{model}")
+
+        valid = bool(analysis.get("valid_json"))
+        lines.append(f"- JSON 校验：{'通过' if valid else '未通过'}")
+
+        errors = analysis.get("validation_errors") if isinstance(analysis.get("validation_errors"), list) else []
+        if errors:
+            lines.append("- 校验问题：" + "；".join(str(item) for item in errors))
+
+        if analysis.get("error"):
+            lines.append(f"- 调用错误：{analysis.get('error')}")
+
+        parsed = analysis.get("parsed") if isinstance(analysis.get("parsed"), dict) else {}
+        if parsed:
+            trend = parsed.get("trend") if isinstance(parsed.get("trend"), dict) else {}
+            if trend.get("summary"):
+                lines.append(f"- 趋势：{trend.get('summary')}")
+            if trend.get("conflict"):
+                lines.append(f"- 周期冲突：{trend.get('conflict')}")
+            timeframes = trend.get("timeframes") if isinstance(trend.get("timeframes"), dict) else {}
+            if timeframes:
+                lines.append("- 多周期：")
+                for timeframe, value in timeframes.items():
+                    text = str(value or "").strip()
+                    if text:
+                        lines.append(f"  · {timeframe}：{text}")
+
+            for key, label in (
+                ("direction", "方向"),
+                ("confidence", "置信度"),
+                ("risk_level", "风险等级"),
+                ("push_recommendation", "推送建议"),
+                ("entry", "入场"),
+                ("stop_loss", "止损"),
+                ("take_profit", "止盈"),
+            ):
+                value = parsed.get(key)
+                if value not in (None, "", "-"):
+                    lines.append(f"- {label}：{value}")
+
+            for key, label in (("risk", "风险分析"), ("suggestion", "交易建议"), ("score_comment", "评分说明")):
+                value = str(parsed.get(key) or "").strip()
+                if value:
+                    lines.append(f"- {label}：{value}")
+
+            audit = parsed.get("rule_audit") if isinstance(parsed.get("rule_audit"), dict) else {}
+            if audit:
+                lines.append("- 规则审计：")
+                if audit.get("overall"):
+                    lines.append(f"  · 总体：{audit.get('overall')}")
+                if audit.get("score_consistency"):
+                    lines.append(f"  · 评分一致性：{audit.get('score_consistency')}")
+                for key, label in (
+                    ("volume_signal_valid", "放量信号"),
+                    ("oi_signal_valid", "OI 信号"),
+                    ("funding_signal_valid", "费率信号"),
+                    ("long_short_signal_valid", "多空比信号"),
+                ):
+                    if key in audit:
+                        lines.append(f"  · {label}：{audit.get(key)}")
+                for warning in audit.get("warnings") or []:
+                    text = str(warning or "").strip()
+                    if text:
+                        lines.append(f"  · 警告：{text}")
+
+            reasons = parsed.get("reasons") if isinstance(parsed.get("reasons"), list) else []
+            if reasons:
+                lines.append("- 理由：")
+                for index, reason in enumerate(reasons, start=1):
+                    text = str(reason or "").strip()
+                    if text:
+                        lines.append(f"  {index}. {text}")
+
+        raw = str(analysis.get("content") or "").strip()
+        if raw:
+            lines.extend(["", "**AI 原始输出**", "```", raw, "```"])
+
+        return lines
+
+    def _join_wechat_desp(self, lines: List[str], max_chars: int = WECHAT_PUSH_MAX_DESP) -> str:
+        text = "\n".join(lines)
+        if len(text) <= max_chars:
+            return text
+        notice = "\n\n（正文过长已截断，完整 AI 输出见 JSON 分析日志 analysis 字段）"
+        keep = max(0, max_chars - len(notice))
+        return text[:keep] + notice
+
     def _build_wechat_push_content(
         self,
         snapshot: Dict[str, Any],
@@ -4387,8 +4897,10 @@ class OkxAiShortTermAssistant:
         analysis: Dict[str, Any],
         push_kind: str = "trade",
         local_score: Optional[Dict[str, Any]] = None,
+        trigger: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, str]:
         local_score = local_score or {}
+        trigger = trigger or {}
         view = self._resolve_push_view(final_decision, analysis, local_score)
         inst_id = snapshot["inst_id"]
         symbol = symbol_ccy(inst_id)
@@ -4398,6 +4910,16 @@ class OkxAiShortTermAssistant:
         local_raw = local_score.get("raw_total_score", local_score.get("total_score", "-"))
         local_trade = local_score.get("final_trade_score", local_score.get("total_score", "-"))
         final_confidence = view.get("confidence", final_decision.get("confidence", "-"))
+        strategy_label = final_decision.get("strategy_label", local_score.get("strategy_label", "-"))
+        risk_preference = self._label_risk_preference(
+            final_decision.get("risk_preference", local_score.get("risk_preference", "standard"))
+        )
+        decision_source_label = self._label_decision_source(final_decision, analysis)
+        push_kind_label = PUSH_KIND_LABELS.get(push_kind, push_kind)
+        trigger_level = final_decision.get("trigger_level", trigger.get("level", "-"))
+        trigger_reasons = self._label_trigger_reasons(trigger.get("reasons") if isinstance(trigger.get("reasons"), list) else [])
+        market_regime = final_decision.get("market_regime", local_score.get("market_regime", "unknown"))
+        market_bias = local_score.get("bias", "neutral")
 
         title_parts = [
             symbol,
@@ -4416,61 +4938,91 @@ class OkxAiShortTermAssistant:
         lines = [
             f"## {inst_id} · {snapshot.get('time', now_text())}",
             "",
-            f"**最终结论**：{view['direction']} | 风险 {view['risk_level']} | 来源 {view['source']} | 推送 {view.get('push_recommendation', push_kind)}",
-            f"**价格**：{price} | 最终置信 {final_confidence} | 本地观察/交易 {local_raw}/{local_trade}",
-            f"**主策略**：{final_decision.get('strategy_label', local_score.get('strategy_label', '-'))} | 风险偏好 {final_decision.get('risk_preference', local_score.get('risk_preference', '-'))}",
+            "### 一、当前配置",
+            f"- 主策略：{strategy_label} | 确认严格度：{risk_preference}",
+            f"- 本次推送：{push_kind_label} | 门槛 trade {self.push_score} · watch {self.config.watch_push_score} · spike {self.config.spike_push_score}",
+            f"- AI 分析：{'已启用' if self.ai_enabled else '未启用'} | 轮询：{self.interval}秒",
+            "",
+            "### 二、触发原因",
+            f"- 触发等级：{trigger_level} | 触发条件：{trigger_reasons}",
+            f"- 检测信号：{signal_text}",
+            f"- 市场状态：{market_regime} / {market_bias}",
         ]
+        signal_details = [
+            clip_push_text(item.get("desc"), 100)
+            for item in signals[:3]
+            if clip_push_text(item.get("desc"), 100)
+        ]
+        if signal_details:
+            lines.append("- 信号说明：" + "；".join(signal_details))
+
+        ai_invoked = self._ai_push_was_invoked(analysis, trigger)
+        lines.extend(["", "### 三、AI/本地建议", f"- 来源：{decision_source_label}"])
+        if ai_invoked:
+            lines.extend(["", "#### AI 完整分析", *self._format_full_ai_push_lines(analysis), "", "#### 本地参考"])
+
+        local_direction = display_push_value(local_score.get("final_direction", local_score.get("direction")), "观望")
+        lines.append(f"- 本地参考：方向 {local_direction} | 观察/交易分 {local_raw}/{local_trade}")
+        if view["direction"] != view["rule_direction"]:
+            lines.append(f"- 本地原始方向 {view['rule_direction']}（与最终结论不一致，以下以最终结论为准）")
+
+        local_summary = clip_push_text(local_score.get("trade_action_level"), 120)
+        if local_summary != "-":
+            lines.append(f"- 本地动作：{local_summary}")
+
         selected_view = local_score.get("selected_strategy_view", {})
         if selected_view.get("summary"):
-            lines.append(f"**主策略视角**：{selected_view.get('summary')}")
+            lines.append(f"- 主策略视角：{clip_push_text(selected_view.get('summary'), 140)}")
+
         scalp_view = local_score.get("strategy_views", {}).get("scalp", {})
         if scalp_view.get("action_level") in ("急速异动", "可短打"):
-            lines.append(f"**超短线提醒**：{scalp_view.get('direction')} / {scalp_view.get('action_level')} / {scalp_view.get('score')}分；{scalp_view.get('summary')}")
-        if view["direction"] != view["rule_direction"]:
-            lines.append(f"**本地参考方向**：{view['rule_direction']}（与最终结论不一致，以最终结论为准）")
-        if view["trend_summary"] != "-":
-            lines.append(f"**趋势**：{view['trend_summary']}")
-        if view["trend_conflict"] not in ("-", "none", "无", "否"):
-            lines.append(f"**周期冲突**：{view['trend_conflict']}")
+            lines.append(
+                f"- 超短线：{scalp_view.get('direction')} / {scalp_view.get('action_level')} / "
+                f"{scalp_view.get('score')}分；{clip_push_text(scalp_view.get('summary'), 120)}"
+            )
 
-        lines.extend(["", "**交易计划**"])
-        if view["direction"] == "观望" and view["entry"] == "-" and view["stop_loss"] == "-" and view["take_profit"] == "-":
-            lines.append("- 当前建议观望，暂不给出入场/止损/止盈")
-        else:
-            lines.append(f"- 入场：{view['entry']}")
-            lines.append(f"- 止损：{view['stop_loss']}")
-            lines.append(f"- 止盈：{view['take_profit']}")
-
-        if view["suggestion"] != "-":
-            lines.extend(["", f"**执行建议**：{view['suggestion']}"])
-
-        if view["reasons"]:
-            lines.extend(["", "**核心依据**"])
+        if not ai_invoked and view["reasons"]:
+            lines.append("- 本地依据：")
             for index, reason in enumerate(view["reasons"], start=1):
-                lines.append(f"{index}. {reason}")
+                lines.append(f"  {index}. {reason}")
 
-        if view["risk"] != "-":
-            lines.extend(["", f"**风险提示**：{view['risk']}"])
+        lines.append("- 交易计划（最终结论）：")
+        if view["direction"] == "观望" and view["entry"] == "-" and view["stop_loss"] == "-" and view["take_profit"] == "-":
+            lines.append("  - 当前建议观望，暂不给出入场/止损/止盈")
+        else:
+            lines.append(f"  - 入场：{view['entry']}")
+            lines.append(f"  - 止损：{view['stop_loss']}")
+            lines.append(f"  - 止盈：{view['take_profit']}")
 
-        if view["score_comment"] != "-":
-            lines.append(f"**评分说明**：{view['score_comment']}")
+        if view["suggestion"] != "-" and not ai_invoked:
+            lines.append(f"- 执行建议：{view['suggestion']}")
+
+        lines.extend([
+            "",
+            "### 四、最终结论",
+            f"- 方向：{view['direction']} | 风险：{view['risk_level']} | 置信度：{final_confidence}",
+            f"- 现价：{price} | 推送：{view.get('push_recommendation', push_kind)}",
+            f"- 决策来源：{decision_source_label} | 触发等级：{trigger_level}",
+        ])
+        if not ai_invoked and view["trend_summary"] != "-":
+            lines.append(f"- 趋势：{view['trend_summary']}")
+        if not ai_invoked and view["trend_conflict"] not in ("-", "none", "无", "否"):
+            lines.append(f"- 周期冲突：{view['trend_conflict']}")
 
         audit_bits = []
         if view["rule_audit_overall"] != "-":
             audit_bits.append(view["rule_audit_overall"])
         audit_bits.extend(view["rule_audit_warnings"])
-        if audit_bits:
-            lines.extend(["", f"**规则审计**：{'；'.join(audit_bits)}"])
+        if audit_bits and not ai_invoked:
+            lines.append(f"- 规则审计：{'；'.join(audit_bits)}")
+        elif view["score_comment"] != "-" and not ai_invoked:
+            lines.append(f"- 评分说明：{view['score_comment']}")
 
         lines.extend([
             "",
-            f"**触发信号**：{signal_text}",
-            f"**市场状态**：{final_decision.get('market_regime', local_score.get('market_regime', 'unknown'))} / {local_score.get('bias', 'neutral')}",
-            f"**决策来源**：{final_decision.get('decision_source', '-')} | 触发等级 {final_decision.get('trigger_level', '-')}",
-            "",
             "仅供观察，不构成投资建议。",
         ])
-        return title[:120], "\n".join(lines)
+        return title[:120], self._join_wechat_desp(lines)
 
     def _format_push_message(
         self,
@@ -4480,9 +5032,16 @@ class OkxAiShortTermAssistant:
         analysis: Dict[str, Any],
         push_kind: str = "trade",
         local_score: Optional[Dict[str, Any]] = None,
+        trigger: Optional[Dict[str, Any]] = None,
     ) -> str:
         title, desp = self._build_wechat_push_content(
-            snapshot, signals, final_decision, analysis, push_kind, local_score=local_score
+            snapshot,
+            signals,
+            final_decision,
+            analysis,
+            push_kind,
+            local_score=local_score,
+            trigger=trigger,
         )
         return f"[OKX AI短线助手][{push_kind}] {title}\n\n{desp}"
 
@@ -4509,9 +5068,16 @@ class OkxAiShortTermAssistant:
         analysis: Dict[str, Any],
         push_kind: str = "trade",
         local_score: Optional[Dict[str, Any]] = None,
+        trigger: Optional[Dict[str, Any]] = None,
     ) -> None:
         title, desp = self._build_wechat_push_content(
-            snapshot, signals, final_decision, analysis, push_kind, local_score=local_score
+            snapshot,
+            signals,
+            final_decision,
+            analysis,
+            push_kind,
+            local_score=local_score,
+            trigger=trigger,
         )
         try:
             http_post_json(
@@ -4592,6 +5158,193 @@ def short_count_greater(trends: Dict[str, str]) -> bool:
     return sum(1 for item in trends.values() if item == "down") > sum(1 for item in trends.values() if item == "up")
 
 
+def _assistant_from_user_config(config: Dict[str, Any]) -> OkxAiShortTermAssistant:
+    inst_ids = config.get("inst_ids") or list(SUPPORTED_INSTRUMENTS)
+    if isinstance(inst_ids, str):
+        inst_ids = [inst_ids]
+    instruments = [item for item in inst_ids if item in SUPPORTED_INSTRUMENTS] or list(SUPPORTED_INSTRUMENTS)
+    push_score = int(config.get("push_score", DEFAULT_PUSH_SCORE))
+    watch_push_score = int(config.get("watch_push_score", 65))
+    spike_push_score = int(config.get("spike_push_score", 62))
+    return OkxAiShortTermAssistant(
+        instruments=instruments,
+        interval=max(int(config.get("interval", DEFAULT_INTERVAL_SECONDS)), 1),
+        flag="0",
+        ai_enabled=bool(config.get("ai_enabled", True)),
+        push_enabled=True,
+        push_score=push_score,
+        dry_run_ai=bool(config.get("dry_run_ai", False)),
+        config=SignalConfig(
+            volume_multiplier=float(config.get("volume_multiplier", 2.0)),
+            oi_change_pct_15m=float(config.get("oi_change_pct_15m", 5.0)),
+            funding_abs_threshold=float(config.get("funding_abs_threshold", 0.0008)),
+            funding_change_threshold=float(config.get("funding_change_threshold", 0.0003)),
+            long_short_extreme=float(config.get("long_short_extreme", 0.75)),
+            strategy_mode=str(config.get("strategy_mode", "short")),
+            risk_preference=str(config.get("risk_preference", "standard")),
+            signal_trade_enabled=bool(config.get("signal_trade_enabled", True)),
+            signal_watch_enabled=bool(config.get("signal_watch_enabled", True)),
+            signal_spike_enabled=bool(config.get("signal_spike_enabled", True)),
+            ai_output_style=str(config.get("ai_output_style", "steady")),
+            allow_scalp_trade=bool(config.get("allow_scalp_trade", False)),
+            allow_counter_4h_scalp=bool(config.get("allow_counter_4h_scalp", False)),
+            allow_oi_divergence_momentum=bool(config.get("allow_oi_divergence_momentum", False)),
+            scalp_move_pct_5m=float(config.get("scalp_move_pct_5m", 0.22)),
+            scalp_move_pct_10m=float(config.get("scalp_move_pct_10m", 0.35)),
+            watch_push_score=watch_push_score,
+            spike_push_score=spike_push_score,
+        ),
+        runtime_config=RuntimeConfig(
+            retry_times=int(config.get("retry_times", DEFAULT_RETRY_TIMES)),
+            retry_backoff=float(config.get("retry_backoff", DEFAULT_RETRY_BACKOFF_SECONDS)),
+            push_cooldown_seconds=int(config.get("push_cooldown_seconds", DEFAULT_PUSH_COOLDOWN_SECONDS)),
+            log_max_bytes=int(config.get("log_max_bytes", DEFAULT_LOG_MAX_BYTES)),
+            analysis_log_enabled=bool(config.get("analysis_log_enabled", False)),
+        ),
+    )
+
+
+def build_wechat_push_format_preview(config: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+    """Assemble a sample WeChat push using mock AI JSON fields for layout preview."""
+    config = dict(config or {})
+    preview_config = {**config, "ai_enabled": True}
+    assistant = _assistant_from_user_config(preview_config)
+    strategy_mode = str(config.get("strategy_mode", "short"))
+    strategy_label = STRATEGY_PROFILES.get(strategy_mode, STRATEGY_PROFILES["short"])["label"]
+    risk_preference = str(config.get("risk_preference", "standard"))
+    inst_ids = config.get("inst_ids") or ["BTC-USDT-SWAP"]
+    if isinstance(inst_ids, str):
+        inst_ids = [inst_ids]
+    inst_id = next((item for item in inst_ids if item in SUPPORTED_INSTRUMENTS), "BTC-USDT-SWAP")
+    preview_time = now_text()
+
+    mock_parsed: Dict[str, Any] = {
+        "trend": {
+            "summary": "【示例】5m/15m 结构偏多，1H 仍在箱体内震荡，尚未形成单边延伸。",
+            "timeframes": {
+                "1m": "短线抬升，回踩区间上沿",
+                "3m": "动能修复，未出现背离",
+                "5m": "profile=up，脉冲后缩量整理",
+                "15m": "结构由 mixed 转 up",
+                "1H": "震荡偏多，阻力尚未突破",
+                "4H": "背景中性，不构成强趋势过滤",
+            },
+            "conflict": "1H 与 15m 方向尚未完全共振",
+        },
+        "risk": "【示例】资金费率略偏正、多空比均衡；波动率偏高，追价风险大于回踩确认。",
+        "suggestion": "【示例】可轻仓试多，优先等回踩入场区；未放量突破前不建议追涨。",
+        "direction": "做多",
+        "entry": "65750 - 65780",
+        "stop_loss": "65710",
+        "take_profit": "65840 / 65900",
+        "risk_level": "中",
+        "confidence": 78,
+        "push_recommendation": "trade",
+        "score_comment": "【示例】本地观察分略低于 AI；盘口支撑与 5m/15m 结构更可信，建议以 AI 计划为主、本地分为辅。",
+        "rule_audit": {
+            "overall": "部分可信",
+            "volume_signal_valid": True,
+            "oi_signal_valid": True,
+            "funding_signal_valid": True,
+            "long_short_signal_valid": False,
+            "score_consistency": "盘口失衡有原始数据支持，本地方向偏保守",
+            "warnings": [
+                "【示例】15m 趋势刚转多，需防假突破",
+                "【示例】费率预热已完成，但 15m 变化幅度一般",
+            ],
+        },
+        "reasons": [
+            "【示例】top20 盘口 imbalance 0.72，买盘承接明显",
+            "【示例】5m+15m profile 同步转多",
+            "【示例】1m 回踩区间上沿获支撑，量价未明显背离",
+        ],
+    }
+    mock_raw = json.dumps(mock_parsed, ensure_ascii=False, indent=2)
+    analysis: Dict[str, Any] = {
+        "provider": "openai",
+        "model": "preview-model",
+        "valid_json": True,
+        "validation_errors": [],
+        "content": mock_raw,
+        "parsed": mock_parsed,
+    }
+    signals = [
+        {
+            "type": "order_book_imbalance",
+            "desc": "【示例】top20 book imbalance 0.72 (bid_support)",
+        },
+        {
+            "type": "volume_spike",
+            "desc": "【示例】1m closed volume 2.3x median",
+        },
+    ]
+    local_score: Dict[str, Any] = {
+        "direction": "观望",
+        "final_direction": "做多",
+        "raw_direction": "做多",
+        "raw_total_score": 68,
+        "final_trade_score": 74,
+        "risk_level": "中",
+        "market_regime": "high_volatility",
+        "bias": "bullish",
+        "strategy_label": strategy_label,
+        "risk_preference": risk_preference,
+        "trade_action_level": "【示例】等待确认 → 可轻仓试多",
+        "entry": "65750 - 65780",
+        "stop_loss": "65710",
+        "take_profit": "65840 / 65900",
+        "selected_strategy_view": {
+            "summary": "【示例】5m+15m 同向偏多，20m 延伸尚未确认",
+        },
+        "strategy_views": {
+            "scalp": {
+                "direction": "做多",
+                "action_level": "可短打",
+                "score": 71,
+                "summary": "【示例】5m 脉冲 0.11%，适合 1-15 分钟波动捕捉",
+            }
+        },
+    }
+    final_decision: Dict[str, Any] = {
+        "direction": "做多",
+        "confidence": 78,
+        "push_recommendation": "trade",
+        "entry": "65750 - 65780",
+        "stop_loss": "65710",
+        "take_profit": "65840 / 65900",
+        "risk_level": "中",
+        "summary": mock_parsed["suggestion"],
+        "reasons": mock_parsed["reasons"],
+        "rule_audit": mock_parsed["rule_audit"],
+        "decision_source": "ai",
+        "ai_called": True,
+        "trigger_level": "L2",
+        "market_regime": "high_volatility",
+        "strategy_label": strategy_label,
+        "risk_preference": risk_preference,
+        "score_comment": mock_parsed["score_comment"],
+    }
+    trigger = {
+        "level": "L2",
+        "ai_invoked": True,
+        "reasons": ["trade_signal", "multi_signal"],
+    }
+    snapshot = {
+        "inst_id": inst_id,
+        "time": preview_time,
+        "price": 65766.9,
+    }
+    return assistant._build_wechat_push_content(
+        snapshot,
+        signals,
+        final_decision,
+        analysis,
+        "trade",
+        local_score,
+        trigger,
+    )
+
+
 def parse_instruments(value: str) -> List[str]:
     # V1只允许客户需求中的两个永续合约，避免误传现货或其他合约。
     instruments = [item.strip().upper() for item in value.split(",") if item.strip()]
@@ -4641,6 +5394,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scalp-move-pct-5m", type=float, default=env_float("SCALP_MOVE_PCT_5M", 0.22))
     parser.add_argument("--scalp-move-pct-10m", type=float, default=env_float("SCALP_MOVE_PCT_10M", 0.35))
     parser.add_argument("--watch-push-score", type=int, default=env_int("WATCH_PUSH_SCORE", DEFAULT_PUSH_SCORE))
+    parser.add_argument("--spike-push-score", type=int, default=env_int("SPIKE_PUSH_SCORE", 62))
     parser.add_argument("--record-replay", action="store_true", default=os.getenv("RECORD_REPLAY", "0") == "1")
     parser.add_argument(
         "--record-replay-file",
@@ -4695,6 +5449,7 @@ def main() -> int:
             scalp_move_pct_5m=args.scalp_move_pct_5m,
             scalp_move_pct_10m=args.scalp_move_pct_10m,
             watch_push_score=args.watch_push_score,
+            spike_push_score=args.spike_push_score,
         ),
         runtime_config=RuntimeConfig(
             retry_times=max(args.retry_times, 1),

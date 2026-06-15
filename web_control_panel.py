@@ -17,7 +17,7 @@ import time
 import urllib.parse
 import urllib.request
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -26,25 +26,28 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-try:
-    from okx_signal_monitor import (
-        REPLAY_DATASET_FILE,
-        REPLAY_LOG_FILE,
-        replay_dataset_stats,
-    )
-except ModuleNotFoundError:
-    import importlib.util
+_SIGNAL_MONITOR = None
 
-    signal_monitor_path = SCRIPT_DIR / "okx_signal_monitor.py"
-    spec = importlib.util.spec_from_file_location("okx_signal_monitor", signal_monitor_path)
-    if spec is None or spec.loader is None:
-        raise
-    signal_monitor_module = importlib.util.module_from_spec(spec)
-    sys.modules["okx_signal_monitor"] = signal_monitor_module
-    spec.loader.exec_module(signal_monitor_module)
-    REPLAY_DATASET_FILE = signal_monitor_module.REPLAY_DATASET_FILE
-    REPLAY_LOG_FILE = signal_monitor_module.REPLAY_LOG_FILE
-    replay_dataset_stats = signal_monitor_module.replay_dataset_stats
+
+def get_signal_monitor():
+    global _SIGNAL_MONITOR
+    if _SIGNAL_MONITOR is not None:
+        return _SIGNAL_MONITOR
+    try:
+        import okx_signal_monitor as mod
+    except ModuleNotFoundError:
+        import importlib.util
+
+        signal_monitor_path = SCRIPT_DIR / "okx_signal_monitor.py"
+        spec = importlib.util.spec_from_file_location("okx_signal_monitor", signal_monitor_path)
+        if spec is None or spec.loader is None:
+            raise
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["okx_signal_monitor"] = mod
+        spec.loader.exec_module(mod)
+    _SIGNAL_MONITOR = mod
+    return mod
+
 
 BUILD_DIR = SCRIPT_DIR / "build"
 CONFIG_DIR = SCRIPT_DIR / "config"
@@ -52,6 +55,19 @@ PORTABLE_STATE_DIR = SCRIPT_DIR / "local_state"
 LEGACY_STATE_DIR = BUILD_DIR / "local_state"
 ASSETS_DIR = SCRIPT_DIR / "web_assets"
 LOG_DIR = BUILD_DIR / "runtime_logs"
+
+try:
+    _monitor_boot = get_signal_monitor()
+    REPLAY_DATASET_FILE = _monitor_boot.REPLAY_DATASET_FILE
+    REPLAY_LOG_FILE = _monitor_boot.REPLAY_LOG_FILE
+    replay_dataset_stats = _monitor_boot.replay_dataset_stats
+except Exception:
+    REPLAY_DATASET_FILE = LOG_DIR / "replay_dataset.jsonl"
+    REPLAY_LOG_FILE = LOG_DIR / "replay_analysis.jsonl"
+
+    def replay_dataset_stats(path):  # type: ignore
+        return {"exists": False, "lines": 0, "bytes": 0}
+
 DEFAULT_CONFIG_FILE = CONFIG_DIR / "trading_assistant_config.json"
 DEFAULT_AUTH_FILE = CONFIG_DIR / "web_console_auth.default.json"
 PORTABLE_CONFIG_FILE = PORTABLE_STATE_DIR / "trading_assistant_config.json"
@@ -66,6 +82,8 @@ USER_ENV_FILE = USER_STATE_DIR / "api_secrets.env"
 USER_AUTH_FILE = USER_STATE_DIR / "web_console_auth.json"
 MONITOR_JSON_LOG_FILE = LOG_DIR / "okx_signal_analysis.jsonl"
 MONITOR_PROCESS_LOG_FILE = LOG_DIR / "signal_monitor_console.log"
+PAPER_ACCOUNT_FILE = LOG_DIR / "paper_account.json"
+PAPER_INITIAL_CAPITAL = 10000.0
 REPLAY_ANALYSIS_LOG_FILE = REPLAY_LOG_FILE
 REPLAY_PROCESS_LOG_FILE = LOG_DIR / "replay_console.log"
 HOST = os.getenv("WEB_CONTROL_PANEL_HOST", "127.0.0.1")
@@ -85,21 +103,34 @@ REPLAY_STOPPED_AT = ""
 _DATASET_STATS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _LOG_LINE_COUNT_CACHE: Dict[str, Tuple[float, int]] = {}
 
-
 FIXED_MONITOR_RUNTIME = 0
 FIXED_OKX_FLAG = "0"
 LEGACY_CONFIG_KEYS = ("runtime", "flag")
 
+
+SUGGESTED_PUSH_SCORES = {
+    "conservative": {"push_score": 80, "watch_push_score": 72, "spike_push_score": 68},
+    "standard": {"push_score": 75, "watch_push_score": 65, "spike_push_score": 62},
+    "aggressive": {"push_score": 70, "watch_push_score": 62, "spike_push_score": 58},
+}
+
+RISK_PREFERENCE_LABELS = {
+    "conservative": "保守",
+    "standard": "标准",
+    "aggressive": "激进",
+}
 
 CONFIG_FIELDS = [
     ("基础运行", "interval", "number", "轮询间隔(秒)", "默认5秒执行一轮监控。"),
     ("基础运行", "analysis_log_enabled", "checkbox", "写入分析日志", "开启后每轮写入 JSON 分析日志与控制台摘要；关闭可减磁盘与 Web 轮询开销。监控指标叠加与 live 压测依赖此项。"),
     ("基础运行", "record_replay_enabled", "checkbox", "录制回放数据集", "监控运行时把每轮 collect_snapshot 原始输入写入 replay_dataset.jsonl，供离线回放压测。"),
     ("策略", "strategy_mode", "strategy_choice", "策略周期", "超短线抓5-10分钟脉冲；短线需5m+15m profile 同向或20分钟延伸；中线看1H/15m/4H结构。会切换本地主路径与 final_direction。"),
-    ("策略", "risk_preference", "risk_choice", "确认严格度", "保守：更高动量阈值与确认分(88)；标准：默认；激进：更低阈值(65)且短线可凭短窗压力给方向。"),
+    ("策略", "risk_preference", "risk_choice", "确认严格度", "保守：更高动量阈值与确认分(88)；标准：默认；激进：更低阈值(65)且短线可凭短窗压力给方向。变更后可在下方推送说明中一键填入建议分数。"),
     ("AI与推送", "ai_enabled", "checkbox", "启用AI分析", "L2/L3 触发后调用 AI 做主决策。"),
     ("AI与推送", "push_enabled", "checkbox", "启用微信推送", "final_decision 过门槛后通过 Server酱 推送。"),
-    ("AI与推送", "push_score", "number", "推送分数阈值", "trade/watch/spike 均参考该置信度；观察与异动默认与交易同门槛。"),
+    ("AI与推送", "push_score", "number", "交易推送门槛(trade)", "direction 为做多/做空且 confidence ≥ 此值时可推 trade。建议见下方「推送分数建议」。"),
+    ("AI与推送", "watch_push_score", "number", "观察推送门槛(watch)", "观望或风险提示类 watch 推送。建议见下方「推送分数建议」。"),
+    ("AI与推送", "spike_push_score", "number", "异动推送门槛(spike)", "超短线急速异动 L3 / spike 推送。建议见下方「推送分数建议」。"),
 ]
 
 ENV_DEFAULTS = {
@@ -135,8 +166,9 @@ def default_config() -> Dict[str, Any]:
         "ai_enabled": False,
         "dry_run_ai": False,
         "push_enabled": False,
-        "push_score": 80,
-        "watch_push_score": 80,
+        "push_score": 75,
+        "watch_push_score": 65,
+        "spike_push_score": 62,
         "volume_multiplier": 2.0,
         "oi_change_pct_15m": 5.0,
         "funding_abs_threshold": 0.0008,
@@ -189,6 +221,23 @@ def visible_config_keys() -> set:
     return keys
 
 
+def suggested_push_scores(risk_preference: str) -> Dict[str, int]:
+    risk = str(risk_preference or "standard").strip().lower()
+    return dict(SUGGESTED_PUSH_SCORES.get(risk, SUGGESTED_PUSH_SCORES["standard"]))
+
+
+def push_score_guide_text(risk_preference: str, ai_enabled: bool = False) -> str:
+    risk = str(risk_preference or "standard").strip().lower()
+    suggested = suggested_push_scores(risk)
+    label = RISK_PREFERENCE_LABELS.get(risk, risk)
+    ai_note = "已启用 AI：trade 建议可贴近下表。" if ai_enabled else "未启用 AI：建议 trade 取偏保守一档（如标准 75→78~80）。"
+    return (
+        f"当前严格度「{label}」建议 trade {suggested['push_score']} · "
+        f"watch {suggested['watch_push_score']} · spike {suggested['spike_push_score']}。"
+        f"{ai_note} watch/spike 应低于 trade，避免噪音推送。"
+    )
+
+
 def derive_ai_output_style(config: Dict[str, Any]) -> str:
     risk = str(config.get("risk_preference", "standard") or "standard")
     mode = str(config.get("strategy_mode", "short") or "short")
@@ -211,7 +260,17 @@ def normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         if key not in visible:
             merged[key] = value
     merged["ai_output_style"] = derive_ai_output_style(merged)
-    merged["watch_push_score"] = int(merged.get("push_score", 80))
+    loaded = config if isinstance(config, dict) else {}
+    suggested = suggested_push_scores(str(merged.get("risk_preference", "standard")))
+    if "watch_push_score" not in loaded:
+        merged["watch_push_score"] = suggested["watch_push_score"]
+    if "spike_push_score" not in loaded:
+        merged["spike_push_score"] = suggested["spike_push_score"]
+    if "push_score" not in loaded:
+        merged["push_score"] = suggested["push_score"]
+    merged["push_score"] = max(0, min(100, int(merged.get("push_score", suggested["push_score"]))))
+    merged["watch_push_score"] = max(0, min(100, int(merged.get("watch_push_score", suggested["watch_push_score"]))))
+    merged["spike_push_score"] = max(0, min(100, int(merged.get("spike_push_score", suggested["spike_push_score"]))))
     merged["allow_scalp_trade"] = merged.get("strategy_mode") == "scalp" or bool(merged.get("allow_scalp_trade"))
     return strip_legacy_config_keys(merged)
 
@@ -429,7 +488,9 @@ def build_monitor_args(config: Dict[str, Any]) -> List[str]:
         "--scalp-move-pct-10m",
         str(config.get("scalp_move_pct_10m", 0.35)),
         "--watch-push-score",
-        str(config.get("watch_push_score", config.get("push_score", 80))),
+        str(config.get("watch_push_score", 65)),
+        "--spike-push-score",
+        str(config.get("spike_push_score", 62)),
     ]
     args.append("--trade-signals" if config.get("signal_trade_enabled", True) else "--no-trade-signals")
     args.append("--watch-signals" if config.get("signal_watch_enabled", True) else "--no-watch-signals")
@@ -804,6 +865,25 @@ def merge_price_points(history_points: List[Dict[str, Any]], realtime_points: Li
     return merged[-max_points:]
 
 
+def read_paper_account(inst_id: str) -> Dict[str, Any]:
+    if not PAPER_ACCOUNT_FILE.exists():
+        return {}
+    try:
+        payload = json.loads(PAPER_ACCOUNT_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    account = payload.get("accounts", {}).get(inst_id, {})
+    if not account:
+        return {}
+    return {
+        **account,
+        "initial_capital": payload.get("initial_capital"),
+        "session_started_at": payload.get("session_started_at"),
+        "session_label": payload.get("session_label"),
+        "note": payload.get("note"),
+    }
+
+
 def effective_fields_from_log_item(item: Dict[str, Any]) -> Dict[str, Any]:
     score = item.get("score") if isinstance(item.get("score"), dict) else {}
     final_decision = item.get("final_decision") if isinstance(item.get("final_decision"), dict) else {}
@@ -852,6 +932,7 @@ def point_from_log_item(item: Dict[str, Any], price: float) -> Dict[str, Any]:
     entry_plan = score.get("entry_plan") if isinstance(score.get("entry_plan"), dict) else {}
     layer_scores = score.get("layer_scores") if isinstance(score.get("layer_scores"), dict) else {}
     tracking = item.get("signal_tracking") if isinstance(item.get("signal_tracking"), dict) else {}
+    paper = item.get("paper_account") if isinstance(item.get("paper_account"), dict) else {}
     raw_total_score = score.get("raw_total_score", score.get("confidence", score.get("total_score")))
     final_direction = score.get("final_direction", score.get("direction"))
     final_trade_score = score.get("final_trade_score")
@@ -908,37 +989,74 @@ def point_from_log_item(item: Dict[str, Any], price: float) -> Dict[str, Any]:
         "data_quality_count": data_quality.get("confirmed_count"),
         "signal_tracking": tracking,
         "signals": [signal.get("type", "") for signal in signals if isinstance(signal, dict)],
+        "paper_equity": paper.get("equity"),
+        "paper_pnl_usd": paper.get("pnl_usd"),
+        "paper_pnl_pct": paper.get("pnl_pct"),
+        "paper_position": paper.get("position_label", paper.get("position")),
+        "paper_trade_count": paper.get("trade_count"),
+        "paper_initial_capital": paper.get("initial_capital"),
     }
 
 
-def test_ai_connection() -> str:
+def parse_serverchan_response(raw: str) -> Tuple[bool, str]:
+    text = (raw or "").strip()
+    if not text:
+        return False, "Server酱返回空响应"
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return True, text[:160]
+    if not isinstance(payload, dict):
+        return True, text[:160]
+    code = payload.get("code")
+    if code is not None:
+        try:
+            code_ok = int(code) == 0
+        except (TypeError, ValueError):
+            code_ok = True
+        if not code_ok:
+            detail = payload.get("message") or payload.get("msg") or text
+            return False, str(detail)
+    detail = payload.get("message") or payload.get("data") or text
+    return True, str(detail)[:160]
+
+
+def test_ai_connection() -> Dict[str, Any]:
     env = build_child_env()
     api_key = env.get("OPENAI_API_KEY", "")
     base_url = env.get("AI_BASE_URL", ENV_DEFAULTS["AI_BASE_URL"]).strip()
     model = env.get("AI_MODEL", ENV_DEFAULTS["AI_MODEL"])
     if not api_key:
-        return "AI测试失败：AI API Key 未配置。"
+        return {"ok": False, "message": "AI测试失败：AI API Key 未配置。请先在配置页填写并保存。"}
     try:
         from openai import OpenAI
         client = OpenAI(api_key=api_key, base_url=base_url)
         response = client.responses.create(model=model, input="请回复：AI接口连通性测试成功。")
-        return f"AI测试成功：{getattr(response, 'output_text', response)}"
+        return {"ok": True, "message": f"AI测试成功：{getattr(response, 'output_text', response)}"}
     except Exception as exc:
-        return f"AI测试失败：{exc}"
+        return {"ok": False, "message": f"AI测试失败：{exc}"}
 
 
-def test_push_connection() -> str:
+def test_push_connection() -> Dict[str, Any]:
     send_key = build_child_env().get("WECHAT_SEND_KEY", "").strip()
     if not send_key:
-        return "推送测试失败：未配置 WECHAT_SEND_KEY。"
+        return {"ok": False, "message": "推送测试失败：未配置 WECHAT_SEND_KEY。请先在配置页填写并保存。"}
     try:
-        result = post_json(
+        monitor = get_signal_monitor()
+        config = normalize_config(load_config())
+        title, desp = monitor.build_wechat_push_format_preview(config)
+        title = f"[格式预览] {title}"
+        desp = "> 以下为模拟数据，仅用于查看推送排版；真实监控推送使用当时行情与 AI 结果。\n\n" + desp
+        raw = post_json(
             f"https://sctapi.ftqq.com/{send_key}.send",
-            {"title": "[OKX AI短线助手] 推送测试", "desp": "微信推送配置正常。"},
+            {"title": title, "desp": desp},
         )
-        return f"微信推送成功：{result[:160]}"
+        ok, detail = parse_serverchan_response(raw)
+        if ok:
+            return {"ok": True, "message": f"微信推送成功（格式预览已发送）：{detail}"}
+        return {"ok": False, "message": f"微信推送失败：{detail}"}
     except Exception as exc:
-        return f"微信推送失败：{exc}"
+        return {"ok": False, "message": f"微信推送失败：{exc}"}
 
 
 def tail_text(path: Path, max_bytes: int = 160000) -> str:
@@ -949,6 +1067,27 @@ def tail_text(path: Path, max_bytes: int = 160000) -> str:
         if size > max_bytes:
             file.seek(size - max_bytes)
         return file.read().decode("utf-8", errors="replace")
+
+
+def iter_json_log_lines(path: Path, *, read_full: bool = False, max_tail_bytes: int = 40 * 1024 * 1024):
+    """Stream JSONL lines. Replay logs are one session and must be read in full."""
+    if not path.exists():
+        return
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if read_full or size <= max_tail_bytes:
+        with path.open("r", encoding="utf-8-sig") as file:
+            for line in file:
+                stripped = line.strip()
+                if stripped:
+                    yield stripped
+        return
+    for line in tail_text(path, max_tail_bytes).splitlines():
+        stripped = line.strip()
+        if stripped:
+            yield stripped
 
 
 def monitor_log_text() -> str:
@@ -1039,6 +1178,19 @@ def read_monitor_points(inst_id: str, max_points: int = 20000) -> Dict[str, Any]
     first = points[0]["price"] if points else 0
     last = points[-1]["price"] if points else 0
     change = last - first if points else 0
+    paper_account = read_paper_account(inst_id)
+    if not paper_account and realtime_points:
+        latest = realtime_points[-1]
+        if latest.get("paper_equity") is not None:
+            paper_account = {
+                "equity": latest.get("paper_equity"),
+                "pnl_usd": latest.get("paper_pnl_usd"),
+                "pnl_pct": latest.get("paper_pnl_pct"),
+                "position_label": latest.get("paper_position"),
+                "trade_count": latest.get("paper_trade_count"),
+                "initial_capital": latest.get("paper_initial_capital"),
+                "direction": latest.get("final_direction"),
+            }
     return {
         "inst_id": inst_id,
         "running": running,
@@ -1047,6 +1199,7 @@ def read_monitor_points(inst_id: str, max_points: int = 20000) -> Dict[str, Any]
         "change": change,
         "change_pct": (change / first * 100) if first else 0,
         "source": source,
+        "paper_account": paper_account,
     }
 
 
@@ -1107,11 +1260,17 @@ def read_accuracy_items(
     inst_id: str,
     since_time: datetime = None,
     log_file: Path = None,
+    retention_hours: float = None,
 ) -> Tuple[List[Dict[str, Any]], List[Tuple[datetime, float]]]:
     log_path = log_file or MONITOR_JSON_LOG_FILE
+    try:
+        log_size = log_path.stat().st_size if log_path.exists() else 0
+    except OSError:
+        log_size = 0
+    read_full = log_path.resolve() == REPLAY_ANALYSIS_LOG_FILE.resolve() or log_size <= 200 * 1024 * 1024
     items = []
     price_by_time: Dict[str, Tuple[datetime, float]] = {}
-    for line in tail_text(log_path, 40 * 1024 * 1024).splitlines():
+    for line in iter_json_log_lines(log_path, read_full=read_full):
         try:
             item = json.loads(line)
             if item.get("inst_id") != inst_id:
@@ -1122,7 +1281,6 @@ def read_accuracy_items(
             continue
         if since_time and item_time < since_time:
             continue
-        items.append(item)
         # 准确度统计用于验证“本轮预测在下一小段时间内是否正确”，必须保留秒级日志价格。
         # 之前按分钟聚合会把5秒、15秒这类实时验证窗口抹平，导致用户看到的结果滞后且不直观。
         price_by_time[item_time.strftime("%Y-%m-%d %H:%M:%S")] = (item_time, price)
@@ -1136,6 +1294,12 @@ def read_accuracy_items(
                 continue
             # K线收盘价只作为日志价格缺口时的兜底；秒级日志点会自然覆盖同一时间的价格。
             price_by_time.setdefault(row_time.strftime("%Y-%m-%d %H:%M:%S"), (row_time, close))
+        items.append(item)
+    if retention_hours and items:
+        keep_hours = max(0.5, min(168.0, float(retention_hours)))
+        latest = max(parse_history_time(str(item.get("time", ""))) for item in items)
+        cutoff = latest - timedelta(hours=keep_hours)
+        items = [item for item in items if parse_history_time(str(item.get("time", ""))) >= cutoff]
     points = sorted(price_by_time.values(), key=lambda pair: pair[0])
     items.sort(key=lambda item: str(item.get("time", "")))
     return items, points
@@ -1166,6 +1330,118 @@ def realtime_accuracy_threshold_pct(horizon_seconds: int) -> float:
 
 def pct_rate(hit: int, total: int) -> float:
     return (hit / total * 100) if total else 0.0
+
+
+def new_paper_account_state() -> Dict[str, Any]:
+    return {
+        "initial_capital": PAPER_INITIAL_CAPITAL,
+        "cash": PAPER_INITIAL_CAPITAL,
+        "equity": PAPER_INITIAL_CAPITAL,
+        "pnl_usd": 0.0,
+        "pnl_pct": 0.0,
+        "position": "flat",
+        "position_label": "空仓",
+        "entry_price": 0.0,
+        "basis_equity": 0.0,
+        "direction": "观望",
+        "trade_count": 0,
+    }
+
+
+def direction_from_log_item(item: Dict[str, Any]) -> str:
+    final_decision = item.get("final_decision") if isinstance(item.get("final_decision"), dict) else {}
+    direction = final_decision.get("direction")
+    if direction in ("做多", "做空", "观望"):
+        return str(direction)
+    score = item.get("score") if isinstance(item.get("score"), dict) else {}
+    direction = score.get("final_direction", score.get("direction", "观望"))
+    return str(direction or "观望")
+
+
+def _paper_position_from_direction(direction: str) -> str:
+    if direction == "做多":
+        return "long"
+    if direction == "做空":
+        return "short"
+    return "flat"
+
+
+def _paper_position_label(position: str) -> str:
+    return {"long": "做多", "short": "做空", "flat": "空仓"}.get(position, "空仓")
+
+
+def _mark_paper_equity(state: Dict[str, Any], price: float) -> None:
+    position = state.get("position", "flat")
+    entry_price = safe_float(state.get("entry_price"), 0.0)
+    basis_equity = safe_float(state.get("basis_equity"), 0.0)
+    if position == "long" and entry_price > 0:
+        equity = basis_equity * (price / entry_price)
+    elif position == "short" and entry_price > 0:
+        equity = basis_equity * (1 + (entry_price - price) / entry_price)
+    else:
+        equity = safe_float(state.get("cash"), PAPER_INITIAL_CAPITAL)
+    initial = safe_float(state.get("initial_capital"), PAPER_INITIAL_CAPITAL)
+    state["equity"] = equity
+    state["pnl_usd"] = equity - initial
+    state["pnl_pct"] = (state["pnl_usd"] / initial * 100) if initial else 0.0
+
+
+def _close_paper_position(state: Dict[str, Any], price: float) -> None:
+    position = state.get("position", "flat")
+    entry_price = safe_float(state.get("entry_price"), 0.0)
+    basis_equity = safe_float(state.get("basis_equity"), 0.0)
+    if position == "long" and entry_price > 0:
+        state["cash"] = basis_equity * (price / entry_price)
+    elif position == "short" and entry_price > 0:
+        state["cash"] = basis_equity * (1 + (entry_price - price) / entry_price)
+    state["position"] = "flat"
+    state["position_label"] = "空仓"
+    state["entry_price"] = 0.0
+    state["basis_equity"] = 0.0
+
+
+def _open_paper_position(state: Dict[str, Any], position: str, price: float, direction: str) -> None:
+    state["position"] = position
+    state["position_label"] = _paper_position_label(position)
+    state["entry_price"] = price
+    state["basis_equity"] = safe_float(state.get("cash"), PAPER_INITIAL_CAPITAL)
+    state["cash"] = 0.0
+    state["direction"] = direction
+    state["trade_count"] = int(state.get("trade_count", 0) or 0) + 1
+
+
+def step_paper_account_state(state: Dict[str, Any], price: float, direction: str) -> None:
+    target = _paper_position_from_direction(direction)
+    current = state.get("position", "flat")
+    if target != current:
+        if current != "flat":
+            _close_paper_position(state, price)
+        if target != "flat":
+            _open_paper_position(state, target, price, direction)
+        else:
+            state["direction"] = "观望"
+            state["position_label"] = "空仓"
+    else:
+        state["direction"] = direction
+        if target != "flat":
+            state["position_label"] = _paper_position_label(target)
+    _mark_paper_equity(state, price)
+
+
+def simulate_paper_account_series(items: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """按 final_direction 对日志逐轮模拟 $10k 跟单账户，返回 time->状态 与最终状态。"""
+    state = new_paper_account_state()
+    by_time: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        try:
+            price = float(item.get("price"))
+        except (TypeError, ValueError):
+            continue
+        if price <= 0:
+            continue
+        step_paper_account_state(state, price, direction_from_log_item(item))
+        by_time[str(item.get("time", ""))] = dict(state)
+    return by_time, dict(state)
 
 
 def trade_direction_hit(
@@ -1367,6 +1643,13 @@ def empty_accuracy_summary() -> Dict[str, Any]:
         "price_strict_accuracy_pct": 0.0,
         "avg_signed_error": 0.0,
         "avg_abs_error": 0.0,
+        "paper_initial_capital": PAPER_INITIAL_CAPITAL,
+        "paper_equity": PAPER_INITIAL_CAPITAL,
+        "paper_pnl_usd": 0.0,
+        "paper_pnl_pct": 0.0,
+        "paper_position_label": "空仓",
+        "paper_trade_count": 0,
+        "paper_log_points": 0,
     }
 
 
@@ -1472,7 +1755,13 @@ def accuracy_report(
             return empty_accuracy_payload
     else:
         since_time = None
-    items, price_points = read_accuracy_items(inst_id, since_time, log_file=log_file)
+    items, price_points = read_accuracy_items(
+        inst_id,
+        since_time,
+        log_file=log_file,
+        retention_hours=retention_hours,
+    )
+    paper_by_time, paper_final = simulate_paper_account_series(items)
     rows = []
     raw_log_total = 0
     pending_total = 0
@@ -1547,8 +1836,10 @@ def accuracy_report(
         signed_error = (pred_value - actual_value)
         signed_error_sum += signed_error
         abs_error_sum += abs(signed_error)
+        item_time_text = item_time.strftime("%Y-%m-%d %H:%M:%S")
+        paper = paper_by_time.get(item_time_text, {})
         rows.append({
-            "time": item_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "time": item_time_text,
             "future_time": advice["future_time"],
             "price": price,
             "future_price": advice["future_price"],
@@ -1574,6 +1865,11 @@ def accuracy_report(
             "final_trade_score": score.get("final_trade_score"),
             "market_regime": score.get("market_regime"),
             "market_risk_level": score.get("market_risk_level", score.get("risk_level")),
+            "paper_equity": paper.get("equity"),
+            "paper_pnl_usd": paper.get("pnl_usd"),
+            "paper_pnl_pct": paper.get("pnl_pct"),
+            "paper_position": paper.get("position_label"),
+            "paper_trade_count": paper.get("trade_count"),
         })
     rolling = []
     window = 25
@@ -1589,6 +1885,10 @@ def accuracy_report(
             "direction": row["final_direction"],
             "actual_direction": row["actual_direction"],
             "outcome_type": row.get("outcome_type", ""),
+            "paper_equity": row.get("paper_equity"),
+            "paper_pnl_usd": row.get("paper_pnl_usd"),
+            "paper_pnl_pct": row.get("paper_pnl_pct"),
+            "paper_position": row.get("paper_position"),
         })
     total = len(rows)
     mature_rate_pct = pct_rate(total, raw_log_total)
@@ -1653,13 +1953,23 @@ def accuracy_report(
             "price_strict_accuracy_pct": pct_rate(price_strict_hit, total),
             "avg_signed_error": signed_error_sum / total if total else 0.0,
             "avg_abs_error": abs_error_sum / total if total else 0.0,
+            "paper_initial_capital": paper_final.get("initial_capital", PAPER_INITIAL_CAPITAL),
+            "paper_equity": paper_final.get("equity", PAPER_INITIAL_CAPITAL),
+            "paper_pnl_usd": paper_final.get("pnl_usd", 0.0),
+            "paper_pnl_pct": paper_final.get("pnl_pct", 0.0),
+            "paper_position_label": paper_final.get("position_label", "空仓"),
+            "paper_trade_count": paper_final.get("trade_count", 0),
+            "paper_log_points": len(paper_by_time),
         },
         "points": rolling[-max_points:],
         "recent": rows[-20:],
+        "time_start": rows[0]["time"] if rows else "",
+        "time_end": rows[-1]["time"] if rows else "",
+        "chart_points": len(rolling[-max_points:]),
         "retention_hours": retention_hours,
         "interval_seconds": interval_seconds,
         "max_points": max_points,
-        "log_path": str(MONITOR_JSON_LOG_FILE),
+        "log_path": str(log_file),
     }
 
 
@@ -1908,8 +2218,8 @@ def pipeline_design_html() -> str:
 	<ol class="help-list"><li><code>signals</code> 非空</li><li><code>final_decision.push_recommendation</code> ≠ none</li><li><code>push_gate</code> 校验 confidence 阈值与类型开关</li><li>不在冷却期</li><li><code>push_enabled</code> + <code>WECHAT_SEND_KEY</code> 决定是否真发</li></ol>
 	<table class="help-table"><thead><tr><th>push_recommendation</th><th>push_gate 额外校验</th></tr></thead><tbody>
 	<tr><td><strong>trade</strong></td><td>direction 为做多/做空，confidence ≥ push_score</td></tr>
-	<tr><td><strong>watch</strong></td><td>confidence ≥ push_score（与 trade 同门槛）；本地来源需命中观察类信号或 AI 来源</td></tr>
-	<tr><td><strong>spike</strong></td><td>通道默认开启，由 final_decision 给出 spike 建议</td></tr>
+	<tr><td><strong>watch</strong></td><td>confidence ≥ watch_push_score；本地来源需命中观察类信号或 AI 来源</td></tr>
+	<tr><td><strong>spike</strong></td><td>confidence ≥ spike_push_score；L3 超短线急速异动</td></tr>
 	</tbody></table>
 	<p>冷却 key：<code>{push_kind}:{inst_id}:{direction}:{信号类型组合}</code>。推送正文同样来自 final_decision。<strong>trade/watch/spike 三类通道 Web 配置默认全开</strong>，是否发出由 final_decision 与 push_score 决定。</p>
 	</section>
@@ -1918,7 +2228,7 @@ def pipeline_design_html() -> str:
 	<h3>关键配置对照</h3>
 	<table class="help-table"><thead><tr><th>Web 可配项</th><th>影响阶段</th></tr></thead><tbody>
 	<tr><td>策略周期 / 确认严格度</td><td>raw_direction 路径、guard、降级门槛、strategy_view 覆盖、动量阈值、score_weights</td></tr>
-	<tr><td>push_score</td><td>trade/watch/spike 推送门槛（观察分默认同值）</td></tr>
+	<tr><td>push_score / watch_push_score / spike_push_score</td><td>trade / watch / spike 三类推送门槛（可拆分配置）</td></tr>
 	<tr><td>ai_enabled / push_enabled</td><td>是否调 AI / 是否发微信</td></tr>
 	<tr><td>写入分析日志</td><td>是否每轮写 JSON 与控制台摘要；关闭可减磁盘与 Web 开销</td></tr>
 	<tr><td>AI 密钥与 Base URL</td><td>AI 连接</td></tr>
@@ -1958,12 +2268,37 @@ def render_page(message: str = "") -> bytes:
             rows.append(f'<section class="card page-section" data-page="config"><h2>{esc(section)}</h2>')
         rows.append(field_html(key, label, kind, help_text, config.get(key)))
     rows.append("</section>")
+    risk = str(config.get("risk_preference", "standard"))
+    suggested_rows = "".join(
+        f"<tr><td>{esc(RISK_PREFERENCE_LABELS.get(risk_key, risk_key))}</td>"
+        f"<td>{values['push_score']}</td>"
+        f"<td>{values['watch_push_score']}</td>"
+        f"<td>{values['spike_push_score']}</td></tr>"
+        for risk_key, values in SUGGESTED_PUSH_SCORES.items()
+    )
+    rows.append(
+        f'<section class="card page-section" data-page="config" id="pushScoreGuideCard" style="display:block;">'
+        f'<h2>推送分数建议</h2>'
+        f'<p class="section-sub" id="pushScoreGuideText">{esc(push_score_guide_text(risk, bool(config.get("ai_enabled"))))}</p>'
+        f'<table class="help-table" style="grid-column:1/-1;"><thead><tr>'
+        f'<th>确认严格度</th><th>trade</th><th>watch</th><th>spike</th>'
+        f'</tr></thead><tbody>{suggested_rows}</tbody></table>'
+        f'<div class="toolbar-right" style="grid-column:1/-1;justify-content:flex-start;">'
+        f'<button class="btn-save action-control" type="button" id="applySuggestedPushScores">填入当前严格度建议值</button>'
+        f'</div></section>'
+    )
     rows.append('<section class="card page-section" data-page="config"><h2>AI密钥与微信推送</h2>')
     for key, label, help_text in ENV_FIELDS:
         value = env.get(key, ENV_DEFAULTS.get(key, ""))
         input_html = masked_input_html(f"env_{key}", value, masked="KEY" in key)
         rows.append(f'<div class="field"><label>{esc(label)}</label><div>{input_html}<p>{esc(help_text)}</p></div></div>')
     rows.append("</section>")
+
+    notice_html = ""
+    if message:
+        is_error = ("失败" in message) or ("错误" in message)
+        notice_class = "notice notice-error" if is_error else "notice"
+        notice_html = f'<div class="{notice_class}">{esc(message)}</div>'
 
     body = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>OKX AI Assistant</title>
@@ -1980,19 +2315,20 @@ def render_page(message: str = "") -> bytes:
 .actions{{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap;position:sticky;bottom:0;margin-top:20px;padding:14px;border-radius:18px;background:rgba(255,255,255,.9);border:1px solid rgba(255,255,255,.9);box-shadow:var(--shadow);backdrop-filter:blur(12px)}} .action-group,.toolbar-right,.toolbar-left{{display:flex;align-items:center;gap:10px;flex-wrap:wrap}}
 button,.button{{border:0;border-radius:12px;padding:11px 16px;background:#f1f3f8;color:#263449;min-width:94px;justify-content:center;white-space:nowrap;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;font-size:14px;font-weight:650;transition:background .18s ease,color .18s ease,box-shadow .18s ease,transform .18s ease,opacity .18s ease}} button:disabled,.button.disabled{{cursor:not-allowed;opacity:.72}} .btn-save,.btn-log{{background:#ede9fe;color:#5b21b6}} .btn-run{{background:#dcfce7;color:#047857}} .btn-run.is-running{{background:linear-gradient(135deg,#ef4444,#f97316);color:#fff;box-shadow:0 10px 26px rgba(239,68,68,.24)}} .btn-run.is-starting{{background:linear-gradient(135deg,#60a5fa,#8b5cf6);color:#fff;box-shadow:0 10px 26px rgba(99,102,241,.25)}} .btn-danger{{background:#fee2e2;color:#b91c1c}} .btn-danger.is-ready{{background:#ef4444;color:#fff;box-shadow:0 10px 26px rgba(239,68,68,.22)}} .btn-test{{background:#e0f2fe;color:#0369a1}} .btn-view{{background:#f1f5f9;color:#334155}}
 .toolbar-card{{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:16px}} .toolbar-card::before{{display:none}} .coin-tabs{{display:inline-flex;gap:8px;padding:4px;border-radius:14px;background:#f1f5f9;border:1px solid #e2e8f0}} .coin-tab.active{{background:#8b6cf6;color:#fff}} .empty-coin{{display:inline-flex;align-items:center;padding:0 12px;color:#64748b;font-size:13px;font-weight:650}}
-	.market-card{{background:#242424;border:1px solid #3a3a3a;border-radius:18px;margin:0;padding:18px 20px 16px;color:#f8fafc;box-shadow:0 12px 34px rgba(15,23,42,.16);overflow:hidden;height:calc(100vh - 40px);display:flex;flex-direction:column}} .monitor-card{{height:calc(100vh - 188px);min-height:520px}} .market-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:12px}} .market-title{{font-size:18px;font-weight:800;margin-bottom:4px}} .market-sub{{color:#a3a3a3;font-size:12px}} .market-price{{text-align:right}} .market-price strong{{display:block;font-size:24px;line-height:1.1}} .market-price span{{font-size:13px;color:#94a3b8}} .market-price.up span{{color:#fb7185}} .market-price.down span{{color:#22c55e}} .market-canvas-wrap{{position:relative;flex:1;min-height:0;border-top:1px solid #393939;background:linear-gradient(rgba(255,255,255,.055) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);background-size:100% 72px,72px 100%}} canvas{{width:100%;height:100%;display:block;cursor:grab}} canvas.dragging{{cursor:grabbing}} .market-loading{{position:absolute;inset:0;display:grid;place-items:center;color:#a3a3a3;pointer-events:none}} .snapshot-panel{{position:absolute;left:16px;top:16px;z-index:2;min-width:260px;max-width:min(500px,calc(100% - 32px));max-height:calc(100% - 32px);overflow:auto;padding:10px 12px;border-radius:12px;background:rgba(15,23,42,.62);border:1px solid rgba(148,163,184,.20);box-shadow:0 12px 28px rgba(0,0,0,.18);backdrop-filter:blur(8px);font-size:12px;line-height:1.35;color:#dbeafe;pointer-events:none}} .snapshot-panel strong{{display:block;color:#fff;font-size:13px;margin-bottom:5px}} .snapshot-grid{{display:grid;grid-template-columns:68px minmax(0,1fr);gap:3px 8px;align-items:start}} .snapshot-grid span{{color:#9ca3af}} .snapshot-grid b{{font-weight:700;color:#e5e7eb;word-break:break-word}} .market-time-range{{margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.08);color:#a3a3a3;font-size:12px;display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}}
-	.log-window{{width:100%;min-height:220px;height:34vh;max-height:46vh;resize:vertical;border:1px solid #dbe4ef;border-radius:16px;padding:16px;background:#0f172a;color:#d1fae5;font-family:Consolas,"Courier New",monospace;font-size:13px;line-height:1.55;white-space:pre}} .log-window-console{{background:#111827;color:#e5e7eb}} .log-panel{{display:block;margin-bottom:14px}} .log-panel h3{{margin:0 0 6px;font-size:16px;color:#111827}} .log-panel p{{margin:0 0 10px;color:#64748b;font-size:12px}} .notice{{background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0;padding:13px 15px;border-radius:14px;margin-bottom:16px}}
+	.market-card{{background:#242424;border:1px solid #3a3a3a;border-radius:18px;margin:0;padding:18px 20px 16px;color:#f8fafc;box-shadow:0 12px 34px rgba(15,23,42,.16);overflow:hidden;height:calc(100vh - 40px);display:flex;flex-direction:column}} .monitor-card{{height:calc(100vh - 188px);min-height:520px}} .market-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:12px}} .market-title{{font-size:18px;font-weight:800;margin-bottom:4px}} .market-sub{{color:#a3a3a3;font-size:12px}} .market-price{{text-align:right}} .market-price strong{{display:block;font-size:24px;line-height:1.1}} .market-price span{{font-size:13px;color:#94a3b8}} .market-price.up span{{color:#fb7185}} .market-price.down span{{color:#22c55e}} .market-canvas-wrap{{position:relative;flex:1;min-height:0;border-top:1px solid #393939;background:linear-gradient(rgba(255,255,255,.055) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);background-size:100% 72px,72px 100%}} canvas{{width:100%;height:100%;display:block;cursor:grab}} canvas.dragging{{cursor:grabbing}} .market-loading{{position:absolute;inset:0;display:grid;place-items:center;color:#a3a3a3;pointer-events:none}} .snapshot-panel{{position:absolute;left:16px;top:16px;z-index:2;min-width:260px;max-width:min(500px,calc(100% - 32px));max-height:calc(100% - 32px);overflow:auto;padding:10px 12px;border-radius:12px;background:rgba(15,23,42,.62);border:1px solid rgba(148,163,184,.20);box-shadow:0 12px 28px rgba(0,0,0,.18);backdrop-filter:blur(8px);font-size:12px;line-height:1.35;color:#dbeafe;pointer-events:none}} .snapshot-panel strong{{display:block;color:#fff;font-size:13px;margin-bottom:5px}} .snapshot-grid{{display:grid;grid-template-columns:68px minmax(0,1fr);gap:3px 8px;align-items:start}} .snapshot-grid span{{color:#9ca3af}} .snapshot-grid b{{font-weight:700;color:#e5e7eb;word-break:break-word}} .market-time-range{{margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.08);color:#a3a3a3;font-size:12px;display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}} #monitorPaperAccount.paper-up{{color:#4ade80}} #monitorPaperAccount.paper-down{{color:#fb7185}}
+	.log-window{{width:100%;min-height:220px;height:34vh;max-height:46vh;resize:vertical;border:1px solid #dbe4ef;border-radius:16px;padding:16px;background:#0f172a;color:#d1fae5;font-family:Consolas,"Courier New",monospace;font-size:13px;line-height:1.55;white-space:pre}} .log-window-console{{background:#111827;color:#e5e7eb}} .log-panel{{display:block;margin-bottom:14px}} .log-panel h3{{margin:0 0 6px;font-size:16px;color:#111827}} .log-panel p{{margin:0 0 10px;color:#64748b;font-size:12px}} .notice{{background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0;padding:13px 15px;border-radius:14px;margin-bottom:16px}} .notice-error{{background:#fee2e2;color:#991b1b;border-color:#fecaca}}
 	.help-panel{{display:grid;grid-template-columns:1fr;gap:16px}} .help-card{{display:block;line-height:1.68}} .help-card::before{{display:none}} .help-card h3{{margin:18px 0 8px;font-size:16px;color:#111827}} .help-card h3:first-child{{margin-top:0}} .help-card p{{margin:6px 0;color:#475569;font-size:13px}} .help-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}} .help-item{{border:1px solid #e2e8f0;border-radius:12px;padding:12px;background:#f8fafc}} .help-item strong{{display:block;margin-bottom:4px;color:#1f2937}} .help-list{{margin:8px 0 0;padding-left:18px;color:#475569;font-size:13px}} .help-list li{{margin:4px 0}} .help-table{{width:100%;border-collapse:collapse;margin-top:10px;font-size:13px}} .help-table th,.help-table td{{border:1px solid #e2e8f0;padding:9px 10px;text-align:left;vertical-align:top}} .help-table th{{background:#f1f5f9;color:#334155}} .help-note{{border-left:4px solid #8b6cf6;background:#f5f3ff;padding:10px 12px;border-radius:10px;color:#4c1d95;font-size:13px;margin-top:10px}} .flow-chain{{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0 4px}} .flow-chain span{{display:inline-flex;align-items:center;padding:8px 12px;border-radius:999px;background:#eef2ff;border:1px solid #c7d2fe;color:#3730a3;font-size:12px;font-weight:650}} .flow-chain span:not(:last-child)::after{{content:"→";margin-left:8px;color:#94a3b8;font-weight:400}} code{{background:#eef2ff;color:#4338ca;border-radius:6px;padding:1px 5px}}
-	.accuracy-card{{display:block}} .accuracy-controls{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0 12px}} .accuracy-controls select{{width:auto;min-width:150px}} .accuracy-controls .btn-save{{min-width:88px}} .accuracy-summary{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px}} .accuracy-summary div{{border:1px solid #e2e8f0;border-radius:12px;padding:10px;background:#f8fafc}} .accuracy-summary div.accuracy-primary{{border-color:#93c5fd;background:#eff6ff}} .accuracy-summary span{{display:block;color:#64748b;font-size:12px}} .accuracy-summary b{{display:block;margin-top:3px;font-size:18px;color:#111827}} .accuracy-canvas-wrap{{position:relative;height:320px;border:1px solid #e2e8f0;border-radius:14px;background:#0f172a;overflow:hidden}} .accuracy-canvas-wrap canvas{{width:100%;height:100%;cursor:grab}} .accuracy-canvas-wrap canvas.dragging{{cursor:grabbing}} .accuracy-point-panel{{position:absolute;left:12px;top:12px;z-index:2;min-width:240px;max-width:min(420px,calc(100% - 24px));max-height:calc(100% - 24px);overflow:auto;padding:10px 12px;border-radius:12px;background:rgba(15,23,42,.78);border:1px solid rgba(148,163,184,.28);box-shadow:0 12px 28px rgba(0,0,0,.22);backdrop-filter:blur(8px);font-size:12px;line-height:1.35;color:#dbeafe;pointer-events:none}} .accuracy-point-panel strong{{display:block;color:#fff;font-size:13px;margin-bottom:5px}} .accuracy-point-panel .snapshot-grid{{display:grid;grid-template-columns:72px minmax(0,1fr);gap:3px 8px;align-items:start}} .accuracy-point-panel .snapshot-grid span{{color:#9ca3af}} .accuracy-point-panel .snapshot-grid b{{font-weight:700;color:#e5e7eb;word-break:break-word}} .accuracy-note{{margin:10px 0 0;color:#64748b;font-size:12px}}
+	.accuracy-card{{display:block}} .accuracy-controls{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0 12px}} .accuracy-controls select{{width:auto;min-width:150px}} .accuracy-controls .btn-save{{min-width:88px}} .accuracy-summary{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px}} .accuracy-summary div{{border:1px solid #e2e8f0;border-radius:12px;padding:10px;background:#f8fafc}} .accuracy-summary div.accuracy-primary{{border-color:#93c5fd;background:#eff6ff}} .accuracy-summary div.accuracy-paper-primary{{border-color:#86efac;background:#ecfdf5}} .accuracy-summary span{{display:block;color:#64748b;font-size:12px}} .accuracy-summary b{{display:block;margin-top:3px;font-size:18px;color:#111827}} .accuracy-canvas-wrap{{position:relative;height:320px;border:1px solid #e2e8f0;border-radius:14px;background:#0f172a;overflow:hidden}} .accuracy-canvas-wrap canvas{{width:100%;height:100%;cursor:grab}} .accuracy-canvas-wrap canvas.dragging{{cursor:grabbing}} .accuracy-point-panel{{position:absolute;left:12px;top:12px;z-index:2;min-width:240px;max-width:min(420px,calc(100% - 24px));max-height:calc(100% - 24px);overflow:auto;padding:10px 12px;border-radius:12px;background:rgba(15,23,42,.78);border:1px solid rgba(148,163,184,.28);box-shadow:0 12px 28px rgba(0,0,0,.22);backdrop-filter:blur(8px);font-size:12px;line-height:1.35;color:#dbeafe;pointer-events:none}} .accuracy-point-panel strong{{display:block;color:#fff;font-size:13px;margin-bottom:5px}} .accuracy-point-panel .snapshot-grid{{display:grid;grid-template-columns:72px minmax(0,1fr);gap:3px 8px;align-items:start}} .accuracy-point-panel .snapshot-grid span{{color:#9ca3af}} .accuracy-point-panel .snapshot-grid b{{font-weight:700;color:#e5e7eb;word-break:break-word}} .accuracy-note{{margin:10px 0 0;color:#64748b;font-size:12px}}
 	@media(max-width:860px){{.app{{grid-template-columns:1fr}}.sidebar{{position:relative;height:auto}}.card{{grid-template-columns:1fr}}.field{{grid-template-columns:1fr}}}}
 	</style></head><body><div class="app"><aside class="sidebar"><div class="brand"><span class="logo">O</span><span>OKX AI</span></div>
 	<a class="nav-item active" href="#monitor" data-page-link="monitor">监控</a><a class="nav-item" href="#config" data-page-link="config">配置</a><a class="nav-item" href="#logs" data-page-link="logs">日志</a><a class="nav-item" href="#tests" data-page-link="tests">测试</a><a class="nav-item" href="#design" data-page-link="design">流程设计</a><a class="nav-item" href="#help" data-page-link="help">帮助</a><a class="nav-item" href="#settings" data-page-link="settings">设置</a>
 </aside><div class="content"><main>
+{notice_html}
 <form class="config-form" method="post" action="/save#config">{''.join(rows)}<div class="actions config-actions" data-page-actions="config"><div class="action-group"><button class="action-control btn-save" type="button" id="saveConfigBtn">另存为配置</button><button class="action-control btn-save" type="button" id="importConfigBtn">导入配置</button><a class="button action-control btn-save" href="/config-json#config">查看配置</a></div></div></form>
 <form class="settings-form" method="post" action="/save-auth#settings"><section class="card page-panel" data-page="settings"><h2>登录账号</h2><div class="field"><label>用户名</label><div><input type="text" name="auth_username" value="{esc(auth.get("username","admin"))}"><p>Web控制台登录用户名。</p></div></div><div class="field"><label>新密码</label><div><div class="password-wrap"><input type="password" name="auth_password" placeholder="留空则不修改"><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>建议首次部署后立即修改默认密码。</p></div></div></section><div class="actions settings-actions" data-page-actions="settings"><div class="action-group"><button class="action-control btn-save" type="submit">保存账号密码</button><a class="button action-control btn-view" href="/logout">切换账号</a><a class="button action-control btn-danger" href="/logout">退出登录</a></div></div></form>
-<div class="page-panel active" data-page="monitor"><section class="card toolbar-card"><div><h2>实时监控</h2><p class="section-sub">未启动时显示虚拟行情；启动后读取真实监控日志，鼠标滚轮可缩放，拖动可平移。</p></div><div class="toolbar-right"><div class="coin-tabs">{monitor_tabs}</div><button class="button btn-run action-control" type="button" id="monitorToggleBtn">开始监控</button></div></section><section class="market-card monitor-card"><div class="market-head"><div><div class="market-title" id="monitorTitle">{esc(monitor_initial or "未配置币种")} 实时走势</div><div class="market-sub" id="monitorMeta">{esc("虚拟行情预览 · 启动监控后自动切换真实数据" if monitor_initial else "请先在配置页选择监控币种")}</div></div><div class="market-price" id="monitorPrice"><strong>--</strong><span>生成模拟行情</span></div></div><div class="market-canvas-wrap"><canvas id="monitorChart"></canvas><div class="market-loading" id="monitorLoading">正在生成虚拟走势...</div><div class="snapshot-panel" id="snapshotPanel"><strong>Snapshot</strong><div class="snapshot-grid"><span>价格</span><b>--</b><span>时间</span><b>--</b><span>评分</span><b>--</b><span>方向</span><b>--</b></div></div></div><div class="market-time-range"><span id="monitorUptime">已监控：未启动</span><span id="monitorPointCount">数据点：0</span></div></section></div>
+<div class="page-panel active" data-page="monitor"><section class="card toolbar-card"><div><h2>实时监控</h2><p class="section-sub">未启动时显示虚拟行情；启动后读取真实日志。下方<strong>模拟账户</strong>按 final_direction 满仓跟单（会话 $10,000 重置），非真实成交。</p></div><div class="toolbar-right"><div class="coin-tabs">{monitor_tabs}</div><button class="button btn-run action-control" type="button" id="monitorToggleBtn">开始监控</button></div></section><section class="market-card monitor-card"><div class="market-head"><div><div class="market-title" id="monitorTitle">{esc(monitor_initial or "未配置币种")} 实时走势</div><div class="market-sub" id="monitorMeta">{esc("虚拟行情预览 · 启动监控后自动切换真实数据" if monitor_initial else "请先在配置页选择监控币种")}</div></div><div class="market-price" id="monitorPrice"><strong>--</strong><span>生成模拟行情</span></div></div><div class="market-canvas-wrap"><canvas id="monitorChart"></canvas><div class="market-loading" id="monitorLoading">正在生成虚拟走势...</div><div class="snapshot-panel" id="snapshotPanel"><strong>Snapshot</strong><div class="snapshot-grid"><span>价格</span><b>--</b><span>时间</span><b>--</b><span>评分</span><b>--</b><span>方向</span><b>--</b></div></div></div><div class="market-time-range"><span id="monitorUptime">已监控：未启动</span><span id="monitorPaperAccount">模拟账户：--</span><span id="monitorPointCount">数据点：0</span></div></section></div>
 	<div class="page-panel" data-page="logs"><section class="card toolbar-card"><div><h2>实时日志</h2><p class="section-sub">默认关闭写入以节省资源。打开「写入分析日志」后，监控进程才会输出 JSON 与控制台摘要；下方窗口仅显示本次启动后的内容。</p></div><div class="toolbar-right"><label class="switch" title="写入分析日志"><input type="checkbox" id="analysisLogSwitch" {"checked" if config.get("analysis_log_enabled") else ""}><span></span></label><span class="section-sub" id="analysisLogSwitchHint" style="margin:0;">{"已开启" if config.get("analysis_log_enabled") else "已关闭"} · 保存后需重启监控</span><button class="button btn-log" type="button" id="refreshLogBtn">刷新全部</button><button class="button btn-log" type="button" id="openLogDirBtn">打开日志目录</button></div></section><section class="card" style="display:block;"><div class="log-panel"><h3>JSON 分析日志</h3><p>Web 图表/压测依赖的完整分析记录，默认保存：{esc(MONITOR_JSON_LOG_FILE)}</p><textarea class="log-window" id="logWindow" readonly>正在加载日志...</textarea><div class="toolbar-card" style="margin:12px 0 0;box-shadow:none;"><div><p class="section-sub" id="saveLogHint">可另存为 .jsonl 文件，便于回放与统计。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveLogBtn">另存为文件</button></div></div></div><div class="log-panel"><h3>控制台日志</h3><p>监控进程精简调试输出（信号摘要、推送结果、错误）；详细重试日志需设置 CONSOLE_VERBOSE=1，默认保存：{esc(MONITOR_PROCESS_LOG_FILE)}</p><textarea class="log-window log-window-console" id="consoleLogWindow" readonly>正在加载控制台日志...</textarea><div class="toolbar-card" style="margin:12px 0 0;box-shadow:none;"><div><p class="section-sub" id="saveConsoleLogHint">可另存为 .log 文件，便于快速排查信号与推送。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearConsoleLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveConsoleLogBtn">另存为文件</button></div></div></div></section></div>
-	<div class="page-panel" data-page="tests"><section class="card toolbar-card"><div><h2>连通性测试</h2><p class="section-sub">测试AI接口和微信推送（Server酱）配置是否可用。</p></div><div class="toolbar-right"><a class="button action-control btn-test" href="/test-ai#tests">测试AI</a><a class="button action-control btn-test" href="/test-push#tests">测试微信推送</a></div></section><section class="card accuracy-card"><h2>实时预测压测</h2><p class="section-sub">指标按<strong>观望</strong>与<strong>交易</strong>分层统计。短线策略建议验证窗选 15–20 分钟；live 监控选「本次启动后」，回放需先点下方「开始回放」再选「回放会话」。</p><div class="accuracy-controls"><select id="accuracyInst"><option value="BTC-USDT-SWAP">BTC-USDT-SWAP</option><option value="ETH-USDT-SWAP">ETH-USDT-SWAP</option></select><select id="accuracyHorizon"><option value="5">5秒 · 轮询级</option><option value="15">15秒</option><option value="30">30秒</option><option value="60">1分钟</option><option value="180">3分钟</option><option value="300">5分钟</option><option value="900">15分钟 · 短线推荐</option><option value="1200">20分钟 · 短线结构</option></select><select id="accuracyScope"><option value="session">本次启动后</option><option value="replay">回放会话</option><option value="all">全部历史日志</option></select><select id="accuracyRetentionHours" title="结合配置页轮询间隔计算图表最多保留多少点"><option value="1">保留1小时</option><option value="2">保留2小时</option><option value="4">保留4小时</option><option value="8">保留8小时</option><option value="12" selected>保留12小时</option><option value="24">保留24小时</option><option value="48">保留48小时</option></select><button class="btn-test" type="button" id="accuracyRefreshBtn">刷新压测</button><button class="btn-save" type="button" id="accuracyExportBtn">导出图表</button><button class="btn-save" type="button" id="accuracyImportBtn">导入图表</button><button class="btn-test" type="button" id="accuracyLiveBtn" style="display:none">返回实时</button><input type="file" id="accuracyImportInput" accept=".json,application/json" hidden></div><div class="accuracy-summary" id="accuracySummary"><div><span>可靠性等级</span><b>--</b></div><div><span>已验证/日志</span><b>--</b></div><div><span>决策合理率</span><b>--</b></div><div><span>相对观望基准</span><b>--</b></div></div><div class="accuracy-canvas-wrap"><canvas id="accuracyChart"></canvas><div class="accuracy-point-panel" id="accuracyPointPanel" hidden></div></div><p class="accuracy-note" id="accuracyNote">观望：后续波动未超阈值即合理（错失机会记红点）。交易：验证窗内价格朝做多/做空方向走即方向命中；入场/止盈/止损仅在较长验证窗下有参考价值。</p></section><section class="card"><h2>离线回放压测</h2><p class="section-sub">配置页勾选「录制回放数据集」并运行监控，每轮原始输入写入 {esc(REPLAY_DATASET_FILE)}；停止监控后点击下方「开始回放」启动子进程，结果写入 {esc(REPLAY_ANALYSIS_LOG_FILE)}，再选上方「回放会话」查看压测曲线。</p><div class="replay-status" id="replayDatasetInfo">正在加载数据集状态...</div><div class="field"><label>回放间隔(秒)</label><div><input type="number" id="replayInterval" value="0" min="0" max="120" step="0.1"><p>0 表示尽快跑完；大于 0 可在回放过程中观察压测曲线刷新。</p></div></div><div class="field"><label>控制</label><div><div class="toolbar-right" style="justify-content:flex-start;gap:8px;"><button class="btn-test" type="button" id="replayStartBtn">开始回放</button><button class="btn-danger action-control" type="button" id="replayStopBtn">停止回放</button><button class="button btn-log" type="button" id="replayRefreshBtn">刷新状态</button></div><p id="replayStatusText">等待加载...</p></div></div></section></div>
+	<div class="page-panel" data-page="tests"><section class="card toolbar-card"><div><h2>连通性测试</h2><p class="section-sub">测试 AI 接口和微信推送（Server酱）配置是否可用。点击后会先保存当前配置页中的密钥，再发起测试；<strong>测试微信推送</strong>会发送与真实监控相同结构的格式预览（模拟 AI 全字段示例）。</p></div><div class="toolbar-right"><button class="button action-control btn-test" type="button" id="testAiBtn">测试AI</button><button class="button action-control btn-test" type="button" id="testPushBtn">测试微信推送</button></div></section><div id="connectivityTestNotice" class="notice" hidden></div><section class="card accuracy-card"><h2>实时预测压测</h2><p class="section-sub">顶部<strong>模拟账户</strong>按 final_direction 从 $10,000 满仓跟单（方向变才换仓）；绿线为权益曲线。下方为分层预测准确度；短线建议验证窗 15–20 分钟。</p><div class="accuracy-controls"><select id="accuracyInst"><option value="BTC-USDT-SWAP">BTC-USDT-SWAP</option><option value="ETH-USDT-SWAP">ETH-USDT-SWAP</option></select><select id="accuracyHorizon"><option value="5">5秒 · 轮询级</option><option value="15">15秒</option><option value="30">30秒</option><option value="60">1分钟</option><option value="180">3分钟</option><option value="300">5分钟</option><option value="900">15分钟 · 短线推荐</option><option value="1200">20分钟 · 短线结构</option></select><select id="accuracyScope"><option value="session">本次启动后</option><option value="replay">回放会话</option><option value="all">全部历史日志</option></select><select id="accuracyRetentionHours" title="结合配置页轮询间隔计算图表最多保留多少点"><option value="1">保留1小时</option><option value="2">保留2小时</option><option value="4">保留4小时</option><option value="8">保留8小时</option><option value="12" selected>保留12小时</option><option value="24">保留24小时</option><option value="48">保留48小时</option></select><button class="btn-test" type="button" id="accuracyRefreshBtn">刷新压测</button><button class="btn-save" type="button" id="accuracyExportBtn">导出图表</button><button class="btn-save" type="button" id="accuracyImportBtn">导入图表</button><button class="btn-test" type="button" id="accuracyLiveBtn" style="display:none">返回实时</button><input type="file" id="accuracyImportInput" accept=".json,application/json" hidden></div><div class="accuracy-summary" id="accuracySummary"><div><span>可靠性等级</span><b>--</b></div><div><span>已验证/日志</span><b>--</b></div><div><span>决策合理率</span><b>--</b></div><div><span>相对观望基准</span><b>--</b></div></div><div class="accuracy-canvas-wrap"><canvas id="accuracyChart"></canvas><div class="accuracy-point-panel" id="accuracyPointPanel" hidden></div></div><p class="accuracy-note" id="accuracyNote">观望：后续波动未超阈值即合理（错失机会记红点）。交易：验证窗内价格朝做多/做空方向走即方向命中；入场/止盈/止损仅在较长验证窗下有参考价值。</p></section><section class="card"><h2>离线回放压测</h2><p class="section-sub">配置页勾选「录制回放数据集」并运行监控，每轮原始输入写入 {esc(REPLAY_DATASET_FILE)}；停止监控后点击下方「开始回放」启动子进程，结果写入 {esc(REPLAY_ANALYSIS_LOG_FILE)}，再选上方「回放会话」查看压测曲线。</p><div class="replay-status" id="replayDatasetInfo">正在加载数据集状态...</div><div class="field"><label>回放间隔(秒)</label><div><input type="number" id="replayInterval" value="0" min="0" max="120" step="0.1"><p>0 表示尽快跑完；大于 0 可在回放过程中观察压测曲线刷新。</p></div></div><div class="field"><label>控制</label><div><div class="toolbar-right" style="justify-content:flex-start;gap:8px;"><button class="btn-test" type="button" id="replayStartBtn">开始回放</button><button class="btn-danger action-control" type="button" id="replayStopBtn">停止回放</button><button class="button btn-log" type="button" id="replayRefreshBtn">刷新状态</button></div><p id="replayStatusText">等待加载...</p></div></div></section></div>
 	<div class="page-panel" data-page="help"><section class="card toolbar-card"><div><h2>帮助</h2><p class="section-sub">系统架构、指标含义、界面字段、推送规则与压测说明。详细流程见「流程设计」页。</p></div><div class="toolbar-right"><a class="button btn-view" href="#design">查看流程设计</a></div></section><div class="help-panel">
 	<section class="card help-card"><h2>系统架构与决策边界</h2>
 	<p>每轮监控按「采集 → 检测 → 本地评分 → AI 触发 →（可选）AI 分析 → merge → 跟踪 → 推送 → 写日志」执行。三层职责如下：</p>
@@ -2037,12 +2373,18 @@ button,.button{{border:0;border-radius:12px;padding:11px 16px;background:#f1f3f8
 	</tbody></table>
 	<div class="help-note">急拉行情：15m profile 未转 <code>up</code> 时，短线与中线都会长时间观望——这是结构确认设计，不是 bug。要吃 5–10 分钟脉冲请选<strong>超短线</strong>作主策略。</div>
 	</section>
+	<section class="card help-card"><h2>模拟跟单账户（监控页 + 压测页）</h2>
+	<ul class="help-list">
+	<li>每次<strong>开始监控</strong>、<strong>离线回放</strong>或压测范围切换时，虚拟账户从该范围内首条日志起算 <strong>$10,000</strong>。</li>
+	<li>按 <code>final_direction</code> 满仓跟单：做多/做空持仓，观望为空仓；仅在<strong>方向变化</strong>时换仓。</li>
+	<li><strong>测试页</strong>：顶部绿底「模拟账户」卡片 + 图表<strong>绿线</strong>为权益曲线；监控页底部也会显示当前权益。</li>
+	<li>1x、不计手续费；非真实成交，仅用于感受策略表现。</li>
+	</ul>
+	</section>
 	<section class="card help-card"><h2>压测图表说明（测试页）</h2>
 	<ul class="help-list">
-	<li><strong>综合预测准确度</strong>：观望 + 交易方向命中加权；图表绿/红点与此一致。</li>
-	<li><strong>观望准确度</strong>：预测观望时，后续波动未超阈值即合理；<strong>观望错失率</strong>为其反面（图表红点常见于此）。</li>
-	<li><strong>交易方向命中</strong>：做多/做空后，验证窗内价格是否朝预测方向走（与策略周期匹配，建议 15–20 分钟）。</li>
-	<li><strong>交易执行合理率</strong>：入场触达、止盈/止损等计划层验证；短窗下样本少时可忽略。</li>
+	<li><strong>模拟账户($10k)</strong>：绿底卡片与绿线权益曲线，按 final_direction 跟单。</li>
+	<li><strong>综合预测准确度</strong>：观望 + 交易方向命中；图表绿/红点与此一致。</li>
 	<li><strong>蓝线</strong>价格、<strong>黄线</strong>预测方向累计；长时段顶部显示抽稀信息。</li>
 	</ul>
 	</section>
@@ -2063,8 +2405,8 @@ button,.button{{border:0;border-radius:12px;padding:11px 16px;background:#f1f3f8
 	</tbody></table>
 	<h3>推送类型（读 final_decision.push_recommendation）</h3><div class="help-grid">
 	<div class="help-item"><strong>trade</strong><p>方向为做多/做空且 confidence ≥ push_score。正文含入场、止损、止盈。</p></div>
-	<div class="help-item"><strong>watch</strong><p>风险提示型推送；门槛与 trade 相同（默认同 push_score）。</p></div>
-	<div class="help-item"><strong>spike</strong><p>L3 急速异动；通道默认开启，由 final_decision 决定是否推送。</p></div>
+	<div class="help-item"><strong>watch</strong><p>风险提示型推送；门槛为 watch_push_score（低于 trade）。</p></div>
+	<div class="help-item"><strong>spike</strong><p>L3 急速异动；门槛为 spike_push_score（通常最低）。</p></div>
 	</div>
 	<p>三类推送通道默认全开；实际是否发出取决于 final_decision、push_score、冷却期，以及是否启用微信推送。</p>
 	<h3>日志字段</h3><ul class="help-list">
@@ -2083,6 +2425,56 @@ button,.button{{border:0;border-radius:12px;padding:11px 16px;background:#f1f3f8
 	{pipeline_design_html()}
 	</main></div></div>
 <script>
+const SUGGESTED_PUSH_SCORES = {json.dumps(SUGGESTED_PUSH_SCORES, ensure_ascii=False)};
+const RISK_PREFERENCE_LABELS = {json.dumps(RISK_PREFERENCE_LABELS, ensure_ascii=False)};
+function currentRiskPreference() {{
+  const el = document.querySelector('.config-form select[name="risk_preference"]');
+  return el && el.value ? el.value : 'standard';
+}}
+function currentAiEnabled() {{
+  const el = document.querySelector('.config-form input[name="ai_enabled"]');
+  return !!(el && el.checked);
+}}
+function updatePushScoreGuide() {{
+  const risk = currentRiskPreference();
+  const suggested = SUGGESTED_PUSH_SCORES[risk] || SUGGESTED_PUSH_SCORES.standard;
+  const label = RISK_PREFERENCE_LABELS[risk] || risk;
+  const textEl = document.getElementById('pushScoreGuideText');
+  if (textEl) {{
+    const aiNote = currentAiEnabled()
+      ? '已启用 AI：trade 建议可贴近下表。'
+      : '未启用 AI：建议 trade 取偏保守一档（如标准 75→78~80）。';
+    textEl.textContent = '当前严格度「' + label + '」建议 trade ' + suggested.push_score
+      + ' · watch ' + suggested.watch_push_score + ' · spike ' + suggested.spike_push_score
+      + '。' + aiNote + ' watch/spike 应低于 trade，避免噪音推送。';
+  }}
+}}
+function applySuggestedPushScores() {{
+  const form = document.querySelector('.config-form');
+  if (!form) return;
+  const suggested = SUGGESTED_PUSH_SCORES[currentRiskPreference()] || SUGGESTED_PUSH_SCORES.standard;
+  const tradeEl = form.querySelector('[name="push_score"]');
+  const watchEl = form.querySelector('[name="watch_push_score"]');
+  const spikeEl = form.querySelector('[name="spike_push_score"]');
+  if (tradeEl) tradeEl.value = String(suggested.push_score);
+  if (watchEl) watchEl.value = String(suggested.watch_push_score);
+  if (spikeEl) spikeEl.value = String(suggested.spike_push_score);
+  updatePushScoreGuide();
+  autoSaveConfig().catch(function(error) {{ alert('保存建议分数失败：' + error); }});
+}}
+const applySuggestedPushScoresBtn = document.getElementById('applySuggestedPushScores');
+if (applySuggestedPushScoresBtn) {{
+  applySuggestedPushScoresBtn.addEventListener('click', applySuggestedPushScores);
+}}
+const riskPreferenceSelect = document.querySelector('.config-form select[name="risk_preference"]');
+if (riskPreferenceSelect) {{
+  riskPreferenceSelect.addEventListener('change', updatePushScoreGuide);
+}}
+const aiEnabledCheckbox = document.querySelector('.config-form input[name="ai_enabled"]');
+if (aiEnabledCheckbox) {{
+  aiEnabledCheckbox.addEventListener('change', updatePushScoreGuide);
+}}
+updatePushScoreGuide();
 function currentPage() {{
   return (location.hash || '#monitor').replace('#', '') || 'monitor';
 }}
@@ -2234,9 +2626,9 @@ const importConfigBtn = document.getElementById('importConfigBtn');
 	async function refreshReplayInfo(options){{options=options||{{}};const lite=options.lite!==false;try{{const url='/api/replay-dataset'+(lite?'?lite=1':'');const r=await fetch(url,{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'加载失败');renderReplayDatasetInfo(p);renderReplayStatus(p);if(!lite&&syncAccuracyScopeWithReplay(p))fetchAccuracy({{resetView:true}});if(!lite&&p.replay_running)startReplayProgress();return p;}}catch(e){{const box=document.getElementById('replayDatasetInfo');if(box)box.textContent='加载回放状态失败：'+e;renderReplayStatus({{replay_status:{{text:String(e)}}}});return null;}}}}
 	let replayProgressTimer=null,replayFinishedNotified=false,fetchAccuracyInFlight=null;
 	function stopReplayProgress(){{stopReplayAccuracyPoll();if(replayProgressTimer){{clearInterval(replayProgressTimer);replayProgressTimer=null;}}}}
-	function startReplayProgress(){{stopReplayProgress();replayFinishedNotified=false;switchAccuracyToReplaySession();replayProgressTimer=setInterval(async function(){{if(currentPage()!=='tests')return;const info=await refreshReplayInfo({{lite:true}});if(!info)return;setReplayStartButtonState(info.replay_running?'running':'idle');if(info.replay_running){{fetchAccuracy({{resetView:false}});return;}}stopReplayProgress();fetchAccuracy({{resetView:false}});if(!replayFinishedNotified){{replayFinishedNotified=true;const lines=info.analysis_log_lines!=null?info.analysis_log_lines:'--';alert('回放完成 · 分析日志 '+lines+' 行 · 上方压测已切到「回放会话」');}}}},2500);}}
+	function startReplayProgress(){{stopReplayProgress();replayFinishedNotified=false;switchAccuracyToReplaySession();replayProgressTimer=setInterval(async function(){{if(currentPage()!=='tests')return;const info=await refreshReplayInfo({{lite:true}});if(!info)return;setReplayStartButtonState(info.replay_running?'running':'idle');if(info.replay_running){{fetchAccuracy({{resetView:false}});return;}}stopReplayProgress();fetchAccuracy({{resetView:true}});if(!replayFinishedNotified){{replayFinishedNotified=true;const lines=info.analysis_log_lines!=null?info.analysis_log_lines:'--';alert('回放完成 · 分析日志 '+lines+' 行 · 上方压测已切到「回放会话」');}}}},2500);}}
 	async function startReplayRun(){{const intervalEl=document.getElementById('replayInterval'),interval=Number(intervalEl&&intervalEl.value),statusEl=document.getElementById('replayStatusText');setReplayStartButtonState('starting');if(statusEl)statusEl.textContent='正在启动回放，请稍候...';try{{const r=await fetch('/api/replay-start',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{interval:Number.isFinite(interval)?interval:0}}),cache:'no-store'}});let p=null;const ct=(r.headers.get('content-type')||'').toLowerCase();if(ct.includes('application/json')){{p=await r.json();}}else{{throw new Error('服务器返回异常页面（HTTP '+r.status+'），请刷新并重新登录后再试');}}if(!r.ok||p.ok===false)throw new Error(p.error||p.message||'启动失败');renderReplayDatasetInfo(p);renderReplayStatus(p);if(statusEl)statusEl.textContent=p.message||'回放已启动';setReplayStartButtonState('running');fetchAccuracy({{resetView:true}});startReplayProgress();}}catch(e){{setReplayStartButtonState('idle');if(statusEl)statusEl.textContent='启动失败：'+e;alert('启动回放失败：'+e);}}}}
-	async function stopReplayRun(){{const btn=document.getElementById('replayStopBtn');if(btn)btn.disabled=true;try{{const r=await fetch('/api/replay-stop',{{method:'POST',cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||p.message||'停止失败');stopReplayProgress();setReplayStartButtonState('idle');await refreshReplayInfo({{lite:false}});fetchAccuracy({{resetView:false}});alert(p.message||'回放已停止');}}catch(e){{alert('停止回放失败：'+e);}}finally{{if(btn)btn.disabled=false;}}}}
+	async function stopReplayRun(){{const btn=document.getElementById('replayStopBtn');if(btn)btn.disabled=true;try{{const r=await fetch('/api/replay-stop',{{method:'POST',cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||p.message||'停止失败');stopReplayProgress();setReplayStartButtonState('idle');await refreshReplayInfo({{lite:false}});fetchAccuracy({{resetView:true}});alert(p.message||'回放已停止');}}catch(e){{alert('停止回放失败：'+e);}}finally{{if(btn)btn.disabled=false;}}}}
 	const replayStartBtn=document.getElementById('replayStartBtn'),replayStopBtn=document.getElementById('replayStopBtn'),replayRefreshBtn=document.getElementById('replayRefreshBtn');
 	if(replayStartBtn)replayStartBtn.addEventListener('click',startReplayRun);
 	if(replayStopBtn)replayStopBtn.addEventListener('click',stopReplayRun);
@@ -2265,7 +2657,7 @@ const importConfigBtn = document.getElementById('importConfigBtn');
 	function clamp(v,a,b){{return Math.max(a,Math.min(b,v));}}
 	function accuracyDirectionValue(o){{const v=String((o&&o.direction)||'');if(v==='\\u505a\\u591a')return 1;if(v==='\\u505a\\u7a7a')return -1;return 0;}}
 	function resetAccuracyView(){{accuracyView.start=0;accuracyView.end=1;accuracyView.yZoom=1;accuracyView.yPan=0;accuracyView.priceRg=1;accuracyView.followLatest=true;accuracyView.selectedKey='';updateAccuracyPointPanel(null);}}
-	function accuracyPointHtml(o){{if(!o)return '';const hit=o.hit?'合理':'不合理',dir=o.direction||'--',actual=o.actual_direction||'--',ret=o.return_pct!=null?fmt(o.return_pct,3)+'%':'--',outcome=o.outcome_type||'--';return '<strong>选中压测点</strong><div class="snapshot-grid"><span>时间</span><b>'+escHtml(o.time||'--')+'</b><span>价格</span><b>'+fmt(o.price,2)+'</b><span>预测</span><b>'+dir+'</b><span>实际</span><b>'+actual+'</b><span>后续价</span><b>'+(o.future_price!=null?fmt(o.future_price,2):'--')+'</b><span>涨跌</span><b>'+ret+'</b><span>判定</span><b>'+hit+'</b><span>类型</span><b>'+escHtml(outcome)+'</b><span>累计准确</span><b>'+(o.accuracy_pct!=null?fmt(o.accuracy_pct,1)+'%':'--')+'</b></div>';}}
+	function accuracyPointHtml(o){{if(!o)return '';const hit=o.hit?'合理':'不合理',dir=o.direction||'--',actual=o.actual_direction||'--',ret=o.return_pct!=null?fmt(o.return_pct,3)+'%':'--',outcome=o.outcome_type||'--',paper=o.paper_equity!=null?('$'+fmt(o.paper_equity,0)+' / '+fmtSignedPct(o.paper_pnl_pct,2)+' / '+(o.paper_position||'--')):'--';return '<strong>选中压测点</strong><div class="snapshot-grid"><span>时间</span><b>'+escHtml(o.time||'--')+'</b><span>价格</span><b>'+fmt(o.price,2)+'</b><span>预测</span><b>'+dir+'</b><span>实际</span><b>'+actual+'</b><span>模拟账户</span><b>'+paper+'</b><span>后续价</span><b>'+(o.future_price!=null?fmt(o.future_price,2):'--')+'</b><span>涨跌</span><b>'+ret+'</b><span>判定</span><b>'+hit+'</b><span>类型</span><b>'+escHtml(outcome)+'</b><span>累计准确</span><b>'+(o.accuracy_pct!=null?fmt(o.accuracy_pct,1)+'%':'--')+'</b></div>';}}
 	function escHtml(v){{return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}}
 	function updateAccuracyPointPanel(point){{const panel=document.getElementById('accuracyPointPanel');if(!panel)return;if(!point){{panel.hidden=true;panel.innerHTML='';return;}}panel.hidden=false;panel.innerHTML=accuracyPointHtml(point);}}
 	function drawAccuracyLeftAxis(ctx,pad,W,H,mn,mx){{ctx.fillStyle='rgba(226,232,240,.82)';ctx.font='12px Segoe UI, Microsoft YaHei';ctx.textAlign='right';ctx.textBaseline='middle';const ch=H-pad.t-pad.b;for(let i=0;i<=4;i++){{const value=mx-(mx-mn)*i/4,y=pad.t+ch*i/4;ctx.fillText(fmt(value,2),pad.l-8,y);}}}}
@@ -2273,13 +2665,15 @@ const importConfigBtn = document.getElementById('importConfigBtn');
 	function drawAccuracyCrosshair(ctx,pad,W,H,plot){{const pt=plot.point||{{}};ctx.save();ctx.strokeStyle='rgba(226,232,240,.72)';ctx.setLineDash([5,5]);ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(plot.x,pad.t);ctx.lineTo(plot.x,H-pad.b);ctx.stroke();ctx.beginPath();ctx.moveTo(pad.l,plot.yPrice);ctx.lineTo(W-pad.r,plot.yPrice);ctx.stroke();ctx.strokeStyle='rgba(251,191,36,.55)';ctx.beginPath();ctx.moveTo(pad.l,plot.yPred);ctx.lineTo(W-pad.r,plot.yPred);ctx.stroke();ctx.setLineDash([]);ctx.font='12px Segoe UI, Microsoft YaHei';ctx.fillStyle='rgba(96,165,250,.95)';ctx.textAlign='right';ctx.textBaseline='middle';ctx.fillText(fmt(pt.price,2),pad.l-8,plot.yPrice);ctx.fillStyle='rgba(251,191,36,.95)';ctx.textAlign='left';ctx.fillText(fmt(plot.predVal!=null?plot.predVal:accuracyDirectionValue(pt),0),W-pad.r+6,plot.yPred);ctx.fillStyle='rgba(229,231,235,.95)';ctx.textAlign='center';ctx.textBaseline='top';ctx.fillText(shortTime(pt.time||''),plot.x,H-pad.b+4);ctx.fillStyle='#60a5fa';ctx.beginPath();ctx.arc(plot.x,plot.yPrice,5,0,Math.PI*2);ctx.fill();ctx.fillStyle='#fbbf24';ctx.beginPath();ctx.arc(plot.x,plot.yPred,4.5,0,Math.PI*2);ctx.fill();ctx.restore();}}
 	function selectAccuracyPoint(event,strict){{const c=document.getElementById('accuracyChart');if(!c||!accuracyPlotPoints.length)return;const rect=c.getBoundingClientRect(),x=event.clientX-rect.left,y=event.clientY-rect.top;let best=null,bestDist=Infinity;accuracyPlotPoints.forEach(o=>{{const dPrice=Math.hypot(o.x-x,o.yPrice-y),dPred=Math.hypot(o.x-x,o.yPred-y),dist=Math.min(dPrice,dPred);if(dist<bestDist){{best=o;bestDist=dist;}}}});const limit=strict?36:30;if(best&&bestDist<limit){{accuracyView.selectedKey=best.point.time||'';updateAccuracyPointPanel(best.point);drawAccuracyChart();}}else if(!strict){{accuracyView.selectedKey='';updateAccuracyPointPanel(null);drawAccuracyChart();}}}}
 	function visibleAccuracyPoints(){{const pts=accuracyView.points||[];if(pts.length<=1)return pts;const n=pts.length,span=Math.max(0.001,accuracyView.end-accuracyView.start),a=Math.floor(accuracyView.start*(n-1)),b=Math.min(n,Math.max(a+2,Math.ceil((accuracyView.start+span)*(n-1))+1));return pts.slice(a,b);}}
-	function accuracyLinePointBudget(cw,count){{if(count<=96)return count;const cap=Math.max(80,Math.floor(cw*0.55));return Math.min(count,cap);}}
+	function accuracyLinePointBudget(cw,count){{if(count<=160)return count;const cap=Math.max(120,Math.floor(cw*1.2));return Math.min(count,cap);}}
 	function accuracyShowPointMarkers(cw,count){{if(count<=80)return true;const budget=accuracyLinePointBudget(cw,count);return count<=Math.min(100,budget);}}
 	function decimateAccuracySeries(points,predVals,maxPoints){{if(points.length<=maxPoints)return{{points:points,predVals:predVals}};const idx=new Set([0,points.length-1]);const buckets=Math.max(1,Math.floor((maxPoints-2)/2));for(let b=0;b<buckets;b++){{const start=Math.floor(b*(points.length-1)/buckets),end=Math.min(points.length-1,Math.floor((b+1)*(points.length-1)/buckets));if(start>=end){{idx.add(start);continue;}}let minI=start,maxI=start;for(let i=start;i<=end;i++){{const p=Number(points[i].price);if(p<Number(points[minI].price))minI=i;if(p>Number(points[maxI].price))maxI=i;}}idx.add(minI);idx.add(maxI);}}let order=Array.from(idx).sort((a,b)=>a-b);if(order.length>maxPoints){{const slim=[];for(let i=0;i<maxPoints;i++)slim.push(order[Math.round(i*(order.length-1)/(maxPoints-1))]);order=slim;}}return{{points:order.map(i=>points[i]),predVals:order.map(i=>predVals[i])}};}}
-	function accuracyMinTimeSpan(){{const n=(accuracyView.points||[]).length;return n<=1?1:Math.max(0.06,Math.min(1,24/Math.max(24,n)));}}
-	function syncAccuracyPoints(points,options){{const opts=options||{{}},clean=(points||[]).filter(o=>Number.isFinite(Number(o&&o.price)));if(opts.resetView){{accuracyView.points=clean;resetAccuracyView();return;}}const followLatest=accuracyView.followLatest!==false&&accuracyView.end>=0.995;accuracyView.points=clean;if(followLatest&&clean.length>2){{const span=Math.max(0.001,accuracyView.end-accuracyView.start);accuracyView.end=1;accuracyView.start=Math.max(0,1-span);}}}}
+	function accuracyMinTimeSpan(){{const n=(accuracyView.points||[]).length;return n<=1?1:Math.max(0.02,Math.min(1,36/Math.max(36,n)));}}
+	function accuracySpanHours(points){{if(!points||points.length<2)return 0;const a=parsePointTime(points[0].time).getTime(),b=parsePointTime(points[points.length-1].time).getTime();return Math.abs(b-a)/3600000;}}
+	function accuracyTimeLabel(t,spanHours){{if(spanHours>=4)return compactTime(t);return shortTime(t);}}
+	function syncAccuracyPoints(points,options){{const opts=options||{{}},clean=(points||[]).filter(o=>Number.isFinite(Number(o&&o.price))),hadFullView=accuracyView.start<=0.001&&accuracyView.end>=0.999;if(opts.resetView){{accuracyView.points=clean;resetAccuracyView();return;}}const followLatest=accuracyView.followLatest!==false&&accuracyView.end>=0.995;accuracyView.points=clean;if(clean.length>2&&(followLatest||hadFullView)){{accuracyView.start=0;accuracyView.end=1;accuracyView.followLatest=true;}}else if(followLatest&&clean.length>2){{const span=Math.max(0.001,accuracyView.end-accuracyView.start);accuracyView.end=1;accuracyView.start=Math.max(0,1-span);}}}}
 	function redrawAccuracyChart(){{drawAccuracyChart();}}
-	async function fetchAccuracy(options){{options=options||{{}};if(fetchAccuracyInFlight&&!options.force)return fetchAccuracyInFlight;const run=async()=>{{const canvas=document.getElementById('accuracyChart');if(!canvas)return;const resetView=!!options.resetView||accuracyQuerySignature()!==accuracyQueryKey;if(accuracyImportedMode&&!options.resetView)return;if(options.resetView)setAccuracyImportedMode(false,'');const inst=(document.getElementById('accuracyInst')||{{}}).value||'BTC-USDT-SWAP',h=(document.getElementById('accuracyHorizon')||{{}}).value||'5',scope=(document.getElementById('accuracyScope')||{{}}).value||'session',retention=accuracyRetentionHours(),interval=configuredMonitorInterval(),note=document.getElementById('accuracyNote');const queryKey=accuracyQuerySignature();accuracyQueryKey=queryKey;try{{if(note&&resetView)note.textContent='正在统计实时预测压测...';const qs='inst_id='+encodeURIComponent(inst)+'&horizon='+encodeURIComponent(h)+'&scope='+encodeURIComponent(scope)+'&retention_hours='+encodeURIComponent(retention)+'&interval_seconds='+encodeURIComponent(interval);const r=await fetch('/api/accuracy-data?'+qs,{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'统计失败');accuracyLivePayload=p;const s=p.summary||{{}};updateAccuracySummary(s);syncAccuracyPoints(p.points||[],{{resetView:resetView}});redrawAccuracyChart();if(p.replay_pending){{if(note)note.textContent=p.hint||'请先点击下方「开始回放」；切换「回放会话」不会自动启动回放。';return;}}const maxPts=p.max_points||0,intervalSec=p.interval_seconds||interval,retainH=p.retention_hours||retention;let noteExtra='';if(p.scope==='replay'&&(s.total??0)===0&&((s.raw_log_total??0)>0||(s.pending_total??0)>0))noteExtra=' · 回放日志已有数据，验证窗口成熟后曲线才会加点';else if(p.scope==='replay'&&(s.raw_log_total??0)===0)noteExtra=' · 回放进行中，请稍候';else if(p.scope==='session'&&(s.total??0)===0&&((s.raw_log_total??0)>0||(s.pending_total??0)>0))noteExtra=' · 监控日志已有数据，验证窗口成熟后曲线才会加点';else if(p.scope==='session'&&(s.raw_log_total??0)===0)noteExtra=' · 监控刚启动，请等待几轮轮询';if(note)note.textContent=(p.scope==='replay'?'回放会话':p.scope==='session'?'本次启动后':'全部历史')+' · 综合 '+fmt(s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,1)+'% · 观望 '+fmt(s.watch_reasonable_pct,1)+'%('+((s.watch_total??0))+') · 交易方向 '+fmt(s.trade_direction_accuracy_pct,1)+'%('+((s.trade_signal_total??0))+') · 窗口 '+formatHorizonLabel(p.horizon_seconds||h)+' · 双击重置缩放'+noteExtra;}}catch(e){{updateAccuracySummary({{}});syncAccuracyPoints([],{{resetView:true}});redrawAccuracyChart();if(note)note.textContent='预测压测统计失败：'+e;}}}};fetchAccuracyInFlight=run();try{{await fetchAccuracyInFlight;}}finally{{fetchAccuracyInFlight=null;}}}}
+	async function fetchAccuracy(options){{options=options||{{}};if(fetchAccuracyInFlight&&!options.force)return fetchAccuracyInFlight;const run=async()=>{{const canvas=document.getElementById('accuracyChart');if(!canvas)return;const resetView=!!options.resetView||accuracyQuerySignature()!==accuracyQueryKey;if(accuracyImportedMode&&!options.resetView)return;if(options.resetView)setAccuracyImportedMode(false,'');const inst=(document.getElementById('accuracyInst')||{{}}).value||'BTC-USDT-SWAP',h=(document.getElementById('accuracyHorizon')||{{}}).value||'5',scope=(document.getElementById('accuracyScope')||{{}}).value||'session',retention=accuracyRetentionHours(),interval=configuredMonitorInterval(),note=document.getElementById('accuracyNote');const queryKey=accuracyQuerySignature();accuracyQueryKey=queryKey;try{{if(note&&resetView)note.textContent='正在统计实时预测压测...';const qs='inst_id='+encodeURIComponent(inst)+'&horizon='+encodeURIComponent(h)+'&scope='+encodeURIComponent(scope)+'&retention_hours='+encodeURIComponent(retention)+'&interval_seconds='+encodeURIComponent(interval);const r=await fetch('/api/accuracy-data?'+qs,{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'统计失败');accuracyLivePayload=p;const s=p.summary||{{}};updateAccuracySummary(s);syncAccuracyPoints(p.points||[],{{resetView:resetView}});redrawAccuracyChart();if(p.replay_pending){{if(note)note.textContent=p.hint||'请先点击下方「开始回放」；切换「回放会话」不会自动启动回放。';return;}}const maxPts=p.max_points||0,intervalSec=p.interval_seconds||interval,retainH=p.retention_hours||retention;let noteExtra='';if(p.scope==='replay'&&(s.total??0)===0&&((s.raw_log_total??0)>0||(s.pending_total??0)>0))noteExtra=' · 回放日志已有数据，验证窗口成熟后曲线才会加点';else if(p.scope==='replay'&&(s.raw_log_total??0)===0)noteExtra=' · 回放进行中，请稍候';else if(p.scope==='session'&&(s.total??0)===0&&((s.raw_log_total??0)>0||(s.pending_total??0)>0))noteExtra=' · 监控日志已有数据，验证窗口成熟后曲线才会加点';else if(p.scope==='session'&&(s.raw_log_total??0)===0)noteExtra=' · 监控刚启动，请等待几轮轮询';if(note)note.textContent=(p.scope==='replay'?'回放会话':p.scope==='session'?'本次启动后':'全部历史')+' · 模拟 '+formatPaperSummary(s)+' · 综合 '+fmt(s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,1)+'% · 窗口 '+formatHorizonLabel(p.horizon_seconds||h)+((p.time_start&&p.time_end)?(' · 范围 '+compactTime(p.time_start)+' ~ '+compactTime(p.time_end)):'')+' · '+(p.chart_points||accuracyView.points.length||0)+'点 · 双击重置缩放'+noteExtra;}}catch(e){{updateAccuracySummary({{}});syncAccuracyPoints([],{{resetView:true}});redrawAccuracyChart();if(note)note.textContent='预测压测统计失败：'+e;}}}};fetchAccuracyInFlight=run();try{{await fetchAccuracyInFlight;}}finally{{fetchAccuracyInFlight=null;}}}}
 	function switchAccuracyToLiveSession(){{const scopeEl=document.getElementById('accuracyScope');if(scopeEl&&scopeEl.value!=='session'){{accuracyScopeSyncing=true;scopeEl.value='session';accuracyScopeSyncing=false;}}setAccuracyImportedMode(false,'');accuracyQueryKey='';fetchAccuracy({{resetView:true}});}}
 	function switchAccuracyToReplaySession(){{const scopeEl=document.getElementById('accuracyScope');if(scopeEl&&scopeEl.value!=='replay'){{accuracyScopeSyncing=true;scopeEl.value='replay';accuracyScopeSyncing=false;}}setAccuracyImportedMode(false,'');accuracyQueryKey='';}}
 	function syncAccuracyScopeWithReplay(info){{if(!info||!info.replay_running)return false;const scopeEl=document.getElementById('accuracyScope');if(!scopeEl||scopeEl.value==='replay')return false;switchAccuracyToReplaySession();return true;}}
@@ -2292,8 +2686,9 @@ const importConfigBtn = document.getElementById('importConfigBtn');
 	['accuracyInst','accuracyHorizon','accuracyRetentionHours'].forEach(id=>{{const el=document.getElementById(id);if(el)el.addEventListener('change',()=>fetchAccuracy({{resetView:true}}));}});
 	const accuracyScopeEl=document.getElementById('accuracyScope');if(accuracyScopeEl)accuracyScopeEl.addEventListener('change',onAccuracyScopeChange);
 	function formatHorizonLabel(sec){{const n=Number(sec)||0;if(n>=60&&n%60===0)return (n/60)+'分钟';return n+'秒';}}
-	function updateAccuracySummary(s){{const box=document.getElementById('accuracySummary');if(!box)return;s=s||{{}};const pred=s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,tradeTotal=s.trade_signal_total??0,tradeDir=s.trade_direction_accuracy_pct,tradePlan=s.trade_signal_accuracy_pct,watchTotal=s.watch_total??0,watchPct=s.watch_reasonable_pct,watchMiss=s.watch_missed_pct,resolved=s.trade_resolved_total??0,execLine=tradeTotal>=5?(fmt(s.entry_touch_pct,1)+'% / '+fmt(s.no_fill_pct,1)+'%'):'样本不足';const vals=[['综合预测准确度',pred!=null?fmt(pred,1)+'% / '+(s.decision_total??s.total??0):'--',true],['可靠性等级',(s.reliability_level||'--')+' / '+(s.reliability_score!=null?fmt(s.reliability_score,1):'--')],['已验证/日志',(s.total??0)+' / '+(s.raw_log_total??s.total??0)],['观望准确度',watchPct!=null?fmt(watchPct,1)+'% / '+watchTotal:'--'],['观望错失率',watchMiss!=null?fmt(watchMiss,1)+'% / '+watchTotal:'--'],['交易方向命中',tradeDir!=null?fmt(tradeDir,1)+'% / '+tradeTotal:'--'],['交易执行合理率',tradePlan!=null?fmt(tradePlan,1)+'% / '+tradeTotal:'--'],['验证窗口',formatHorizonLabel(s.horizon_seconds)+' · 阈值 '+fmt(s.threshold_pct,3)+'%'],['入场触达/未成交',execLine]];if(resolved>=3)vals.push(['止盈/止损/胜率',fmt(s.take_profit_pct,1)+'% / '+fmt(s.stop_hit_pct,1)+'% / '+fmt(s.trade_win_rate_pct,1)+'% ('+resolved+')']);box.innerHTML=vals.map(v=>'<div'+(v[2]?' class="accuracy-primary"':'')+'><span>'+v[0]+'</span><b>'+v[1]+'</b></div>').join('');}}
-	function drawAccuracyChart(points){{if(Array.isArray(points))syncAccuracyPoints(points,{{resetView:true}});const c=document.getElementById('accuracyChart');if(!c)return;accuracyPlotPoints=[];const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=Math.max(1,r.width*d);c.height=Math.max(1,r.height*d);const ctx=c.getContext('2d');ctx.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,pad={{l:58,r:52,t:24,b:40}},cw=W-pad.l-pad.r,ch=H-pad.t-pad.b;ctx.clearRect(0,0,W,H);ctx.fillStyle='#0f172a';ctx.fillRect(0,0,W,H);let clean=visibleAccuracyPoints();if(!clean.length){{updateAccuracyPointPanel(null);ctx.fillStyle='rgba(203,213,225,.82)';ctx.textAlign='center';ctx.textBaseline='middle';ctx.font='13px Segoe UI, Microsoft YaHei';const scopeNow=(document.getElementById('accuracyScope')||{{}}).value||'session',emptyMsg=scopeNow==='replay'?'回放会话暂无数据：请先点击下方「开始回放」，切换范围不会自动启动回放':(scopeNow==='all'?'全部历史暂无已验证点：请确认日志中有该币种数据':'暂无可验证样本：live 监控请启动后选「本次启动后」；离线回放请点「开始回放」后选「回放会话」');ctx.fillText(emptyMsg,W/2,H/2);return;}}const visibleCount=clean.length,totalCount=(accuracyView.points||[]).length;if(clean.length===1)clean=[clean[0],Object.assign({{}},clean[0])];const priceVals=clean.map(o=>Number(o.price)),mn=Math.min(...priceVals),mx=Math.max(...priceVals),basePriceRg=Math.max((mx||1)*0.001,(mx-mn)*1.16,0.01);let pred=0;const predVals=clean.map(o=>{{pred+=accuracyDirectionValue(o);return pred;}}),pmn=Math.min(...predVals),pmx=Math.max(...predVals),basePredRg=Math.max(1,(pmx-pmn)*1.16,1);const yZoom=Math.max(0.35,accuracyView.yZoom||1),yPan=accuracyView.yPan||0,normTop=0.5+yPan+0.5/yZoom,normBottom=0.5+yPan-0.5/yZoom,priceSpan=Math.max(0.000001,basePriceRg),predSpan=Math.max(0.000001,basePredRg),priceAxisBottom=mn+normBottom*priceSpan,priceAxisTop=mn+normTop*priceSpan,predAxisBottom=pmn+normBottom*predSpan,predAxisTop=pmn+normTop*predSpan;accuracyView.priceRg=priceSpan/yZoom;const pricePlotRg=Math.max(0.000001,priceAxisTop-priceAxisBottom),predPlotRg=Math.max(0.000001,predAxisTop-predAxisBottom),priceFlat=Math.abs(mx-mn)<1e-9,predFlat=Math.abs(pmx-pmn)<1e-9,bothFlat=priceFlat&&predFlat,priceY=o=>{{let norm=priceFlat?0.5:(Number(o.price)-priceAxisBottom)/pricePlotRg;return pad.t+ch-norm*ch-(bothFlat?16:0);}},predValY=val=>{{let norm=predFlat?0.5:(val-predAxisBottom)/predPlotRg;return pad.t+ch-norm*ch+(bothFlat?16:0);}},stepFull=cw/Math.max(1,clean.length-1),xAtFull=i=>pad.l+stepFull*i;const drawBudget=accuracyLinePointBudget(cw,clean.length),showMarkers=accuracyShowPointMarkers(cw,clean.length),decimated=decimateAccuracySeries(clean,predVals,drawBudget),drawPts=decimated.points,drawPred=decimated.predVals,stepDraw=cw/Math.max(1,drawPts.length-1),xAtDraw=i=>pad.l+stepDraw*i,denseMode=drawPts.length<clean.length,priceLineWidth=denseMode?1.5:2.6,predLineWidth=denseMode?1.1:2;ctx.strokeStyle='rgba(148,163,184,.22)';ctx.lineWidth=1;for(let i=0;i<=4;i++){{const y=pad.t+ch*i/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke();}}drawAccuracyLeftAxis(ctx,pad,W,H,priceAxisBottom,priceAxisTop);drawAccuracyRightAxis(ctx,pad,W,H,predAxisBottom,predAxisTop);drawTimeAxis(ctx,W,H,pad,clean,cw);ctx.beginPath();drawPts.forEach((o,i)=>{{const px=xAtDraw(i),py=predValY(drawPred[i]);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);}});ctx.strokeStyle='rgba(251,191,36,.92)';ctx.lineWidth=predLineWidth;ctx.stroke();ctx.beginPath();drawPts.forEach((o,i)=>{{const px=xAtDraw(i),py=priceY(o);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);}});ctx.strokeStyle='rgba(96,165,250,.95)';ctx.lineWidth=priceLineWidth;ctx.stroke();const markerPriceRadius=showMarkers?(visibleCount>160?1.6:2.8):0,markerPredRadius=showMarkers?(visibleCount>160?1.4:2.4):0;clean.forEach((o,i)=>{{const px=xAtFull(i),pyPrice=priceY(o),pyPred=predValY(predVals[i]),selected=(o.time||'')===accuracyView.selectedKey;accuracyPlotPoints.push({{x:px,yPrice:pyPrice,yPred:pyPred,predVal:predVals[i],point:o}});if(!showMarkers&&!selected)return;const pr=selected?4.2:(markerPriceRadius||2.8),qr=selected?3.8:(markerPredRadius||2.4);ctx.lineWidth=selected?1.5:1;ctx.strokeStyle='rgba(15,23,42,.85)';ctx.fillStyle=selected?'#22d3ee':(o.hit?'#34d399':'#fb7185');ctx.beginPath();ctx.arc(px,pyPrice,pr,0,Math.PI*2);ctx.fill();ctx.stroke();ctx.strokeStyle='rgba(15,23,42,.85)';ctx.fillStyle=selected?'#fde047':'#fbbf24';ctx.beginPath();ctx.arc(px,pyPred,qr,0,Math.PI*2);ctx.fill();ctx.stroke();}});let selectedPlot=null;if(accuracyView.selectedKey){{selectedPlot=accuracyPlotPoints.find(o=>(o.point.time||'')===accuracyView.selectedKey)||null;if(selectedPlot){{drawAccuracyCrosshair(ctx,pad,W,H,selectedPlot);updateAccuracyPointPanel(selectedPlot.point);}}else{{accuracyView.selectedKey='';updateAccuracyPointPanel(null);}}}}else{{updateAccuracyPointPanel(null);}}ctx.fillStyle='rgba(226,232,240,.92)';ctx.font='12px Segoe UI, Microsoft YaHei';ctx.textAlign='left';ctx.textBaseline='top';ctx.fillText('蓝线：价格',pad.l,pad.t+4);ctx.fillStyle='#fbbf24';ctx.fillText('黄线：预测方向',pad.l+72,pad.t+4);ctx.fillStyle=denseMode?'#fcd34d':'rgba(203,213,225,.72)';ctx.fillText(' · 绘制 '+drawPts.length+'/'+visibleCount+(denseMode?' 已抽稀':' 全量'),pad.l+248,pad.t+4);ctx.textAlign='right';ctx.fillStyle='rgba(203,213,225,.68)';ctx.textBaseline='top';ctx.fillText('总计 '+totalCount+' 点 · 滚轮缩放 · 拖动平移 · 点击选点',W-pad.r,H-26);}}
+	function formatPaperSummary(s){{if(!s||s.paper_equity==null)return '--';const pnl=Number(s.paper_pnl_usd)||0,pct=Number(s.paper_pnl_pct)||0,sign=pnl>=0?'+':'';return '$'+fmt(s.paper_equity,0)+' ('+sign+fmt(pnl,0)+' / '+sign+fmt(pct,2)+'%) · '+(s.paper_position_label||'--');}}
+	function updateAccuracySummary(s){{const box=document.getElementById('accuracySummary');if(!box)return;s=s||{{}};const pred=s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,tradeTotal=s.trade_signal_total??0,tradeDir=s.trade_direction_accuracy_pct,tradePlan=s.trade_signal_accuracy_pct,watchTotal=s.watch_total??0,watchPct=s.watch_reasonable_pct,watchMiss=s.watch_missed_pct,resolved=s.trade_resolved_total??0,execLine=tradeTotal>=5?(fmt(s.entry_touch_pct,1)+'% / '+fmt(s.no_fill_pct,1)+'%'):'样本不足',paperPts=s.paper_log_points??0;const vals=[['模拟账户($10k)',formatPaperSummary(s)+' / '+(s.paper_trade_count??0)+'笔 · '+paperPts+'轮','paper'],['综合预测准确度',pred!=null?fmt(pred,1)+'% / '+(s.decision_total??s.total??0):'--','primary'],['可靠性等级',(s.reliability_level||'--')+' / '+(s.reliability_score!=null?fmt(s.reliability_score,1):'--')],['已验证/日志',(s.total??0)+' / '+(s.raw_log_total??s.total??0)],['观望准确度',watchPct!=null?fmt(watchPct,1)+'% / '+watchTotal:'--'],['观望错失率',watchMiss!=null?fmt(watchMiss,1)+'% / '+watchTotal:'--'],['交易方向命中',tradeDir!=null?fmt(tradeDir,1)+'% / '+tradeTotal:'--'],['交易执行合理率',tradePlan!=null?fmt(tradePlan,1)+'% / '+tradeTotal:'--'],['验证窗口',formatHorizonLabel(s.horizon_seconds)+' · 阈值 '+fmt(s.threshold_pct,3)+'%'],['入场触达/未成交',execLine]];if(resolved>=3)vals.push(['止盈/止损/胜率',fmt(s.take_profit_pct,1)+'% / '+fmt(s.stop_hit_pct,1)+'% / '+fmt(s.trade_win_rate_pct,1)+'% ('+resolved+')']);box.innerHTML=vals.map(v=>'<div class="'+(v[2]==='paper'?'accuracy-paper-primary':(v[2]==='primary'?'accuracy-primary':''))+'"><span>'+v[0]+'</span><b>'+v[1]+'</b></div>').join('');}}
+	function drawAccuracyChart(points){{if(Array.isArray(points))syncAccuracyPoints(points,{{resetView:true}});const c=document.getElementById('accuracyChart');if(!c)return;accuracyPlotPoints=[];const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=Math.max(1,r.width*d);c.height=Math.max(1,r.height*d);const ctx=c.getContext('2d');ctx.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,pad={{l:58,r:52,t:24,b:40}},cw=W-pad.l-pad.r,ch=H-pad.t-pad.b;ctx.clearRect(0,0,W,H);ctx.fillStyle='#0f172a';ctx.fillRect(0,0,W,H);let clean=visibleAccuracyPoints();if(!clean.length){{updateAccuracyPointPanel(null);ctx.fillStyle='rgba(203,213,225,.82)';ctx.textAlign='center';ctx.textBaseline='middle';ctx.font='13px Segoe UI, Microsoft YaHei';const scopeNow=(document.getElementById('accuracyScope')||{{}}).value||'session',emptyMsg=scopeNow==='replay'?'回放会话暂无数据：请先点击下方「开始回放」，切换范围不会自动启动回放':(scopeNow==='all'?'全部历史暂无已验证点：请确认日志中有该币种数据':'暂无可验证样本：live 监控请启动后选「本次启动后」；离线回放请点「开始回放」后选「回放会话」');ctx.fillText(emptyMsg,W/2,H/2);return;}}const visibleCount=clean.length,totalCount=(accuracyView.points||[]).length;if(clean.length===1)clean=[clean[0],Object.assign({{}},clean[0])];const priceVals=clean.map(o=>Number(o.price)),mn=Math.min(...priceVals),mx=Math.max(...priceVals),basePriceRg=Math.max((mx||1)*0.001,(mx-mn)*1.16,0.01);let pred=0;const predVals=clean.map(o=>{{pred+=accuracyDirectionValue(o);return pred;}}),pmn=Math.min(...predVals),pmx=Math.max(...predVals),basePredRg=Math.max(1,(pmx-pmn)*1.16,1);const yZoom=Math.max(0.35,accuracyView.yZoom||1),yPan=accuracyView.yPan||0,normTop=0.5+yPan+0.5/yZoom,normBottom=0.5+yPan-0.5/yZoom,priceSpan=Math.max(0.000001,basePriceRg),predSpan=Math.max(0.000001,basePredRg),priceAxisBottom=mn+normBottom*priceSpan,priceAxisTop=mn+normTop*priceSpan,predAxisBottom=pmn+normBottom*predSpan,predAxisTop=pmn+normTop*predSpan;accuracyView.priceRg=priceSpan/yZoom;const pricePlotRg=Math.max(0.000001,priceAxisTop-priceAxisBottom),predPlotRg=Math.max(0.000001,predAxisTop-predAxisBottom),priceFlat=Math.abs(mx-mn)<1e-9,predFlat=Math.abs(pmx-pmn)<1e-9,bothFlat=priceFlat&&predFlat,priceY=o=>{{let norm=priceFlat?0.5:(Number(o.price)-priceAxisBottom)/pricePlotRg;return pad.t+ch-norm*ch-(bothFlat?16:0);}},predValY=val=>{{let norm=predFlat?0.5:(val-predAxisBottom)/predPlotRg;return pad.t+ch-norm*ch+(bothFlat?16:0);}},stepFull=cw/Math.max(1,clean.length-1),xAtFull=i=>pad.l+stepFull*i;const drawBudget=accuracyLinePointBudget(cw,clean.length),showMarkers=accuracyShowPointMarkers(cw,clean.length),decimated=decimateAccuracySeries(clean,predVals,drawBudget),drawPts=decimated.points,drawPred=decimated.predVals,stepDraw=cw/Math.max(1,drawPts.length-1),xAtDraw=i=>pad.l+stepDraw*i,denseMode=drawPts.length<clean.length,priceLineWidth=denseMode?1.5:2.6,predLineWidth=denseMode?1.1:2;ctx.strokeStyle='rgba(148,163,184,.22)';ctx.lineWidth=1;for(let i=0;i<=4;i++){{const y=pad.t+ch*i/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke();}}drawAccuracyLeftAxis(ctx,pad,W,H,priceAxisBottom,priceAxisTop);drawAccuracyRightAxis(ctx,pad,W,H,predAxisBottom,predAxisTop);drawAccuracyTimeAxis(ctx,W,H,pad,clean,cw);ctx.beginPath();drawPts.forEach((o,i)=>{{const px=xAtDraw(i),py=predValY(drawPred[i]);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);}});ctx.strokeStyle='rgba(251,191,36,.92)';ctx.lineWidth=predLineWidth;ctx.stroke();ctx.beginPath();drawPts.forEach((o,i)=>{{const px=xAtDraw(i),py=priceY(o);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);}});ctx.strokeStyle='rgba(96,165,250,.95)';ctx.lineWidth=priceLineWidth;ctx.stroke();const paperEq=clean.map(o=>Number(o.paper_equity)).filter(v=>Number.isFinite(v));if(paperEq.length>=2){{const pMn=Math.min(...paperEq),pMx=Math.max(...paperEq),pRg=Math.max(0.01,pMx-pMn),paperY=v=>pad.t+ch-((v-pMn)/pRg)*ch;let started=false;ctx.beginPath();clean.forEach((o,i)=>{{const pe=Number(o.paper_equity);if(!Number.isFinite(pe))return;const px=xAtFull(i),py=paperY(pe);if(!started){{ctx.moveTo(px,py);started=true;}}else ctx.lineTo(px,py);}});if(started){{ctx.strokeStyle='rgba(74,222,128,.92)';ctx.lineWidth=denseMode?1.2:2;ctx.stroke();}}}}const markerPriceRadius=showMarkers?(visibleCount>160?1.6:2.8):0,markerPredRadius=showMarkers?(visibleCount>160?1.4:2.4):0;clean.forEach((o,i)=>{{const px=xAtFull(i),pyPrice=priceY(o),pyPred=predValY(predVals[i]),selected=(o.time||'')===accuracyView.selectedKey;accuracyPlotPoints.push({{x:px,yPrice:pyPrice,yPred:pyPred,predVal:predVals[i],point:o}});if(!showMarkers&&!selected)return;const pr=selected?4.2:(markerPriceRadius||2.8),qr=selected?3.8:(markerPredRadius||2.4);ctx.lineWidth=selected?1.5:1;ctx.strokeStyle='rgba(15,23,42,.85)';ctx.fillStyle=selected?'#22d3ee':(o.hit?'#34d399':'#fb7185');ctx.beginPath();ctx.arc(px,pyPrice,pr,0,Math.PI*2);ctx.fill();ctx.stroke();ctx.strokeStyle='rgba(15,23,42,.85)';ctx.fillStyle=selected?'#fde047':'#fbbf24';ctx.beginPath();ctx.arc(px,pyPred,qr,0,Math.PI*2);ctx.fill();ctx.stroke();}});let selectedPlot=null;if(accuracyView.selectedKey){{selectedPlot=accuracyPlotPoints.find(o=>(o.point.time||'')===accuracyView.selectedKey)||null;if(selectedPlot){{drawAccuracyCrosshair(ctx,pad,W,H,selectedPlot);updateAccuracyPointPanel(selectedPlot.point);}}else{{accuracyView.selectedKey='';updateAccuracyPointPanel(null);}}}}else{{updateAccuracyPointPanel(null);}}ctx.fillStyle='rgba(226,232,240,.92)';ctx.font='12px Segoe UI, Microsoft YaHei';ctx.textAlign='left';ctx.textBaseline='top';ctx.fillText('蓝线：价格',pad.l,pad.t+4);ctx.fillStyle='#4ade80';ctx.fillText('绿线：模拟账户',pad.l+72,pad.t+4);ctx.fillStyle='#fbbf24';ctx.fillText('黄线：预测方向',pad.l+168,pad.t+4);ctx.fillStyle=denseMode?'#fcd34d':'rgba(203,213,225,.72)';ctx.fillText(' · 绘制 '+drawPts.length+'/'+visibleCount+(denseMode?' 已抽稀':' 全量'),pad.l+248,pad.t+4);ctx.textAlign='right';ctx.fillStyle='rgba(203,213,225,.68)';ctx.textBaseline='top';ctx.fillText('总计 '+totalCount+' 点 · 滚轮缩放 · 拖动平移 · 点击选点',W-pad.r,H-26);}}
 	function setupAccuracyChartInteractions(){{const c=document.getElementById('accuracyChart');if(!c||c.dataset.panZoomBound)return;c.dataset.panZoomBound='1';c.addEventListener('wheel',e=>{{if(!accuracyView.points.length)return;e.preventDefault();const rect=c.getBoundingClientRect(),mx=(e.clientX-rect.left)/Math.max(1,rect.width),factor=e.deltaY>0?1.18:0.85,n=accuracyView.points.length;if(e.shiftKey||n<=2){{accuracyView.yZoom=clamp(accuracyView.yZoom/factor,0.35,12);}}else{{const span=accuracyView.end-accuracyView.start,newSpan=clamp(span*factor,accuracyMinTimeSpan(),1),anchor=accuracyView.start+span*mx;accuracyView.start=clamp(anchor-newSpan*mx,0,1-newSpan);accuracyView.end=accuracyView.start+newSpan;}}accuracyView.followLatest=accuracyView.end>=0.995;drawAccuracyChart();}},{{passive:false}});c.addEventListener('mousedown',e=>{{accuracyView.drag={{x:e.clientX,y:e.clientY,start:accuracyView.start,end:accuracyView.end,yPan:accuracyView.yPan,moved:false}};c.classList.add('dragging');}});window.addEventListener('mousemove',e=>{{const g=accuracyView.drag;if(!g)return;const rect=c.getBoundingClientRect(),dx=(e.clientX-g.x)/Math.max(1,rect.width),dy=(e.clientY-g.y)/Math.max(1,rect.height),span=g.end-g.start;if(Math.abs(e.clientX-g.x)>3||Math.abs(e.clientY-g.y)>3)g.moved=true;let ns=clamp(g.start-dx*span,0,1-span),ne=ns+span;accuracyView.start=ns;accuracyView.end=ne;accuracyView.yPan=clamp(g.yPan+dy*1.35,-3,3);accuracyView.followLatest=accuracyView.end>=0.995;drawAccuracyChart();}});window.addEventListener('mouseup',()=>{{if(accuracyView.drag){{setTimeout(function(){{accuracyView.drag=null;}},0);}}c.classList.remove('dragging');}});c.addEventListener('click',e=>{{if(accuracyView.drag&&accuracyView.drag.moved)return;selectAccuracyPoint(e,false);}});c.addEventListener('dblclick',e=>{{if(accuracyView.drag&&accuracyView.drag.moved)return;resetAccuracyView();drawAccuracyChart();}});}}
 	setupAccuracyChartInteractions();
 	let virtualTick=0;
@@ -2323,6 +2718,8 @@ function fmtBool(v){{return v===true?'是':(v===false?'否':'--');}}
 function summarizeLayers(layers){{if(!layers||typeof layers!=='object')return '--';const keys=['market_regime_score','trend_score','momentum_score','volume_price_score','derivatives_score','orderbook_score','entry_quality_score','risk_control_score'];return keys.filter(k=>layers[k]!==undefined&&layers[k]!==null).map(k=>k.replace('_score','').replace('market_regime','状态').replace('volume_price','量价').replace('entry_quality','入场').replace('risk_control','风控').replace('orderbook','盘口').replace('derivatives','合约').replace('momentum','动量').replace('trend','趋势')+':'+fmtScore(layers[k])).join(' / ')||'--';}}
 function formatDuration(seconds){{let s=Math.max(0,Math.floor(Number(seconds)||0)),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60,pad=n=>String(n).padStart(2,'0');return h>0?h+'小时 '+pad(m)+'分 '+pad(sec)+'秒':pad(m)+':'+pad(sec);}}
 function updateMonitorUptime(status){{const el=document.getElementById('monitorUptime');if(status){{monitorStatusRunning=!!status.running;monitorStartedAt=status.started_at||'';monitorElapsedSeconds=Number(status.elapsed_seconds)||0;}}if(!el)return;if(monitorStatusRunning)el.textContent='已监控：'+formatDuration(monitorElapsedSeconds);else el.textContent=monitorStartedAt?'已停止：'+formatDuration(monitorElapsedSeconds):'已监控：未启动';}}
+function formatPaperAccount(paper){{if(!paper||paper.equity==null)return '--';const eq=Number(paper.equity),pnl=Number(paper.pnl_usd)||0,pct=Number(paper.pnl_pct)||0,sign=pnl>=0?'+':'';return '$'+fmt(eq,0)+' ('+sign+fmt(pnl,0)+' / '+sign+fmt(pct,2)+'%) · '+(paper.position_label||paper.position||'--');}}
+function updatePaperAccount(paper){{const el=document.getElementById('monitorPaperAccount');if(!el)return;if(!paper||paper.equity==null){{el.textContent='模拟账户：--';el.classList.remove('paper-up','paper-down');return;}}const pnl=Number(paper.pnl_usd)||0;el.textContent='模拟账户 '+formatPaperAccount(paper);el.classList.remove('paper-up','paper-down');el.classList.add(pnl>=0?'paper-up':'paper-down');}}
 function updateChartFooter(points){{const c=document.getElementById('monitorPointCount');if(!c)return;c.textContent='数据点：'+((points&&points.length)||0);}}
 function parsePointTime(t){{const s=String(t||'');const m=s.match(/^(\\d{{4}})-(\\d{{2}})-(\\d{{2}})[ T](\\d{{2}}):(\\d{{2}})(?::(\\d{{2}}))?/);if(m)return new Date(Number(m[1]),Number(m[2])-1,Number(m[3]),Number(m[4]),Number(m[5]),Number(m[6]||0));const d=new Date(s);return Number.isFinite(d.getTime())?d:new Date();}}
 function formatPointTime(d){{const pad=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());}}
@@ -2332,17 +2729,18 @@ function mergeClientPoints(existing,incoming,maxPoints){{const merged=[],indexBy
 function setMonitorSeries(points){{const series=mergeClientPoints([],points||[],20000);monitorSeriesByInst[monitorInst]=series;monitorPayload={{points:series}};return series;}}
 function appendMonitorPoints(points){{const series=mergeClientPoints(monitorSeriesByInst[monitorInst]||[],points||[],20000);monitorSeriesByInst[monitorInst]=series;monitorPayload={{points:series}};return series;}}
 function drawMonitorSeries(metaText){{const series=monitorSeriesByInst[monitorInst]||[];if(series.length){{drawChart('monitorChart',series,document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));document.getElementById('monitorTitle').textContent=monitorInst+' 实时走势';const m=document.getElementById('monitorMeta');if(m&&metaText)m.textContent=metaText;return true;}}return false;}}
-	function snapshotHtml(point,title){{if(!point)return '<strong>Snapshot</strong><div class="snapshot-grid"><span>价格</span><b>--</b><span>时间</span><b>--</b><span>评分</span><b>--</b><span>方向</span><b>--</b></div>';const hasMetrics=point.raw_total_score!==undefined&&point.raw_total_score!==null,kind=point.kind==='history'?(hasMetrics?'历史K线+日志指标':'历史K线'):'实时快照',dir=(point.raw_direction&&point.final_direction&&point.raw_direction!==point.final_direction)?(point.raw_direction+' → '+point.final_direction):(point.final_direction||point.direction||'--'),scoreText='综合 '+fmtScore(point.score)+' / 观察 '+fmtScore(point.raw_total_score)+' / 交易 '+fmtScore(point.final_trade_score),riskText=(point.market_risk_level||point.risk_level||'--')+' / '+(point.trade_action_level||'--'),lsAvail=point.long_short_available===false?'不可用':'可用',longShort=fmt(Number(point.long_ratio)*100,1)+'/'+fmt(Number(point.short_ratio)*100,1)+'% ('+lsAvail+')',warmup='OI '+fmtBool(point.oi_warmup_ready)+' / 费率 '+fmtBool(point.funding_warmup_ready),volumeText=fmt(point.volume_multiplier,2)+'x / 阈值 '+fmt(point.volume_threshold_used,2)+'x / '+displayValue(point.volume_direction)+'/'+displayValue(point.volume_trend),bookText=fmtSignedPct(Number(point.order_book_imbalance)*100,1)+' / top5 '+fmtSignedPct(Number(point.order_book_imbalance_5)*100,1)+' / spread '+fmt(point.spread_pct,4)+'%',qualityText=(point.data_quality_reliable===true?'可靠':(point.data_quality_reliable===false?'不足':'--'))+' / 15m确认K '+displayValue(point.data_quality_count),signals=compactList(point.signals,4),waitFor=compactList(point.wait_for,3);return '<strong>'+title+' · '+kind+'</strong><div class="snapshot-grid"><span>时间</span><b>'+compactTime(point.time)+'</b><span>价格</span><b>'+fmt(point.price,2)+'</b><span>分数</span><b>'+scoreText+'</b><span>方向</span><b>'+dir+'</b><span>市场/策略</span><b>'+displayValue(point.market_regime)+' / '+displayValue(point.strategy_template)+'</b><span>风险/动作</span><b>'+riskText+'</b><span>入场质量</span><b>'+displayValue(point.entry_quality)+' / '+fmtScore(point.entry_quality_score)+'</b><span>风控分</span><b>'+fmtScore(point.risk_control_score)+'</b><span>入场</span><b>'+displayValue(point.entry)+'</b><span>止损/止盈</span><b>'+displayValue(point.stop_loss)+' / '+displayValue(point.take_profit)+'</b><span>等待条件</span><b>'+waitFor+'</b><span>信号</span><b>'+signals+'</b><span>数据质量</span><b>'+qualityText+'</b><span>预热</span><b>'+warmup+'</b><span>OI</span><b>'+fmt(point.open_interest,2)+'</b><span>OI 15m</span><b>'+fmtPct(point.oi_change_pct_15m)+'</b><span>资金费率</span><b>'+fmt(point.funding_rate,6)+' / 变化 '+fmt(point.funding_change,6)+'</b><span>多头/空头</span><b>'+longShort+'</b><span>放量</span><b>'+volumeText+'</b><span>ATR 15m</span><b>'+fmt(point.atr_pct_15m,4)+'% / '+displayValue(point.volatility_regime)+'</b><span>盘口</span><b>'+bookText+'</b><span>分层</span><b>'+summarizeLayers(point.layer_scores)+'</b></div>';}}
+	function snapshotHtml(point,title){{if(!point)return '<strong>Snapshot</strong><div class="snapshot-grid"><span>价格</span><b>--</b><span>时间</span><b>--</b><span>评分</span><b>--</b><span>方向</span><b>--</b></div>';const hasMetrics=point.raw_total_score!==undefined&&point.raw_total_score!==null,kind=point.kind==='history'?(hasMetrics?'历史K线+日志指标':'历史K线'):'实时快照',dir=(point.raw_direction&&point.final_direction&&point.raw_direction!==point.final_direction)?(point.raw_direction+' → '+point.final_direction):(point.final_direction||point.direction||'--'),scoreText='综合 '+fmtScore(point.score)+' / 观察 '+fmtScore(point.raw_total_score)+' / 交易 '+fmtScore(point.final_trade_score),riskText=(point.market_risk_level||point.risk_level||'--')+' / '+(point.trade_action_level||'--'),lsAvail=point.long_short_available===false?'不可用':'可用',longShort=fmt(Number(point.long_ratio)*100,1)+'/'+fmt(Number(point.short_ratio)*100,1)+'% ('+lsAvail+')',warmup='OI '+fmtBool(point.oi_warmup_ready)+' / 费率 '+fmtBool(point.funding_warmup_ready),volumeText=fmt(point.volume_multiplier,2)+'x / 阈值 '+fmt(point.volume_threshold_used,2)+'x / '+displayValue(point.volume_direction)+'/'+displayValue(point.volume_trend),bookText=fmtSignedPct(Number(point.order_book_imbalance)*100,1)+' / top5 '+fmtSignedPct(Number(point.order_book_imbalance_5)*100,1)+' / spread '+fmt(point.spread_pct,4)+'%',qualityText=(point.data_quality_reliable===true?'可靠':(point.data_quality_reliable===false?'不足':'--'))+' / 15m确认K '+displayValue(point.data_quality_count),signals=compactList(point.signals,4),waitFor=compactList(point.wait_for,3);return '<strong>'+title+' · '+kind+'</strong><div class="snapshot-grid"><span>时间</span><b>'+compactTime(point.time)+'</b><span>价格</span><b>'+fmt(point.price,2)+'</b><span>分数</span><b>'+scoreText+'</b><span>方向</span><b>'+dir+'</b><span>模拟账户</span><b>'+(point.paper_equity!=null?formatPaperAccount({{equity:point.paper_equity,pnl_usd:point.paper_pnl_usd,pnl_pct:point.paper_pnl_pct,position_label:point.paper_position}}):'--')+'</b><span>市场/策略</span><b>'+displayValue(point.market_regime)+' / '+displayValue(point.strategy_template)+'</b><span>风险/动作</span><b>'+riskText+'</b><span>入场质量</span><b>'+displayValue(point.entry_quality)+' / '+fmtScore(point.entry_quality_score)+'</b><span>风控分</span><b>'+fmtScore(point.risk_control_score)+'</b><span>入场</span><b>'+displayValue(point.entry)+'</b><span>止损/止盈</span><b>'+displayValue(point.stop_loss)+' / '+displayValue(point.take_profit)+'</b><span>等待条件</span><b>'+waitFor+'</b><span>信号</span><b>'+signals+'</b><span>数据质量</span><b>'+qualityText+'</b><span>预热</span><b>'+warmup+'</b><span>OI</span><b>'+fmt(point.open_interest,2)+'</b><span>OI 15m</span><b>'+fmtPct(point.oi_change_pct_15m)+'</b><span>资金费率</span><b>'+fmt(point.funding_rate,6)+' / 变化 '+fmt(point.funding_change,6)+'</b><span>多头/空头</span><b>'+longShort+'</b><span>放量</span><b>'+volumeText+'</b><span>ATR 15m</span><b>'+fmt(point.atr_pct_15m,4)+'% / '+displayValue(point.volatility_regime)+'</b><span>盘口</span><b>'+bookText+'</b><span>分层</span><b>'+summarizeLayers(point.layer_scores)+'</b></div>';}}
 function updateSnapshotPanel(point,title){{const panel=document.getElementById('snapshotPanel');if(panel)panel.innerHTML=snapshotHtml(point,title||'Snapshot');}}
 function drawTimeAxis(x,W,H,p,points,cw){{if(!points||points.length<2)return;const maxLabels=Math.max(2,Math.min(8,Math.floor(W/150))),step=Math.max(1,Math.floor((points.length-1)/(maxLabels-1)));x.fillStyle='rgba(229,231,235,.9)';x.font='12px Segoe UI, Microsoft YaHei, Arial';x.textAlign='center';x.textBaseline='top';for(let i=0;i<points.length;i+=step){{const px=p.l+cw*i/(points.length-1);x.fillText(shortTime(points[i].time),px,H-24);}}const lastIndex=points.length-1;if((lastIndex%step)!==0){{x.fillText(shortTime(points[lastIndex].time),W-p.r,H-24);}}}}
+function drawAccuracyTimeAxis(x,W,H,p,points,cw){{if(!points||points.length<2)return;const spanHours=accuracySpanHours(points),maxLabels=Math.max(2,Math.min(10,Math.floor(W/110))),step=Math.max(1,Math.floor((points.length-1)/(maxLabels-1)));x.fillStyle='rgba(229,231,235,.9)';x.font='12px Segoe UI, Microsoft YaHei, Arial';x.textAlign='center';x.textBaseline='top';for(let i=0;i<points.length;i+=step){{const px=p.l+cw*i/(points.length-1);x.fillText(accuracyTimeLabel(points[i].time,spanHours),px,H-24);}}const lastIndex=points.length-1;if((lastIndex%step)!==0){{x.fillText(accuracyTimeLabel(points[lastIndex].time,spanHours),W-p.r,H-24);}}}}
 function drawPriceAxis(x,W,H,p,mn,mx){{x.fillStyle='rgba(229,231,235,.82)';x.font='12px Segoe UI, Microsoft YaHei, Arial';x.textAlign='right';x.textBaseline='middle';for(let i=0;i<=4;i++){{const value=mx-(mx-mn)*i/4,y=p.t+(H-p.t-p.b)*i/4;x.fillText(value.toFixed(2),W-8,y);}}}}
-function clearChartMessage(text){{const c=document.getElementById('monitorChart'),l=document.getElementById('monitorLoading'),p=document.getElementById('monitorPrice'),m=document.getElementById('monitorMeta'),t=document.getElementById('monitorTitle');monitorSelectedKey='';monitorVisiblePoints=[];monitorPlotPoints=[];monitorLatestPoint=null;if(c){{const r=c.getBoundingClientRect(),x=c.getContext('2d');c.width=Math.max(1,r.width);c.height=Math.max(1,r.height);x.clearRect(0,0,r.width,r.height);}}if(l){{l.style.display='grid';l.textContent=text;}}if(p)p.innerHTML='<strong>--</strong><span>无数据</span>';if(m)m.textContent=text;if(t)t.textContent='未配置币种';updateChartFooter([]);updateSnapshotPanel(null,'Snapshot');}}
+function clearChartMessage(text){{const c=document.getElementById('monitorChart'),l=document.getElementById('monitorLoading'),p=document.getElementById('monitorPrice'),m=document.getElementById('monitorMeta'),t=document.getElementById('monitorTitle');monitorSelectedKey='';monitorVisiblePoints=[];monitorPlotPoints=[];monitorLatestPoint=null;if(c){{const r=c.getBoundingClientRect(),x=c.getContext('2d');c.width=Math.max(1,r.width);c.height=Math.max(1,r.height);x.clearRect(0,0,r.width,r.height);}}if(l){{l.style.display='grid';l.textContent=text;}}if(p)p.innerHTML='<strong>--</strong><span>无数据</span>';if(m)m.textContent=text;if(t)t.textContent='未配置币种';updateChartFooter([]);updatePaperAccount(null);updateSnapshotPanel(null,'Snapshot');}}
 function drawChart(id,points,priceBox,metaBox,loading){{const c=document.getElementById(id);if(!c||!points||points.length<1)return;if(points.length===1)points=[points[0],{{time:points[0].time,price:points[0].price}}];monitorLatestPoint=points[points.length-1];points=visiblePoints(points);monitorVisiblePoints=points;updateChartFooter(points);if(loading)loading.style.display='none';const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=r.width*d;c.height=r.height*d;const x=c.getContext('2d');x.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,p={{l:34,r:74,t:18,b:58}},cw=W-p.l-p.r,ch=H-p.t-p.b,prices=points.map(q=>q.price);let mn=Math.min(...prices),mx=Math.max(...prices);const rawCenter=(mn+mx)/2,baseRg=Math.max(.01,(mx-mn)*1.16),center=rawCenter+monitorYPan,rg=baseRg/monitorYZoom;monitorYRange=rg;mn=center-rg/2;mx=center+rg/2;monitorPlotPoints=[];x.clearRect(0,0,W,H);x.strokeStyle='rgba(255,255,255,.12)';for(let i=0;i<=4;i++){{const y=p.t+ch*i/4;x.beginPath();x.moveTo(p.l,y);x.lineTo(W-p.r,y);x.stroke();}}x.beginPath();points.forEach((q,i)=>{{const px=p.l+cw*i/(points.length-1),py=p.t+ch-((q.price-mn)/rg)*ch;monitorPlotPoints.push({{x:px,y:py,point:q}});if(i===0)x.moveTo(px,py);else x.lineTo(px,py);}});const up=points[points.length-1].price>=points[0].price;x.strokeStyle=up?'#fb7185':'#22c55e';x.lineWidth=2;x.stroke();x.fillStyle=up?'rgba(251,113,133,.10)':'rgba(34,197,94,.08)';x.lineTo(W-p.r,H-p.b);x.lineTo(p.l,H-p.b);x.closePath();x.fill();drawTimeAxis(x,W,H,p,points,cw);drawPriceAxis(x,W,H,p,mn,mx);if(monitorSelectedKey){{const hit=monitorPlotPoints.find(o=>(o.point.time||'')===monitorSelectedKey);if(hit){{x.strokeStyle='rgba(255,255,255,.62)';x.setLineDash([4,5]);x.beginPath();x.moveTo(hit.x,p.t);x.lineTo(hit.x,H-p.b);x.stroke();x.beginPath();x.moveTo(p.l,hit.y);x.lineTo(W-p.r,hit.y);x.stroke();x.setLineDash([]);x.fillStyle='#60a5fa';x.beginPath();x.arc(hit.x,hit.y,5,0,7);x.fill();updateSnapshotPanel(hit.point,'选中点');}}else{{monitorSelectedKey='';updateSnapshotPanel(monitorLatestPoint,'最新快照');}}}}if(priceBox){{const first=points[0].price,last=points[points.length-1].price,chg=last-first,pct=first?chg/first*100:0;priceBox.classList.toggle('up',chg>=0);priceBox.classList.toggle('down',chg<0);priceBox.innerHTML='<strong>'+last.toFixed(2)+'</strong><span>'+(chg>=0?'+':'')+chg.toFixed(2)+' / '+(pct>=0?'+':'')+pct.toFixed(2)+'%</span>';}}if(!monitorSelectedKey)updateSnapshotPanel(monitorLatestPoint,'最新快照');if(metaBox)metaBox.textContent='更新：'+new Date().toLocaleTimeString();}}
 function drawVirtualMonitor(){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}drawChart('monitorChart',nextVirtualSeries(),document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));document.getElementById('monitorTitle').textContent=monitorInst+' 虚拟走势';const m=document.getElementById('monitorMeta');if(m)m.textContent='虚拟行情预览 · 点击开始监控后切换真实数据';}}
 function setMonitorButtonState(state,text){{const btn=document.getElementById('monitorToggleBtn'),meta=document.getElementById('monitorMeta');if(!btn)return;btn.classList.remove('is-running','is-starting');btn.disabled=false;if(state==='starting'){{btn.classList.add('is-starting');btn.textContent='启动中...';btn.disabled=true;if(meta)meta.textContent=text||'正在启动监控进程...';}}else if(state==='running'){{btn.classList.add('is-running');btn.textContent='停止监控';if(meta&&text)meta.textContent=text;}}else if(state==='stopping'){{btn.classList.add('is-starting');btn.textContent='停止中...';btn.disabled=true;if(meta)meta.textContent=text||'正在停止监控进程...';}}else{{btn.textContent='开始监控';if(meta&&text)meta.textContent=text;}}}}
 async function syncMonitorStatus(){{try{{const r=await fetch('/api/status',{{cache:'no-store'}}),p=await r.json();updateMonitorUptime(p);setMonitorButtonState(p.running?'running':'stopped',p.text||'');if(p.running&&!monitorWasRunning&&typeof switchAccuracyToLiveSession==='function')switchAccuracyToLiveSession();monitorWasRunning=!!p.running;return p;}}catch(e){{return null;}}}}
 function showRealtimeWaiting(clearChart){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}monitorLiveMode=true;const c=document.getElementById('monitorChart'),l=document.getElementById('monitorLoading'),m=document.getElementById('monitorMeta'),t=document.getElementById('monitorTitle'),p=document.getElementById('monitorPrice');if(clearChart&&c){{const r=c.getBoundingClientRect(),x=c.getContext('2d');c.width=Math.max(1,r.width);c.height=Math.max(1,r.height);x.clearRect(0,0,r.width,r.height);updateChartFooter([]);}}if(l){{l.style.display=clearChart?'grid':'none';l.textContent='监控已启动，正在等待真实价格数据...';}}if(m)m.textContent=clearChart?'实时监控已启动 · 等待第一条价格数据':'已获取最新价 · 等待完整分析数据';if(t)t.textContent=monitorInst+' 实时走势';if(clearChart&&p)p.innerHTML='<strong>--</strong><span>等待真实数据</span>';}}
-async function fetchMonitor(){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return null;}}try{{const r=await fetch('/api/monitor-data?inst_id='+encodeURIComponent(monitorInst),{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false){{clearChartMessage(p.error||'当前币种未配置，不能读取监控数据');return p;}}if(!p.running){{monitorLiveMode=false;monitorSeriesByInst[monitorInst]=[];drawVirtualMonitor();return p;}}monitorLiveMode=true;if(p.points&&p.points.length>0){{setMonitorSeries(p.points);const hasChart=p.source==='web-chart'||p.source==='signal-monitor-chart';document.getElementById('monitorTitle').textContent=monitorInst+(hasChart?' 1m K线走势':' 实时走势');const meta=p.source==='web-chart'?'Web获取1m K线 · 指标读取okx_signal_monitor.py日志':(p.source==='signal-monitor-chart'?'okx_signal_monitor.py 1m K线兜底 · 指标读取日志':'读取okx_signal_monitor.py实时日志 · 等待K线');drawMonitorSeries(meta+' · '+new Date().toLocaleTimeString());}}else if(!drawMonitorSeries('保留最近走势 · 等待K线/日志')){{showRealtimeWaiting(false);}}return p;}}catch(e){{if(monitorLiveMode){{if(!drawMonitorSeries('保留最近走势 · 等待K线/日志'))showRealtimeWaiting(false);}}else drawVirtualMonitor();return null;}}}}
+async function fetchMonitor(){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return null;}}try{{const r=await fetch('/api/monitor-data?inst_id='+encodeURIComponent(monitorInst),{{cache:'no-store'}}),p=await r.json();updatePaperAccount(p.paper_account||null);if(!r.ok||p.ok===false){{clearChartMessage(p.error||'当前币种未配置，不能读取监控数据');return p;}}if(!p.running){{monitorLiveMode=false;monitorSeriesByInst[monitorInst]=[];updatePaperAccount(null);drawVirtualMonitor();return p;}}monitorLiveMode=true;if(p.points&&p.points.length>0){{setMonitorSeries(p.points);const hasChart=p.source==='web-chart'||p.source==='signal-monitor-chart';document.getElementById('monitorTitle').textContent=monitorInst+(hasChart?' 1m K线走势':' 实时走势');const meta=p.source==='web-chart'?'Web获取1m K线 · 指标读取okx_signal_monitor.py日志':(p.source==='signal-monitor-chart'?'okx_signal_monitor.py 1m K线兜底 · 指标读取日志':'读取okx_signal_monitor.py实时日志 · 等待K线');drawMonitorSeries(meta+' · '+new Date().toLocaleTimeString());}}else if(!drawMonitorSeries('保留最近走势 · 等待K线/日志')){{showRealtimeWaiting(false);}}return p;}}catch(e){{if(monitorLiveMode){{if(!drawMonitorSeries('保留最近走势 · 等待K线/日志'))showRealtimeWaiting(false);}}else drawVirtualMonitor();return null;}}}}
 function sleep(ms){{return new Promise(resolve=>setTimeout(resolve,ms));}}
 async function bootstrapMonitorChart(){{monitorLastTickerAt=0;for(let i=0;i<16;i++){{const payload=await fetchMonitor();if(payload&&(payload.source==='web-chart'||payload.source==='signal-monitor-chart')&&payload.points&&payload.points.length>0)break;await sleep(i<4?500:1000);}}}}
 function redrawMonitorCached(){{if(drawMonitorSeries())return;const series=virtualSeriesByInst[monitorInst]||[];if(series.length){{drawChart('monitorChart',series,document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));document.getElementById('monitorTitle').textContent=monitorInst+' 虚拟走势';}}else{{drawVirtualMonitor();}}}}
@@ -2355,6 +2753,55 @@ function syncAnalysisLogUi(){{const sw=document.getElementById('analysisLogSwitc
 async function setAnalysisLogEnabled(enabled){{analysisLogEnabled=!!enabled;syncAnalysisLogUi();try{{await autoSaveConfig();refreshLogs(true);refreshConsoleLogs(true);}}catch(e){{analysisLogEnabled=!enabled;syncAnalysisLogUi();alert('保存日志开关失败：'+e);}}}}
 async function refreshLogs(force){{const box=document.getElementById('logWindow');if(!box)return;if(logCleared&&!force)return;try{{const r=await fetch('/api/logs',{{cache:'no-store'}}),p=await r.json();if(typeof p.enabled==='boolean'){{analysisLogEnabled=p.enabled;syncAnalysisLogUi();}}logCleared=false;box.value=p.text||'暂无日志。';box.scrollTop=box.scrollHeight;}}catch(e){{box.value='日志读取失败：'+e;}}}}
 async function refreshConsoleLogs(force){{const box=document.getElementById('consoleLogWindow');if(!box)return;if(consoleLogCleared&&!force)return;try{{const r=await fetch('/api/console-logs',{{cache:'no-store'}}),p=await r.json();if(typeof p.enabled==='boolean'){{analysisLogEnabled=p.enabled;syncAnalysisLogUi();}}consoleLogCleared=false;box.value=p.text||'暂无控制台日志。';box.scrollTop=box.scrollHeight;}}catch(e){{box.value='控制台日志读取失败：'+e;}}}}
+function showConnectivityNotice(text, ok) {{
+  const box = document.getElementById('connectivityTestNotice');
+  if (!box) return;
+  if (!text) {{
+    box.hidden = true;
+    box.textContent = '';
+    return;
+  }}
+  box.hidden = false;
+  box.className = ok ? 'notice' : 'notice notice-error';
+  box.textContent = text;
+}}
+async function runConnectivityTest(kind) {{
+  const aiBtn = document.getElementById('testAiBtn');
+  const pushBtn = document.getElementById('testPushBtn');
+  const btn = kind === 'ai' ? aiBtn : pushBtn;
+  const label = kind === 'ai' ? '测试AI' : '测试微信推送';
+  if (btn) {{
+    btn.disabled = true;
+    btn.textContent = '测试中...';
+  }}
+  showConnectivityNotice('正在保存配置并测试 ' + label + '...', true);
+  try {{
+    await autoSaveConfig();
+    const url = kind === 'ai' ? '/api/test-ai' : '/api/test-push';
+    const response = await fetch(url, {{ cache: 'no-store' }});
+    const payload = await response.json();
+    const message = payload.message || payload.error || '未知结果';
+    showConnectivityNotice(message, !!payload.ok);
+    if (!response.ok || payload.ok === false) alert(message);
+  }} catch (error) {{
+    const message = label + '失败：' + error;
+    showConnectivityNotice(message, false);
+    alert(message);
+  }} finally {{
+    if (btn) {{
+      btn.disabled = false;
+      btn.textContent = label;
+    }}
+  }}
+}}
+const testAiBtn = document.getElementById('testAiBtn');
+if (testAiBtn) {{
+  testAiBtn.addEventListener('click', function() {{ runConnectivityTest('ai'); }});
+}}
+const testPushBtn = document.getElementById('testPushBtn');
+if (testPushBtn) {{
+  testPushBtn.addEventListener('click', function() {{ runConnectivityTest('push'); }});
+}}
 const analysisLogSwitch=document.getElementById('analysisLogSwitch');
 if(analysisLogSwitch){{analysisLogSwitch.addEventListener('change',function(){{setAnalysisLogEnabled(analysisLogSwitch.checked);}});}}
 syncAnalysisLogUi();
@@ -2573,6 +3020,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "message": open_log_dir(), "path": str(LOG_DIR)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc), "path": str(LOG_DIR)}, status=500)
+        elif path == "/api/test-ai":
+            result = test_ai_connection()
+            self.send_json(result, status=200 if result.get("ok") else 400)
+        elif path == "/api/test-push":
+            result = test_push_connection()
+            self.send_json(result, status=200 if result.get("ok") else 400)
         elif path == "/config-json":
             content = f"<pre>{esc(active_config_file().read_text(encoding='utf-8-sig'))}</pre>".encode("utf-8")
             self.send_html(content)
@@ -2581,9 +3034,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/stop":
             self.send_html(render_page(stop_monitor()))
         elif path == "/test-ai":
-            self.send_html(render_page(test_ai_connection()))
+            result = test_ai_connection()
+            self.send_html(render_page(result["message"]))
         elif path == "/test-push":
-            self.send_html(render_page(test_push_connection()))
+            result = test_push_connection()
+            self.send_html(render_page(result["message"]))
         else:
             self.send_error(404)
 
