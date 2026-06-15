@@ -26,6 +26,8 @@ Production tuning:
     export AI_CIRCUIT_FAIL_THRESHOLD=3
     export AI_CIRCUIT_COOLDOWN_SECONDS=120
     export AI_PROBE_INTERVAL_SECONDS=60
+    export AI_CALL_MIN_INTERVAL_SECONDS=60
+    export CONSOLE_VERBOSE=1
 """
 
 import argparse
@@ -70,7 +72,14 @@ DEFAULT_AI_CIRCUIT_COOLDOWN_SECONDS = 120
 DEFAULT_AI_PROBE_INTERVAL_SECONDS = 60
 DEFAULT_AI_RATE_LIMIT_BACKOFF_SECONDS = 30.0
 DEFAULT_PUSH_COOLDOWN_SECONDS = 900
+DEFAULT_AI_CALL_MIN_INTERVAL_SECONDS = 60
 DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024
+TRADE_TRIGGER_SIGNALS = frozenset(
+    {"volume_spike", "structure_break", "oi_change", "order_book_imbalance", "macd_momentum_change"}
+)
+WATCH_TRIGGER_SIGNALS = frozenset(
+    {"funding_hot", "rsi_extreme", "rsi_divergence", "boll_squeeze", "long_short_extreme", "funding_fast_change"}
+)
 WARMUP_MINUTES = 15
 HISTORY_RETENTION_MINUTES = 180
 METRIC_SAMPLE_INTERVAL_SECONDS = 60
@@ -100,6 +109,159 @@ REPLAY_DATASET_VERSION = "1.0"
 SIGNAL_PERFORMANCE_FILE = LOG_DIR / "signal_performance.jsonl"
 SIGNAL_PERFORMANCE_MAX_BYTES = 10 * 1024 * 1024
 SIGNAL_PERFORMANCE_LOAD_BYTES = 2 * 1024 * 1024
+
+
+def console_verbose_enabled() -> bool:
+    return os.getenv("CONSOLE_VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def console_debug(message: str) -> None:
+    if console_verbose_enabled():
+        print(message, flush=True)
+
+
+def console_info(message: str) -> None:
+    print(message, flush=True)
+
+
+def console_warn(message: str) -> None:
+    print(message, flush=True)
+
+
+def analysis_console_excerpt(analysis: Dict[str, Any], score: Dict[str, Any], limit: int = 96) -> str:
+    content = analysis.get("content")
+    if isinstance(content, str):
+        text = " ".join(content.split())
+        if text:
+            return text[:limit] + ("..." if len(text) > limit else "")
+    if isinstance(content, dict):
+        direction = content.get("direction") or score.get("direction", "-")
+        entry = content.get("entry")
+        parts = [f"dir={direction}"]
+        if entry and entry not in ("", "-"):
+            parts.append(f"entry={entry}")
+        return " ".join(parts)
+    provider = analysis.get("provider")
+    return str(provider) if provider else "-"
+
+
+DECISION_SOURCE_LABELS = {
+    "ai": "AI分析",
+    "local": "本地规则",
+    "local_fallback": "本地兜底",
+}
+
+
+def decision_source_prefix(final_decision: Dict[str, Any]) -> str:
+    source = str(final_decision.get("decision_source", "local") or "local")
+    label = DECISION_SOURCE_LABELS.get(source, source)
+    return f"【{label}】"
+
+
+def format_ai_call_status(trigger: Dict[str, Any], ai_enabled: bool) -> str:
+    level = str(trigger.get("level", "L0"))
+    reasons = trigger.get("reasons") if isinstance(trigger.get("reasons"), list) else []
+    reason_text = ",".join(str(item) for item in reasons[:4]) or "-"
+
+    if trigger.get("ai_invoked"):
+        return f"trigger={level} ai=已调用 原因={reason_text}"
+
+    if trigger.get("should_call_ai"):
+        return f"trigger={level} ai=待调用 原因={reason_text}"
+
+    if level in ("L0", "L1"):
+        return f"trigger={level} ai=未调用({level}不调AI) 信号={reason_text}"
+
+    if not ai_enabled:
+        return f"trigger={level} ai=未调用(ai_disabled) 触发条件={reason_text}"
+
+    if level == "L2":
+        return f"trigger={level} ai=未调用(同指纹冷却) 触发条件={reason_text}"
+
+    return f"trigger={level} ai=未调用 触发条件={reason_text}"
+
+
+def _clip_console_text(text: Any, limit: int = 160) -> str:
+    cleaned = " ".join(str(text or "").split())
+    if not cleaned:
+        return ""
+    return cleaned[:limit] + ("..." if len(cleaned) > limit else "")
+
+
+def format_ai_analysis_lines(
+    analysis: Dict[str, Any],
+    final_decision: Dict[str, Any],
+) -> List[str]:
+    lines: List[str] = []
+    if not analysis:
+        return lines
+
+    source = str(final_decision.get("decision_source", "") or "")
+    parsed = analysis.get("parsed") if isinstance(analysis.get("parsed"), dict) else {}
+
+    if source == "ai" and analysis.get("valid_json") and parsed:
+        parts = [
+            f"方向={parsed.get('direction', '-')}",
+            f"置信度={final_decision.get('confidence', '-')}",
+            f"推送={final_decision.get('push_recommendation', 'none')}",
+        ]
+        for key, label in (
+            ("entry", "入场"),
+            ("stop_loss", "止损"),
+            ("take_profit", "止盈"),
+            ("risk_level", "风险"),
+        ):
+            value = parsed.get(key)
+            if value not in (None, "", "-"):
+                parts.append(f"{label}={value}")
+        lines.append(f"  AI结论: {' | '.join(parts)}")
+
+        audit = parsed.get("rule_audit") if isinstance(parsed.get("rule_audit"), dict) else {}
+        audit_overall = audit.get("overall")
+        if audit_overall:
+            lines.append(f"  AI审计: {audit_overall}")
+
+        reasons = parsed.get("reasons")
+        if isinstance(reasons, list) and reasons:
+            lines.append(f"  AI理由: {_clip_console_text('; '.join(str(item) for item in reasons[:3]), 180)}")
+
+        suggestion = parsed.get("suggestion") or parsed.get("score_comment")
+        if suggestion:
+            lines.append(f"  AI建议: {_clip_console_text(suggestion, 180)}")
+        return lines
+
+    if source == "local_fallback" or analysis.get("error") or analysis.get("validation_errors"):
+        fail_parts: List[str] = []
+        if analysis.get("validation_errors"):
+            fail_parts.append(
+                "校验失败: "
+                + ", ".join(str(item) for item in (analysis.get("validation_errors") or [])[:3])
+            )
+        if analysis.get("error"):
+            fail_parts.append(f"错误={analysis.get('error')}")
+        content = analysis.get("content")
+        if isinstance(content, str) and content.strip():
+            fail_parts.append(_clip_console_text(content, 140))
+        if fail_parts:
+            lines.append("  AI失败: " + " | ".join(fail_parts))
+
+    return lines
+
+
+def format_local_decision_line(final_decision: Dict[str, Any]) -> str:
+    parts = [
+        f"方向={final_decision.get('direction', '-')}",
+        f"置信度={final_decision.get('confidence', '-')}",
+        f"推送={final_decision.get('push_recommendation', 'none')}",
+    ]
+    for key, label in (("entry", "入场"), ("stop_loss", "止损"), ("take_profit", "止盈")):
+        value = final_decision.get(key)
+        if value not in (None, "", "-"):
+            parts.append(f"{label}={value}")
+    summary = final_decision.get("summary")
+    if summary:
+        parts.append(f"摘要={_clip_console_text(summary, 80)}")
+    return "  本地结论: " + " | ".join(parts)
 
 
 STRATEGY_PROFILES = {
@@ -203,6 +365,9 @@ class RuntimeConfig:
     # 单个日志文件最大字节数，超过后轮转成 .1 文件。
     log_max_bytes: int = DEFAULT_LOG_MAX_BYTES
 
+    # 是否写入 JSON 分析日志与每轮控制台摘要；回放模式不受此开关影响。
+    analysis_log_enabled: bool = False
+
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -253,13 +418,33 @@ def load_replay_dataset(path: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]
 def replay_dataset_stats(path: Path) -> Dict[str, Any]:
     if not path.exists():
         return {"exists": False, "path": str(path), "frame_count": 0, "inst_ids": [], "interval_seconds": 0}
-    meta, frames = load_replay_dataset(path)
-    inst_ids = sorted({str(frame.get("inst_id", "")) for frame in frames if frame.get("inst_id")})
+    meta: Dict[str, Any] = {}
+    frame_count = 0
+    inst_ids = set()
+    with path.open("r", encoding="utf-8-sig") as file:
+        for line in file:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            item_type = item.get("type")
+            if item_type == "meta":
+                meta = item
+            elif item_type == "frame":
+                frame_count += 1
+                inst_id = str(item.get("inst_id", "") or "")
+                if inst_id:
+                    inst_ids.add(inst_id)
+    if frame_count <= 0:
+        return {"exists": False, "path": str(path), "frame_count": 0, "inst_ids": [], "interval_seconds": 0}
     return {
         "exists": True,
         "path": str(path),
-        "frame_count": len(frames),
-        "inst_ids": inst_ids,
+        "frame_count": frame_count,
+        "inst_ids": sorted(inst_ids),
         "interval_seconds": int(meta.get("interval_seconds") or 0),
         "recorded_at": str(meta.get("recorded_at") or ""),
         "version": str(meta.get("version") or REPLAY_DATASET_VERSION),
@@ -552,7 +737,7 @@ def retry_call(label: str, func: Any, retry_times: int, retry_backoff: float) ->
             if attempt >= retry_times:
                 break
             sleep_seconds = retry_backoff * attempt
-            print(f"[{now_text()}] {label} failed, retry {attempt}/{retry_times}: {exc}")
+            console_debug(f"[{now_text()}] {label} failed, retry {attempt}/{retry_times}: {exc}")
             time.sleep(sleep_seconds)
     raise RuntimeError(f"{label} failed after {retry_times} retries: {last_error}")
 
@@ -945,8 +1130,8 @@ def env_int(name: str, default: int) -> int:
 class OkxAiShortTermAssistant:
     """OKX短线助手主类。
 
-    这个类串起完整流程：
-    采集OKX数据 -> 检测异常信号 -> 规则评分 -> 可选AI分析 -> 可选推送 -> 写日志。
+    流程：采集 -> 本地触发预筛 -> 按需 AI 深分析 -> merge final_decision -> 推送/跟踪/写日志。
+    本地 score 仅作触发参考与 AI 不可用时的 fallback；推送与 Web 展示以 final_decision 为准。
     """
 
     def __init__(
@@ -1008,6 +1193,8 @@ class OkxAiShortTermAssistant:
         self.ai_fail_streak = 0
         self.ai_circuit_open_until = 0.0
         self.ai_last_probe_at = 0.0
+        self.last_ai_call_at: Dict[str, float] = {}
+        self.last_ai_fingerprint: Dict[str, str] = {}
 
         # 回放/录制：录制保存 collect_snapshot 原始输入；回放时注入同一套 collect/analyze 链路。
         self.replay_mode = False
@@ -1297,9 +1484,8 @@ class OkxAiShortTermAssistant:
         context = snapshot.get("market_context", {})
         volatility = snapshot.get("volatility", {})
         signal_types = {item["type"] for item in signals}
-        raw_direction = {"long": "做多", "short": "做空"}.get(context.get("bias"), "观望")
-
         strategy_profile = self._strategy_profile()
+        raw_direction = self._raw_direction_for_mode(snapshot, context)
         layer_scores = self._layer_scores(snapshot, signals, raw_direction, trends)
         trend_score = min(50, layer_scores["trend_score"] + layer_scores["momentum_score"])
         capital_score = min(30, layer_scores["volume_price_score"] + layer_scores["derivatives_score"] + layer_scores["orderbook_score"])
@@ -1314,7 +1500,7 @@ class OkxAiShortTermAssistant:
         if direction_guard:
             final_direction = "\u89c2\u671b"
         entry_plan = self._suggest_levels(snapshot, final_direction)
-        if not direction_guard and entry_plan["quality"] in ("no_trade", "wait_confirmation") and raw_total_score < 88:
+        if self._should_downgrade_direction(direction_guard, entry_plan, raw_total_score):
             final_direction = "观望"
             entry_plan = self._suggest_levels(snapshot, final_direction)
         final_trade_score = raw_total_score if final_direction in ("做多", "做空") else 0
@@ -1357,18 +1543,8 @@ class OkxAiShortTermAssistant:
         score["strategy_views"] = strategy_views
         selected = strategy_views.get(strategy_profile["mode"], {})
         score["selected_strategy_view"] = selected
-        if selected:
-            score["trade_action_level"] = selected.get("action_level", score["trade_action_level"])
-            score["holding_time"] = selected.get("holding_time", strategy_profile.get("holding_time"))
-            if strategy_profile["mode"] == "scalp" and selected.get("trade_allowed"):
-                score["direction"] = selected.get("direction", score["direction"])
-                score["final_direction"] = score["direction"]
-                if selected.get("entry") not in (None, ""):
-                    score["entry"] = selected.get("entry")
-                    score["stop_loss"] = selected.get("stop_loss")
-                    score["take_profit"] = selected.get("take_profit")
-                score["final_trade_score"] = selected.get("trade_score", score["final_trade_score"])
-                score["total_score"] = selected.get("score", score["total_score"])
+        if selected and strategy_profile["mode"] == self._strategy_mode():
+            self._apply_selected_strategy_view(score, strategy_profile, selected)
         return score
 
     def _layer_scores(
@@ -1562,6 +1738,328 @@ class OkxAiShortTermAssistant:
     def _risk_adjustment(self) -> float:
         return {"conservative": 1.15, "standard": 1.0, "aggressive": 0.9}.get(self._risk_preference(), 1.0)
 
+    def _direction_confirm_score_floor(self) -> int:
+        """风险偏好决定「等待确认」时保留做多/做空所需的最低观察分。"""
+        return {"conservative": 88, "standard": 78, "aggressive": 65}.get(self._risk_preference(), 78)
+
+    def _scalp_move_thresholds(self) -> Tuple[float, float]:
+        factor = {"conservative": 1.15, "standard": 1.0, "aggressive": 0.82}.get(self._risk_preference(), 1.0)
+        threshold_5m = max(to_float(getattr(self.config, "scalp_move_pct_5m", 0.22)) * factor, 0.01)
+        threshold_10m = max(to_float(getattr(self.config, "scalp_move_pct_10m", 0.35)) * factor, 0.01)
+        return threshold_5m, threshold_10m
+
+    def _mode_allows_scalp_trade(self) -> bool:
+        return self._strategy_mode() == "scalp" or bool(getattr(self.config, "allow_scalp_trade", False))
+
+    def _scalp_raw_direction(self, snapshot: Dict[str, Any], context: Dict[str, Any]) -> str:
+        candles = snapshot.get("candles", {})
+        profiles = snapshot.get("trend_profiles", {})
+        threshold_5m, threshold_10m = self._scalp_move_thresholds()
+        move_5m = self._recent_move_pct(candles.get("1m", []), 5)
+        move_10m = self._recent_move_pct(candles.get("1m", []), 10)
+        drawdown_10m = self._recent_drawdown_pct(candles.get("1m", []), 10)
+        drawdown_15m = self._recent_drawdown_pct(candles.get("1m", []), 15)
+        rebound_10m = self._recent_rebound_pct(candles.get("1m", []), 10)
+        rebound_15m = self._recent_rebound_pct(candles.get("1m", []), 15)
+        trend_votes = [profiles.get(bar, {}).get("trend") for bar in ("1m", "3m", "5m")]
+        up_votes = trend_votes.count("up")
+        down_votes = trend_votes.count("down")
+        recent_pressure = context.get("recent_price_pressure", "neutral")
+        long_breakout = move_5m >= threshold_5m or move_10m >= threshold_10m or up_votes >= 2
+        short_breakdown = move_5m <= -threshold_5m or move_10m <= -threshold_10m or down_votes >= 2
+        long_rebound = recent_pressure != "down" and up_votes >= 1 and (
+            rebound_10m >= threshold_5m * 0.55 or rebound_15m >= threshold_10m * 0.50
+        )
+        short_rollover = recent_pressure != "up" and down_votes >= 1 and (
+            drawdown_10m <= -threshold_5m * 0.55 or drawdown_15m <= -threshold_10m * 0.50
+        )
+        long_strength = max(move_5m, move_10m, rebound_10m, rebound_15m)
+        short_strength = max(-move_5m, -move_10m, -drawdown_10m, -drawdown_15m)
+        direction = "观望"
+        if long_breakout or long_rebound:
+            direction = "做多"
+        if (short_breakdown or short_rollover) and short_strength >= long_strength * 0.85:
+            direction = "做空"
+        trend_15m = profiles.get("15m", {}).get("trend")
+        if direction == "做多" and trend_15m == "down" and move_5m < threshold_5m * 1.35:
+            direction = "观望"
+        if direction == "做空" and trend_15m == "up" and move_5m > -threshold_5m * 1.35:
+            direction = "观望"
+        return direction
+
+    def _swing_move_thresholds(self, snapshot: Dict[str, Any]) -> Tuple[float, float]:
+        """中线动量阈值：30/60 分钟涨跌幅，结合 15m ATR 与风险偏好。"""
+        volatility = snapshot.get("volatility", {})
+        atr_pct_15m = max(to_float(volatility.get("atr_pct_15m")), 0.12)
+        factor = self._risk_adjustment()
+        threshold_30m = max(0.18, atr_pct_15m * 0.55) * factor
+        threshold_60m = max(0.28, atr_pct_15m * 0.85) * factor
+        return threshold_30m, threshold_60m
+
+    def _swing_direction_meta(self, snapshot: Dict[str, Any], context: Dict[str, Any]) -> Tuple[str, str, str]:
+        profiles = snapshot.get("trend_profiles", {})
+        candles = snapshot.get("candles", {})
+        trend_1h = profiles.get("1H", {}).get("trend")
+        trend_4h = profiles.get("4H", {}).get("trend")
+        trend_15m = profiles.get("15m", {}).get("trend")
+        if trend_1h == trend_4h == "up":
+            return "做多", "aligned", "1H/4H趋势同向偏多，中线关注结构回踩后的延伸机会。"
+        if trend_1h == trend_4h == "down":
+            return "做空", "aligned", "1H/4H趋势同向偏空，中线关注反抽不过后的延伸机会。"
+
+        threshold_30m, threshold_60m = self._swing_move_thresholds(snapshot)
+        move_30m = self._recent_move_pct(candles.get("1m", []), 30)
+        move_60m = self._recent_move_pct(candles.get("1m", []), 60)
+        pressure = context.get("recent_price_pressure", "neutral")
+        trade_up = int(context.get("trade_up", 0) or 0)
+        trade_down = int(context.get("trade_down", 0) or 0)
+        bias = context.get("bias", "neutral")
+        regime = context.get("regime", "")
+
+        long_structural = (
+            trend_1h in ("up", "mixed")
+            and trend_15m == "up"
+            and trend_4h != "down"
+            and (trade_up >= 1 or pressure == "up" or bias == "long")
+        )
+        short_structural = (
+            trend_1h in ("down", "mixed")
+            and trend_15m == "down"
+            and trend_4h != "up"
+            and (trade_down >= 1 or pressure == "down" or bias == "short")
+        )
+        long_move = max(move_30m, move_60m)
+        short_move = abs(min(move_30m, move_60m))
+
+        if long_structural:
+            if long_move >= threshold_30m:
+                return (
+                    "做多",
+                    "developing",
+                    f"1H/15m转多且30-60分钟涨幅约{long_move:.2f}%，4H仍在同步中。",
+                )
+            return "做多", "developing", "1H领先、15m确认转多，4H仍在同步中，关注延伸而非追极致。"
+
+        if short_structural:
+            if short_move >= threshold_30m:
+                return (
+                    "做空",
+                    "developing",
+                    f"1H/15m转空且30-60分钟跌幅约{short_move:.2f}%，4H仍在同步中。",
+                )
+            return "做空", "developing", "1H领先、15m确认转空，4H仍在同步中，关注延伸而非追极致。"
+
+        long_momentum = (
+            long_move >= threshold_30m
+            and trend_1h != "down"
+            and trend_15m in ("up", "mixed")
+            and pressure != "down"
+            and (bias == "long" or regime in ("trend_up", "mixed"))
+        )
+        short_momentum = (
+            short_move >= threshold_30m
+            and trend_1h != "up"
+            and trend_15m in ("down", "mixed")
+            and pressure != "up"
+            and (bias == "short" or regime in ("trend_down", "mixed"))
+        )
+        if long_momentum and long_move >= threshold_60m * 0.85:
+            return "做多", "momentum", f"30-60分钟强势上行约{long_move:.2f}%，按中线动量跟踪。"
+        if short_momentum and short_move >= threshold_60m * 0.85:
+            return "做空", "momentum", f"30-60分钟强势下行约{short_move:.2f}%，按中线动量跟踪。"
+        return "观望", "neutral", "1H/4H/15m尚未形成可跟踪的中线结构，继续观察。"
+
+    def _swing_raw_direction(self, snapshot: Dict[str, Any], context: Dict[str, Any]) -> str:
+        return self._swing_direction_meta(snapshot, context)[0]
+
+    def _swing_levels(self, snapshot: Dict[str, Any], direction: str) -> Dict[str, str]:
+        price = to_float(snapshot.get("price"))
+        profiles = snapshot.get("trend_profiles", {})
+        atr_1h = to_float(profiles.get("1H", {}).get("atr")) or price * 0.006
+        stop_gap = max(atr_1h * 0.55, price * 0.002)
+        target_gap = max(atr_1h * 0.95, price * 0.0035)
+        if direction == "做多":
+            return {
+                "entry": f"{price - stop_gap * 0.35:.2f} - {price + stop_gap * 0.25:.2f}",
+                "stop_loss": f"{price - stop_gap:.2f}",
+                "take_profit": f"{price + target_gap:.2f} / {price + target_gap * 1.8:.2f}",
+            }
+        if direction == "做空":
+            return {
+                "entry": f"{price - stop_gap * 0.25:.2f} - {price + stop_gap * 0.35:.2f}",
+                "stop_loss": f"{price + stop_gap:.2f}",
+                "take_profit": f"{price - target_gap:.2f} / {price - target_gap * 1.8:.2f}",
+            }
+        return {"entry": "-", "stop_loss": "-", "take_profit": "-"}
+
+    def _short_move_thresholds(self, snapshot: Dict[str, Any]) -> Tuple[float, float]:
+        """短线动量阈值：10/20 分钟涨跌幅，明显高于超短线 5/10 分钟脉冲。"""
+        volatility = snapshot.get("volatility", {})
+        atr_pct_15m = max(to_float(volatility.get("atr_pct_15m")), 0.10)
+        factor = self._risk_adjustment()
+        threshold_10m = max(0.12, atr_pct_15m * 0.40) * factor
+        threshold_20m = max(0.20, atr_pct_15m * 0.62) * factor
+        return threshold_10m, threshold_20m
+
+    def _short_direction_meta(self, snapshot: Dict[str, Any], context: Dict[str, Any]) -> Tuple[str, str, str]:
+        profiles = snapshot.get("trend_profiles", {})
+        candles = snapshot.get("candles", {})
+        trend_5m = profiles.get("5m", {}).get("trend")
+        trend_15m = profiles.get("15m", {}).get("trend")
+        trend_1h = profiles.get("1H", {}).get("trend")
+        bias = context.get("bias", "neutral")
+        pressure = context.get("recent_price_pressure", "neutral")
+        trade_up = int(context.get("trade_up", 0) or 0)
+        trade_down = int(context.get("trade_down", 0) or 0)
+        threshold_10m, threshold_20m = self._short_move_thresholds(snapshot)
+        move_10m = self._recent_move_pct(candles.get("1m", []), 10)
+        move_20m = self._recent_move_pct(candles.get("1m", []), 20)
+
+        if bias == "long" and (trade_up >= 1 or trend_15m == "up"):
+            return "做多", "bias", "市场偏多且5m/15m未背离，短线跟随结构。"
+        if bias == "short" and (trade_down >= 1 or trend_15m == "down"):
+            return "做空", "bias", "市场偏空且5m/15m未背离，短线跟随结构。"
+
+        long_structural = trend_5m == "up" and trend_15m == "up" and (
+            trade_up >= 2 or (trade_up >= 1 and pressure == "up")
+        )
+        short_structural = trend_5m == "down" and trend_15m == "down" and (
+            trade_down >= 2 or (trade_down >= 1 and pressure == "down")
+        )
+        if long_structural:
+            return "做多", "structure", "5m/15m结构同向转多，关注延续或回踩再入。"
+        if short_structural:
+            return "做空", "structure", "5m/15m结构同向转空，关注延续或反抽再入。"
+
+        long_developing = (
+            trend_5m == "up"
+            and trend_15m == "up"
+            and trend_1h != "down"
+            and move_20m >= threshold_10m
+        )
+        short_developing = (
+            trend_5m == "down"
+            and trend_15m == "down"
+            and trend_1h != "up"
+            and move_20m <= -threshold_10m
+        )
+        if long_developing:
+            return "做多", "developing", "5m/15m已同向，20分钟涨幅确认结构延伸。"
+        if short_developing:
+            return "做空", "developing", "5m/15m已同向，20分钟跌幅确认结构延伸。"
+
+        long_momentum = (
+            move_20m >= threshold_20m
+            and trend_15m == "up"
+            and trend_5m in ("up", "mixed")
+            and trend_1h != "down"
+            and pressure != "down"
+        )
+        short_momentum = (
+            move_20m <= -threshold_20m
+            and trend_15m == "down"
+            and trend_5m in ("down", "mixed")
+            and trend_1h != "up"
+            and pressure != "up"
+        )
+        if long_momentum:
+            return "做多", "momentum", f"20分钟涨幅约{move_20m:.2f}%，15m结构已确认。"
+        if short_momentum:
+            return "做空", "momentum", f"20分钟跌幅约{abs(move_20m):.2f}%，15m结构已确认。"
+
+        risk = self._risk_preference()
+        if risk == "aggressive":
+            if pressure == "up" and trade_up >= 1 and trend_5m != "down" and trend_15m != "down":
+                return "做多", "pressure", "激进模式：短窗压力偏多且15m未反向。"
+            if pressure == "down" and trade_down >= 1 and trend_5m != "up" and trend_15m != "up":
+                return "做空", "pressure", "激进模式：短窗压力偏空且15m未反向。"
+        return "观望", "neutral", "5m/15m尚未同向确认，等待结构或20分钟延伸。"
+
+    def _short_raw_direction(self, snapshot: Dict[str, Any], context: Dict[str, Any]) -> str:
+        return self._short_direction_meta(snapshot, context)[0]
+
+    def _short_levels(self, snapshot: Dict[str, Any], direction: str) -> Dict[str, str]:
+        price = to_float(snapshot.get("price"))
+        profiles = snapshot.get("trend_profiles", {})
+        atr_15m = to_float(profiles.get("15m", {}).get("atr")) or price * 0.004
+        atr_5m = to_float(profiles.get("5m", {}).get("atr")) or atr_15m * 0.45
+        stop_gap = max(atr_5m * 0.7, atr_15m * 0.35, price * 0.001)
+        target_gap = max(atr_15m * 0.65, price * 0.0018)
+        if direction == "做多":
+            return {
+                "entry": f"{price - stop_gap * 0.30:.2f} - {price + stop_gap * 0.22:.2f}",
+                "stop_loss": f"{price - stop_gap:.2f}",
+                "take_profit": f"{price + target_gap:.2f} / {price + target_gap * 1.6:.2f}",
+            }
+        if direction == "做空":
+            return {
+                "entry": f"{price - stop_gap * 0.22:.2f} - {price + stop_gap * 0.30:.2f}",
+                "stop_loss": f"{price + stop_gap:.2f}",
+                "take_profit": f"{price - target_gap:.2f} / {price - target_gap * 1.6:.2f}",
+            }
+        return {"entry": "-", "stop_loss": "-", "take_profit": "-"}
+
+    def _raw_direction_for_mode(self, snapshot: Dict[str, Any], context: Dict[str, Any]) -> str:
+        mode = self._strategy_mode()
+        if mode == "scalp":
+            return self._scalp_raw_direction(snapshot, context)
+        if mode == "swing":
+            return self._swing_raw_direction(snapshot, context)
+        return self._short_raw_direction(snapshot, context)
+
+    def _should_downgrade_direction(
+        self,
+        direction_guard: str,
+        entry_plan: Dict[str, Any],
+        raw_total_score: int,
+    ) -> bool:
+        if direction_guard:
+            return True
+        score_floor = self._direction_confirm_score_floor()
+        mode = self._strategy_mode()
+        quality = entry_plan.get("quality", "")
+        if mode == "scalp":
+            if quality != "wait_confirmation":
+                return False
+            return raw_total_score < max(55, int(score_floor * 0.70))
+        if mode == "swing":
+            if quality == "no_trade":
+                return raw_total_score < max(48, int(score_floor * 0.62))
+            if quality == "wait_confirmation":
+                return raw_total_score < max(58, int(score_floor * 0.74))
+            return False
+        if mode == "short":
+            if quality == "no_trade":
+                return raw_total_score < max(50, int(score_floor * 0.64))
+            if quality == "wait_confirmation":
+                return raw_total_score < max(60, int(score_floor * 0.76))
+            return False
+        if quality in ("no_trade", "wait_confirmation") and raw_total_score < score_floor:
+            return True
+        return False
+
+    def _apply_selected_strategy_view(self, score: Dict[str, Any], strategy_profile: Dict[str, Any], selected: Dict[str, Any]) -> None:
+        if not selected or strategy_profile.get("mode") not in ("scalp", "swing", "short"):
+            return
+        if score.get("direction_guard"):
+            return
+        score["trade_action_level"] = selected.get("action_level", score.get("trade_action_level"))
+        score["holding_time"] = selected.get("holding_time", strategy_profile.get("holding_time"))
+        sel_dir = selected.get("direction", "观望")
+        if sel_dir not in ("做多", "做空"):
+            return
+        score["direction"] = sel_dir
+        score["final_direction"] = sel_dir
+        if selected.get("entry") not in (None, "", "-"):
+            score["entry"] = selected.get("entry")
+            score["stop_loss"] = selected.get("stop_loss")
+            score["take_profit"] = selected.get("take_profit")
+        trade_score = selected.get("trade_score")
+        if trade_score is None:
+            trade_score = selected.get("score", 0) if sel_dir in ("做多", "做空") else 0
+        score["final_trade_score"] = trade_score
+        score["total_score"] = selected.get("score", score.get("total_score"))
+
     def _strategy_profile(self, mode: Optional[str] = None) -> Dict[str, Any]:
         selected = mode if mode in STRATEGY_PROFILES else self._strategy_mode()
         profile = dict(STRATEGY_PROFILES[selected])
@@ -1617,62 +2115,149 @@ class OkxAiShortTermAssistant:
         return "neutral"
 
     def _direction_guard(self, direction: str, context: Dict[str, Any]) -> str:
+        if direction not in ("做多", "做空"):
+            return ""
+        mode = self._strategy_mode()
+        risk = self._risk_preference()
         pressure = context.get("recent_price_pressure")
-        if direction == "做多" and pressure == "down":
-            return "recent_price_pressure_down_blocks_long"
-        if direction == "做空" and pressure == "up":
-            return "recent_price_pressure_up_blocks_short"
         trade_up = int(context.get("trade_up", 0) or 0)
         trade_down = int(context.get("trade_down", 0) or 0)
-        if direction == "做多" and pressure == "neutral" and trade_up < 2:
+        if mode == "scalp":
+            if risk == "aggressive":
+                return ""
+            if direction == "做多" and pressure == "down":
+                return "recent_price_pressure_down_blocks_long"
+            if direction == "做空" and pressure == "up":
+                return "recent_price_pressure_up_blocks_short"
+            return ""
+        if mode == "swing":
+            bias = context.get("bias", "neutral")
+            if direction == "做多" and pressure == "down" and bias != "long":
+                return "recent_price_pressure_down_blocks_long"
+            if direction == "做空" and pressure == "up" and bias != "short":
+                return "recent_price_pressure_up_blocks_short"
+            return ""
+        if mode == "short":
+            moves = context.get("recent_move_pct") or {}
+            move_20m = to_float(moves.get("20m"), 0.0)
+            move_15m = abs(to_float(moves.get("15m"), 0.0))
+            momentum_floor = max(0.14, move_15m * 0.85)
+            if direction == "做多" and move_20m >= momentum_floor:
+                return ""
+            if direction == "做空" and move_20m <= -momentum_floor:
+                return ""
+            bias = context.get("bias", "neutral")
+            if direction == "做多" and pressure == "down" and bias != "long" and trade_up < 1:
+                return "recent_price_pressure_down_blocks_long"
+            if direction == "做空" and pressure == "up" and bias != "short" and trade_down < 1:
+                return "recent_price_pressure_up_blocks_short"
+            min_trade_votes = 2 if risk == "conservative" else 1
+            if direction == "做多" and pressure == "neutral" and trade_up < min_trade_votes:
+                return "neutral_price_pressure_blocks_long_without_5m_15m_alignment"
+            if direction == "做空" and pressure == "neutral" and trade_down < min_trade_votes:
+                return "neutral_price_pressure_blocks_short_without_5m_15m_alignment"
+            return ""
+        if direction == "做多" and pressure == "down":
+            if risk == "aggressive" and trade_up >= 1:
+                return ""
+            return "recent_price_pressure_down_blocks_long"
+        if direction == "做空" and pressure == "up":
+            if risk == "aggressive" and trade_down >= 1:
+                return ""
+            return "recent_price_pressure_up_blocks_short"
+        min_trade_votes = 1 if risk == "aggressive" else 2
+        if direction == "做多" and pressure == "neutral" and trade_up < min_trade_votes:
             return "neutral_price_pressure_blocks_long_without_5m_15m_alignment"
-        if direction == "做空" and pressure == "neutral" and trade_down < 2:
+        if direction == "做空" and pressure == "neutral" and trade_down < min_trade_votes:
             return "neutral_price_pressure_blocks_short_without_5m_15m_alignment"
         return ""
 
-    def _short_strategy_view(self, score: Dict[str, Any]) -> Dict[str, Any]:
+    def _short_strategy_view(self, snapshot: Dict[str, Any], score: Dict[str, Any]) -> Dict[str, Any]:
+        context = snapshot.get("market_context", {})
+        direction, tier, summary = self._short_direction_meta(snapshot, context)
+        short_score = score.get("raw_total_score", 0)
+        if direction in ("做多", "做空"):
+            threshold_10m, threshold_20m = self._short_move_thresholds(snapshot)
+            candles = snapshot.get("candles", {})
+            move_strength = max(
+                abs(self._recent_move_pct(candles.get("1m", []), 10)),
+                abs(self._recent_move_pct(candles.get("1m", []), 20)),
+            )
+            if tier == "bias":
+                short_score = max(short_score, 66)
+            elif tier == "structure":
+                short_score = max(short_score, 64)
+            elif tier == "developing":
+                short_score = max(short_score, 62)
+            elif tier == "momentum" and move_strength >= threshold_20m:
+                short_score = max(short_score, 60)
+            elif tier == "pressure":
+                short_score = max(short_score, 58)
+        else:
+            short_score = min(short_score, 72)
+        levels = self._short_levels(snapshot, direction) if direction in ("做多", "做空") else {
+            "entry": "-",
+            "stop_loss": "-",
+            "take_profit": "-",
+        }
+        action = score.get("trade_action_level", "观望")
+        if direction in ("做多", "做空"):
+            action = "动量跟踪" if tier == "momentum" else "等待结构位"
         return {
             "mode": "short",
             "label": STRATEGY_PROFILES["short"]["label"],
-            "direction": score.get("direction", "观望"),
-            "score": score.get("raw_total_score", 0),
-            "trade_score": score.get("final_trade_score", 0),
-            "action_level": score.get("trade_action_level", "观望"),
-            "entry": score.get("entry"),
-            "stop_loss": score.get("stop_loss"),
-            "take_profit": score.get("take_profit"),
+            "direction": direction,
+            "score": short_score,
+            "trade_score": short_score if direction in ("做多", "做空") else 0,
+            "action_level": action,
+            "entry": levels.get("entry"),
+            "stop_loss": levels.get("stop_loss"),
+            "take_profit": levels.get("take_profit"),
             "holding_time": STRATEGY_PROFILES["short"]["holding_time"],
-            "summary": "关注5m/15m结构与1H确认，适合等待突破回踩或二次确认。",
+            "summary": summary,
+            "short_tier": tier,
         }
 
     def _swing_strategy_view(self, snapshot: Dict[str, Any], score: Dict[str, Any]) -> Dict[str, Any]:
-        profiles = snapshot.get("trend_profiles", {})
-        trend_1h = profiles.get("1H", {}).get("trend")
-        trend_4h = profiles.get("4H", {}).get("trend")
-        if trend_1h == trend_4h == "up":
-            direction = "做多"
-            summary = "1H/4H趋势同向偏多，中线只关注结构回踩后的低频机会。"
-        elif trend_1h == trend_4h == "down":
-            direction = "做空"
-            summary = "1H/4H趋势同向偏空，中线只关注反抽不过后的低频机会。"
-        else:
-            direction = "观望"
-            summary = "1H/4H结构未共振，中线以关键支撑阻力观察为主。"
+        context = snapshot.get("market_context", {})
+        direction, tier, summary = self._swing_direction_meta(snapshot, context)
         swing_score = score.get("raw_total_score", 0)
-        if direction == "观望":
+        if direction in ("做多", "做空"):
+            candles = snapshot.get("candles", {})
+            threshold_30m, _ = self._swing_move_thresholds(snapshot)
+            move_strength = max(
+                abs(self._recent_move_pct(candles.get("1m", []), 30)),
+                abs(self._recent_move_pct(candles.get("1m", []), 60)),
+            )
+            if tier == "aligned":
+                swing_score = max(swing_score, 68)
+            elif tier == "developing":
+                swing_score = max(swing_score, 62)
+            elif tier == "momentum" and move_strength >= threshold_30m:
+                swing_score = max(swing_score, 60)
+        else:
             swing_score = min(swing_score, 72)
+        levels = self._swing_levels(snapshot, direction) if direction in ("做多", "做空") else {
+            "entry": "-",
+            "stop_loss": "-",
+            "take_profit": "-",
+        }
+        action = "等待结构位" if direction in ("做多", "做空") else "观望"
+        if tier == "momentum" and direction in ("做多", "做空"):
+            action = "动量跟踪"
         return {
             "mode": "swing",
             "label": STRATEGY_PROFILES["swing"]["label"],
             "direction": direction,
             "score": swing_score,
             "trade_score": swing_score if direction in ("做多", "做空") else 0,
-            "action_level": "等待结构位" if direction in ("做多", "做空") else "观望",
-            "entry": "-",
-            "stop_loss": "-",
-            "take_profit": "-",
+            "action_level": action,
+            "entry": levels.get("entry"),
+            "stop_loss": levels.get("stop_loss"),
+            "take_profit": levels.get("take_profit"),
             "holding_time": STRATEGY_PROFILES["swing"]["holding_time"],
             "summary": summary,
+            "swing_tier": tier,
         }
 
     def _scalp_levels(self, snapshot: Dict[str, Any], direction: str) -> Dict[str, str]:
@@ -1701,42 +2286,28 @@ class OkxAiShortTermAssistant:
         context = snapshot.get("market_context", {})
         volume = snapshot.get("volume", {})
         order_book = snapshot.get("order_book", {})
+        threshold_5m, threshold_10m = self._scalp_move_thresholds()
         move_5m = self._recent_move_pct(candles.get("1m", []), 5)
         move_10m = self._recent_move_pct(candles.get("1m", []), 10)
         drawdown_10m = self._recent_drawdown_pct(candles.get("1m", []), 10)
         drawdown_15m = self._recent_drawdown_pct(candles.get("1m", []), 15)
         rebound_10m = self._recent_rebound_pct(candles.get("1m", []), 10)
         rebound_15m = self._recent_rebound_pct(candles.get("1m", []), 15)
-        threshold_5m = max(to_float(getattr(self.config, "scalp_move_pct_5m", 0.22)), 0.01)
-        threshold_10m = max(to_float(getattr(self.config, "scalp_move_pct_10m", 0.35)), 0.01)
+        direction = self._scalp_raw_direction(snapshot, context)
         trend_votes = [profiles.get(bar, {}).get("trend") for bar in ("1m", "3m", "5m")]
         up_votes = trend_votes.count("up")
         down_votes = trend_votes.count("down")
-        recent_pressure = context.get("recent_price_pressure", "neutral")
-        long_breakout = move_5m >= threshold_5m or move_10m >= threshold_10m or up_votes >= 2
-        short_breakdown = move_5m <= -threshold_5m or move_10m <= -threshold_10m or down_votes >= 2
-        long_rebound = recent_pressure != "down" and up_votes >= 1 and (
-            rebound_10m >= threshold_5m * 0.55 or rebound_15m >= threshold_10m * 0.50
-        )
-        short_rollover = recent_pressure != "up" and down_votes >= 1 and (
-            drawdown_10m <= -threshold_5m * 0.55 or drawdown_15m <= -threshold_10m * 0.50
-        )
-        long_strength = max(move_5m, move_10m, rebound_10m, rebound_15m)
-        short_strength = max(-move_5m, -move_10m, -drawdown_10m, -drawdown_15m)
-        direction = "\u89c2\u671b"
-        if long_breakout or long_rebound:
-            direction = "\u505a\u591a"
-        if (short_breakdown or short_rollover) and short_strength >= long_strength * 0.85:
-            direction = "\u505a\u7a7a"
+        short_rollover = direction == "做空" and down_votes >= 1
+        long_rebound = direction == "做多" and up_votes >= 1
 
         scalp_score = 45
         if abs(move_5m) >= threshold_5m:
             scalp_score += 18
         if abs(move_10m) >= threshold_10m:
             scalp_score += 14
-        if direction == "\u505a\u7a7a" and short_rollover:
+        if direction == "做空" and short_rollover:
             scalp_score += 10
-        if direction == "\u505a\u591a" and long_rebound:
+        if direction == "做多" and long_rebound:
             scalp_score += 10
         if volume.get("multiplier", 0.0) >= max(self.config.volume_multiplier, 1.8):
             scalp_score += 12
@@ -1754,10 +2325,11 @@ class OkxAiShortTermAssistant:
             if direction == "做空" and profiles.get("4H", {}).get("trend") == "up":
                 scalp_score -= 8
         scalp_score = max(0, min(100, int(round(scalp_score))))
-        levels = self._scalp_levels(snapshot, direction) if self.config.allow_scalp_trade and direction in ("做多", "做空") else {"entry": "-", "stop_loss": "-", "take_profit": "-"}
+        trade_allowed = self._mode_allows_scalp_trade()
+        levels = self._scalp_levels(snapshot, direction) if trade_allowed and direction in ("做多", "做空") else {"entry": "-", "stop_loss": "-", "take_profit": "-"}
         action = "急速异动" if direction in ("做多", "做空") else "观望"
-        trade_score = scalp_score if self.config.allow_scalp_trade and direction in ("做多", "做空") else 0
-        if self.config.allow_scalp_trade and scalp_score >= self.push_score and direction in ("做多", "做空"):
+        trade_score = scalp_score if trade_allowed and direction in ("做多", "做空") else 0
+        if trade_allowed and scalp_score >= self.push_score and direction in ("做多", "做空"):
             action = "可短打"
         return {
             "mode": "scalp",
@@ -1777,13 +2349,13 @@ class OkxAiShortTermAssistant:
             "drawdown_pct_15m": drawdown_15m,
             "rebound_pct_10m": rebound_10m,
             "rebound_pct_15m": rebound_15m,
-            "trade_allowed": bool(self.config.allow_scalp_trade),
+            "trade_allowed": trade_allowed,
         }
 
     def _strategy_views(self, snapshot: Dict[str, Any], signals: List[Dict[str, Any]], score: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "scalp": self._scalp_strategy_view(snapshot, score),
-            "short": self._short_strategy_view(score),
+            "short": self._short_strategy_view(snapshot, score),
             "swing": self._swing_strategy_view(snapshot, score),
         }
 
@@ -1833,7 +2405,7 @@ class OkxAiShortTermAssistant:
         if previous != ("", "") and previous != config:
             self.ai_fail_streak = 0
             self.ai_circuit_open_until = 0.0
-            print(f"[{now_text()}] AI client reloaded after config change")
+            console_debug(f"[{now_text()}] AI client reloaded after config change")
         return self._ai_client
 
     def _ai_circuit_state(self) -> str:
@@ -1846,7 +2418,7 @@ class OkxAiShortTermAssistant:
 
     def _record_ai_success(self) -> None:
         if self.ai_fail_streak or self.ai_circuit_open_until:
-            print(f"[{now_text()}] AI connection recovered, circuit closed")
+            console_info(f"[{now_text()}] AI connection recovered, circuit closed")
         self.ai_fail_streak = 0
         self.ai_circuit_open_until = 0.0
 
@@ -1858,7 +2430,7 @@ class OkxAiShortTermAssistant:
             self.ai_fail_streak += 1
         if self.ai_fail_streak >= threshold:
             self.ai_circuit_open_until = time.time() + self._ai_circuit_cooldown()
-            print(
+            console_warn(
                 f"[{now_text()}] AI circuit opened for {self._ai_circuit_cooldown()}s "
                 f"after failure: {exc}"
             )
@@ -1906,7 +2478,7 @@ class OkxAiShortTermAssistant:
                 sleep_seconds = retry_backoff * attempt
                 if is_rate_limit_ai_error(exc):
                     sleep_seconds = max(sleep_seconds, self._ai_rate_limit_backoff())
-                print(
+                console_debug(
                     f"[{now_text()}] ai-chat failed, retry {attempt}/{retry_times}: {exc}; "
                     f"sleep {sleep_seconds:.1f}s"
                 )
@@ -1932,7 +2504,7 @@ class OkxAiShortTermAssistant:
             )
             return True
         except Exception as exc:
-            print(f"[{now_text()}] AI probe failed: {exc}")
+            console_debug(f"[{now_text()}] AI probe failed: {exc}")
             self._reset_ai_client()
             return False
 
@@ -1941,7 +2513,7 @@ class OkxAiShortTermAssistant:
         if now - self.ai_last_probe_at < self._ai_probe_interval():
             return False
         self.ai_last_probe_at = now
-        print(f"[{now_text()}] AI circuit probing...")
+        console_debug(f"[{now_text()}] AI circuit probing...")
         if self._probe_ai_connection(model):
             self._record_ai_success()
             return True
@@ -1971,17 +2543,295 @@ class OkxAiShortTermAssistant:
             "fallback": None if valid else self._local_analysis(snapshot, signals, score),
         }
 
+    def _ai_call_min_interval(self) -> int:
+        return max(15, env_int("AI_CALL_MIN_INTERVAL_SECONDS", DEFAULT_AI_CALL_MIN_INTERVAL_SECONDS))
+
+    def _signal_fingerprint(self, signals: List[Dict[str, Any]], score: Dict[str, Any]) -> str:
+        signal_types = ",".join(sorted(item.get("type", "") for item in signals if item.get("type"))) or "none"
+        return f"{signal_types}:{score.get('direction', '观望')}:{score.get('raw_total_score', 0)}"
+
+    def evaluate_ai_trigger(
+        self,
+        inst_id: str,
+        signals: List[Dict[str, Any]],
+        score: Dict[str, Any],
+        snapshot: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not signals:
+            return {
+                "level": "L0",
+                "should_call_ai": False,
+                "ai_invoked": False,
+                "reasons": [],
+                "fingerprint": "",
+                "local_hint": self.build_local_hint(score, signals),
+            }
+
+        signal_types = {item.get("type", "") for item in signals}
+        reasons: List[str] = []
+        scalp_view = score.get("strategy_views", {}).get("scalp", {})
+        level = "L1"
+
+        if (
+            self.config.signal_spike_enabled
+            and scalp_view.get("action_level") in ("急速异动", "可短打")
+            and scalp_view.get("score", 0) >= self.config.watch_push_score
+        ):
+            level = "L3"
+            reasons.append("scalp_spike")
+
+        if "funding_hot" in signal_types and abs(to_float(snapshot.get("funding_rate"))) >= self.config.funding_abs_threshold * 1.25:
+            level = "L3"
+            reasons.append("funding_extreme")
+
+        if level != "L3":
+            l2_hit = False
+            if len(signals) >= 2:
+                l2_hit = True
+                reasons.append("multi_signal")
+            elif signal_types.intersection(TRADE_TRIGGER_SIGNALS):
+                l2_hit = True
+                reasons.append("trade_signal")
+            elif score.get("raw_total_score", 0) >= 72:
+                l2_hit = True
+                reasons.append("raw_score_high")
+            elif len(signal_types.intersection(WATCH_TRIGGER_SIGNALS)) >= 2:
+                l2_hit = True
+                reasons.append("multi_watch")
+            if l2_hit:
+                level = "L2"
+
+        if not reasons:
+            reasons = [item.get("type", "signal") for item in signals[:3]]
+
+        fingerprint = self._signal_fingerprint(signals, score)
+        should_call_ai = False
+        if self.ai_enabled and level in ("L2", "L3"):
+            if level == "L3":
+                should_call_ai = True
+            else:
+                last_fp = self.last_ai_fingerprint.get(inst_id, "")
+                last_at = self.last_ai_call_at.get(inst_id, 0.0)
+                should_call_ai = (
+                    fingerprint != last_fp
+                    or last_at <= 0
+                    or self._now_ts() - last_at >= self._ai_call_min_interval()
+                )
+
+        return {
+            "level": level,
+            "should_call_ai": should_call_ai,
+            "ai_invoked": False,
+            "reasons": reasons,
+            "fingerprint": fingerprint,
+            "local_hint": self.build_local_hint(score, signals),
+        }
+
+    def build_local_hint(self, score: Dict[str, Any], signals: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return {
+            "reference_only": True,
+            "direction": score.get("direction", "观望"),
+            "raw_direction": score.get("raw_direction"),
+            "raw_total_score": score.get("raw_total_score", 0),
+            "final_trade_score": score.get("final_trade_score", 0),
+            "risk_level": score.get("risk_level"),
+            "entry": score.get("entry"),
+            "stop_loss": score.get("stop_loss"),
+            "take_profit": score.get("take_profit"),
+            "market_regime": score.get("market_regime"),
+            "trade_action_level": score.get("trade_action_level"),
+            "signal_types": [item.get("type", "") for item in signals],
+        }
+
+    def _local_push_recommendation(self, score: Dict[str, Any], signals: List[Dict[str, Any]]) -> str:
+        kind = self._push_kind(score, signals)
+        return kind or "none"
+
+    def _derive_confidence_from_parsed(self, parsed: Dict[str, Any], score: Dict[str, Any]) -> int:
+        raw = parsed.get("confidence")
+        if isinstance(raw, (int, float)):
+            return max(0, min(100, int(round(raw))))
+        direction = parsed.get("direction", "观望")
+        if direction in ("做多", "做空"):
+            return max(0, min(100, int(score.get("final_trade_score", score.get("raw_total_score", 0)))))
+        return max(0, min(100, int(score.get("raw_total_score", 0))))
+
+    def _derive_push_recommendation(
+        self,
+        parsed: Dict[str, Any],
+        score: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        trigger: Dict[str, Any],
+    ) -> str:
+        explicit = str(parsed.get("push_recommendation", "") or "").strip().lower()
+        if explicit in ("none", "watch", "trade", "spike"):
+            return explicit
+
+        direction = parsed.get("direction", "观望")
+        confidence = self._derive_confidence_from_parsed(parsed, score)
+        audit = parsed.get("rule_audit") if isinstance(parsed.get("rule_audit"), dict) else {}
+        audit_overall = str(audit.get("overall", ""))
+
+        if audit_overall == "不可信":
+            signal_types = {item.get("type", "") for item in signals}
+            if signal_types.intersection(WATCH_TRIGGER_SIGNALS) and confidence >= self.config.watch_push_score:
+                return "watch"
+            return "none"
+
+        scalp_view = score.get("strategy_views", {}).get("scalp", {})
+        if (
+            trigger.get("level") == "L3"
+            and scalp_view.get("action_level") in ("急速异动", "可短打")
+            and direction in ("做多", "做空")
+        ):
+            return "spike"
+
+        if direction in ("做多", "做空") and confidence >= self.push_score:
+            return "trade"
+
+        signal_types = {item.get("type", "") for item in signals}
+        if direction == "观望" and confidence >= self.config.watch_push_score and signal_types.intersection(WATCH_TRIGGER_SIGNALS):
+            return "watch"
+
+        return "none"
+
+    def _build_local_final_decision(
+        self,
+        score: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        trigger: Dict[str, Any],
+        *,
+        decision_source: str = "local",
+        ai_called: bool = False,
+    ) -> Dict[str, Any]:
+        push_recommendation = self._local_push_recommendation(score, signals)
+        if not ai_called and trigger.get("level") == "L1" and push_recommendation == "trade":
+            push_recommendation = "watch" if score.get("raw_total_score", 0) >= self.config.watch_push_score else "none"
+
+        direction = score.get("direction", "观望")
+        confidence = score.get("final_trade_score", 0) if direction in ("做多", "做空") else score.get("raw_total_score", 0)
+        return {
+            "direction": direction,
+            "confidence": max(0, min(100, int(confidence or 0))),
+            "push_recommendation": push_recommendation,
+            "entry": score.get("entry", "-"),
+            "stop_loss": score.get("stop_loss", "-"),
+            "take_profit": score.get("take_profit", "-"),
+            "risk_level": score.get("risk_level", "中"),
+            "summary": score.get("trade_action_level", "本地规则结论"),
+            "reasons": [item.get("desc", item.get("type", "")) for item in signals[:3]],
+            "rule_audit": {"overall": "本地规则", "warnings": []},
+            "decision_source": decision_source,
+            "ai_called": ai_called,
+            "trigger_level": trigger.get("level", "L0"),
+            "local_hint_direction": score.get("direction", "观望"),
+            "market_regime": score.get("market_regime"),
+            "strategy_label": score.get("strategy_label"),
+            "risk_preference": score.get("risk_preference"),
+        }
+
+    def _build_ai_final_decision(
+        self,
+        analysis: Dict[str, Any],
+        score: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        trigger: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        parsed = analysis.get("parsed") if isinstance(analysis.get("parsed"), dict) else {}
+        audit = parsed.get("rule_audit") if isinstance(parsed.get("rule_audit"), dict) else {}
+        direction = parsed.get("direction", "观望")
+        confidence = self._derive_confidence_from_parsed(parsed, score)
+        push_recommendation = self._derive_push_recommendation(parsed, score, signals, trigger)
+
+        if str(audit.get("overall", "")) == "不可信":
+            if push_recommendation == "trade":
+                signal_types = {item.get("type", "") for item in signals}
+                push_recommendation = "watch" if signal_types.intersection(WATCH_TRIGGER_SIGNALS) else "none"
+            if direction in ("做多", "做空") and push_recommendation == "none":
+                direction = "观望"
+
+        if parsed.get("risk_level") == "高" and confidence < max(50, self.push_score - 10) and push_recommendation == "trade":
+            push_recommendation = "watch"
+
+        reasons = parsed.get("reasons") if isinstance(parsed.get("reasons"), list) else []
+        return {
+            "direction": direction,
+            "confidence": confidence,
+            "push_recommendation": push_recommendation,
+            "entry": parsed.get("entry", "-"),
+            "stop_loss": parsed.get("stop_loss", "-"),
+            "take_profit": parsed.get("take_profit", "-"),
+            "risk_level": parsed.get("risk_level", "中"),
+            "summary": parsed.get("suggestion", ""),
+            "reasons": reasons,
+            "rule_audit": audit,
+            "decision_source": "ai",
+            "ai_called": True,
+            "trigger_level": trigger.get("level", "L0"),
+            "local_hint_direction": score.get("direction", "观望"),
+            "market_regime": score.get("market_regime"),
+            "strategy_label": score.get("strategy_label"),
+            "risk_preference": score.get("risk_preference"),
+            "score_comment": parsed.get("score_comment", ""),
+        }
+
+    def merge_final_decision(
+        self,
+        analysis: Optional[Dict[str, Any]],
+        score: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        trigger: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if analysis and analysis.get("valid_json") and isinstance(analysis.get("parsed"), dict):
+            return self._build_ai_final_decision(analysis, score, signals, trigger)
+
+        source = "local_fallback" if trigger.get("ai_invoked") else "local"
+        ai_called = bool(trigger.get("ai_invoked"))
+        return self._build_local_final_decision(score, signals, trigger, decision_source=source, ai_called=ai_called)
+
+    def push_gate(self, final_decision: Dict[str, Any], signals: List[Dict[str, Any]]) -> str:
+        if not signals:
+            return ""
+
+        recommendation = str(final_decision.get("push_recommendation", "none") or "none")
+        if recommendation == "none":
+            return ""
+
+        if recommendation == "spike":
+            if not self.config.signal_spike_enabled:
+                return ""
+            return "spike"
+
+        if recommendation == "watch":
+            if not self.config.signal_watch_enabled:
+                return ""
+            if final_decision.get("confidence", 0) < self.config.watch_push_score:
+                return ""
+            if final_decision.get("decision_source") == "ai":
+                return "watch"
+            signal_types = {item.get("type", "") for item in signals}
+            if not signal_types.intersection(WATCH_TRIGGER_SIGNALS) and final_decision.get("direction") == "观望":
+                return ""
+            return "watch"
+
+        if recommendation == "trade":
+            if not self.config.signal_trade_enabled:
+                return ""
+            if final_decision.get("direction") not in ("做多", "做空"):
+                return ""
+            if final_decision.get("confidence", 0) < self.push_score:
+                return ""
+            return "trade"
+
+        return ""
+
     def analyze_with_ai(
         self,
         snapshot: Dict[str, Any],
         signals: List[Dict[str, Any]],
         score: Dict[str, Any],
     ) -> Dict[str, Any]:
-        # AI模块只在触发信号后由run_once调用。
-        # 三层稳健机制：请求重试、client重建、熔断后轻量探活自动恢复。
-        if not self.ai_enabled:
-            return self._local_analysis(snapshot, signals, score)
-
+        # 仅在 evaluate_ai_trigger 判定 should_call_ai 后调用。
         if self.dry_run_ai:
             payload = self._ai_payload(snapshot, signals, score)
             return {
@@ -2027,7 +2877,7 @@ class OkxAiShortTermAssistant:
             self._record_ai_success()
             return self._build_ai_success_result(base_url, model, output_text, snapshot, signals, score)
         except Exception as exc:
-            print(f"[{now_text()}] AI request failed: {exc}")
+            console_warn(f"[{now_text()}] AI request failed: {exc}")
             self._record_ai_failure(exc)
             ai_status = self._ai_circuit_state()
             return self._ai_fallback_result(
@@ -2043,38 +2893,32 @@ class OkxAiShortTermAssistant:
         self,
         snapshot: Dict[str, Any],
         signals: List[Dict[str, Any]],
-        score: Dict[str, Any],
-        analysis: Dict[str, Any],
+        final_decision: Dict[str, Any],
+        analysis: Optional[Dict[str, Any]],
+        local_score: Dict[str, Any],
     ) -> None:
-        # 推送拆成两类：
-        # 1. trade：最终方向可交易，看final_trade_score；
-        # 2. watch：最终观望但原始观察分高或风险异常，看raw_total_score和风险信号。
-        # 这样不会因为final_trade_score=0漏掉资金费率过热、RSI极端、挤压突破等重要观察提醒。
-        if not signals:
-            return
-
-        push_kind = self._push_kind(score, signals)
+        push_kind = self.push_gate(final_decision, signals)
         if not push_kind:
             return
 
-        push_key = self._push_key(snapshot, signals, score)
+        push_key = self._push_key(snapshot, signals, final_decision, push_kind)
         if self._in_push_cooldown(push_key):
-            print(f"[{now_text()}] push skipped by cooldown: {push_key}")
+            console_debug(f"[{now_text()}] push skipped by cooldown: {push_key}")
             return
 
-        message = self._format_push_message(snapshot, signals, score, analysis, push_kind)
-        print(message)
         if not self.push_enabled:
+            self._log_push_event(snapshot, signals, final_decision, push_kind, "dry-run")
             self.last_push_at[push_key] = time.time()
             return
 
         send_key = os.getenv("WECHAT_SEND_KEY", "").strip()
         if not send_key:
-            print(f"[{now_text()}] WeChat push skipped: WECHAT_SEND_KEY is not configured")
+            console_debug(f"[{now_text()}] WeChat push skipped: WECHAT_SEND_KEY is not configured")
+            self._log_push_event(snapshot, signals, final_decision, push_kind, "skipped(no wechat key)")
             self.last_push_at[push_key] = time.time()
             return
 
-        self._push_wechat(send_key, snapshot, signals, score, analysis, push_kind)
+        self._push_wechat(send_key, snapshot, signals, final_decision, analysis or {}, push_kind, local_score)
         self.last_push_at[push_key] = time.time()
 
     def log_result(
@@ -2082,10 +2926,13 @@ class OkxAiShortTermAssistant:
         snapshot: Dict[str, Any],
         signals: List[Dict[str, Any]],
         score: Dict[str, Any],
-        analysis: Dict[str, Any],
+        analysis: Optional[Dict[str, Any]],
+        trigger: Dict[str, Any],
+        final_decision: Dict[str, Any],
     ) -> None:
+        if not self.replay_mode and not self.runtime_config.analysis_log_enabled:
+            return
         # 每一轮都会写日志，即使不触发信号也记录。
-        # 这些日志后续可以用于统计信号质量、优化阈值、做复盘。
         record = {
             "time": snapshot["time"],
             "inst_id": snapshot["inst_id"],
@@ -2111,7 +2958,9 @@ class OkxAiShortTermAssistant:
             "signal_tracking": snapshot.get("signal_tracking", {}),
             "signals": signals,
             "score": score,
+            "local_trigger": trigger,
             "analysis": analysis,
+            "final_decision": final_decision,
         }
         self._rotate_log_if_needed()
         log_path = self.replay_log_file if self.replay_mode else LOG_FILE
@@ -2125,12 +2974,21 @@ class OkxAiShortTermAssistant:
         snapshot = self.collect_snapshot(inst_id)
         signals = self.detect_signals(snapshot)
         score = self.score_snapshot(snapshot, signals)
-        snapshot["signal_tracking"] = self.update_signal_tracking(snapshot, signals, score)
-        analysis = self.analyze_with_ai(snapshot, signals, score) if signals else self._local_analysis(snapshot, signals, score)
-        print(f"[{snapshot['time']}] {inst_id} analysis by {analysis.get('provider')}: {analysis.get('content')}")
+        trigger = self.evaluate_ai_trigger(inst_id, signals, score, snapshot)
+
+        analysis: Optional[Dict[str, Any]] = None
+        if trigger["should_call_ai"]:
+            analysis = self.analyze_with_ai(snapshot, signals, score)
+            trigger["ai_invoked"] = True
+            self.last_ai_call_at[inst_id] = self._now_ts()
+            self.last_ai_fingerprint[inst_id] = trigger["fingerprint"]
+
+        final_decision = self.merge_final_decision(analysis, score, signals, trigger)
+        snapshot["signal_tracking"] = self.update_signal_tracking(snapshot, signals, final_decision)
+        self._log_console_summary(snapshot, signals, final_decision, analysis, trigger)
         if not self.replay_mode:
-            self.push_if_needed(snapshot, signals, score, analysis)
-        self.log_result(snapshot, signals, score, analysis)
+            self.push_if_needed(snapshot, signals, final_decision, analysis, score)
+        self.log_result(snapshot, signals, score, analysis, trigger, final_decision)
 
     def run_replay(self, frames: List[Dict[str, Any]], replay_interval: float = 0.0) -> None:
         self.replay_mode = True
@@ -2138,23 +2996,23 @@ class OkxAiShortTermAssistant:
             self.replay_log_file = REPLAY_LOG_FILE
         self.replay_log_file.parent.mkdir(parents=True, exist_ok=True)
         total = len(frames)
-        print(f"[{now_text()}] replay start: {total} frames -> {self.replay_log_file}")
+        console_info(f"[{now_text()}] replay start: {total} frames -> {self.replay_log_file}")
         for index, frame in enumerate(frames, start=1):
             inst_id = str(frame.get("inst_id", ""))
             if inst_id not in self.instruments:
-                print(f"[{now_text()}] replay skip unknown inst_id={inst_id}")
+                console_debug(f"[{now_text()}] replay skip unknown inst_id={inst_id}")
                 continue
             self.replay_frame = frame
             self._set_replay_clock(str(frame.get("time", "")))
             try:
                 self._process_inst(inst_id)
             except Exception as exc:
-                print(f"[{self._now_text()}] replay frame {index}/{total} failed: {exc}")
+                console_warn(f"[{self._now_text()}] replay frame {index}/{total} failed: {exc}")
             finally:
                 self.replay_frame = None
             if replay_interval > 0 and index < total:
                 time.sleep(replay_interval)
-        print(f"[{now_text()}] replay finished: {total} frames")
+        console_info(f"[{now_text()}] replay finished: {total} frames")
 
     def run_once(self) -> None:
         # 定时执行：遍历所有支持币种，完成数据采集、阈值检测、综合评分、AI分析、微信推送、日志存储等全部功能。
@@ -2162,15 +3020,20 @@ class OkxAiShortTermAssistant:
             try:
                 self._process_inst(inst_id)
             except Exception as exc:
-                print(f"[{self._now_text()}] {inst_id} collect/analyze failed: {exc}")
+                console_warn(f"[{self._now_text()}] {inst_id} collect/analyze failed: {exc}")
 
     def run_forever(self, runtime: int) -> None:
         # 主循环：默认永久运行；runtime>0时，到指定秒数自动退出，用于实现定时任务。
+        log_note = f"json_log={LOG_FILE}" if self.runtime_config.analysis_log_enabled else "json_log=off"
+        console_info(
+            f"[{now_text()}] monitor start: {', '.join(self.instruments)} "
+            f"interval={self.interval}s {log_note}"
+        )
         started = time.time()
         while True:
             self.run_once()
             if runtime > 0 and time.time() - started >= runtime:
-                print(f"Runtime {runtime}s reached; exit.")
+                console_info(f"[{now_text()}] runtime {runtime}s reached; exit.")
                 break
             time.sleep(self.interval)
 
@@ -2178,7 +3041,7 @@ class OkxAiShortTermAssistant:
         self,
         snapshot: Dict[str, Any],
         signals: List[Dict[str, Any]],
-        score: Dict[str, Any],
+        final_decision: Dict[str, Any],
     ) -> Dict[str, Any]:
         # 在线回测/校准的最小闭环：
         # 1. 当系统给出做多/做空且分数较高时，先登记“等待入场区触达”的样本；
@@ -2243,15 +3106,21 @@ class OkxAiShortTermAssistant:
         self.pending_signal_reviews = still_pending
 
         opened = []
-        direction = score.get("direction")
-        if direction in ("做多", "做空") and price > 0 and (signals or score.get("total_score", 0) >= self.push_score):
+        direction = final_decision.get("direction")
+        confidence = final_decision.get("confidence", 0)
+        push_recommendation = final_decision.get("push_recommendation", "none")
+        if (
+            direction in ("做多", "做空")
+            and price > 0
+            and push_recommendation in ("trade", "spike")
+            and confidence >= max(70, self.push_score - 10)
+        ):
             signal_types = ",".join(sorted(item.get("type", "") for item in signals if item.get("type"))) or "score-only"
             strategy = snapshot.get("market_context", {}).get("strategy_template", "unknown")
             track_key = f"{inst_id}:{direction}:{strategy}:{signal_types}"
-            # 同一类信号最多每60秒登记一次，避免5秒轮询制造大量高度重复样本。
             if now_ts - self.last_signal_track_at.get(track_key, 0.0) >= 60:
                 self.last_signal_track_at[track_key] = now_ts
-                entry_low, entry_high = self._entry_bounds(score.get("entry_plan", {}).get("entry", ""))
+                entry_low, entry_high = self._entry_bounds(final_decision.get("entry", ""))
                 if not entry_low or not entry_high:
                     entry_low = entry_high = price
                 for label, seconds in (("5m", 300), ("15m", 900), ("1H", 3600)):
@@ -2268,12 +3137,12 @@ class OkxAiShortTermAssistant:
                         "entry_price": None,
                         "entry_low": entry_low,
                         "entry_high": entry_high,
-                        "planned_entry": score.get("entry"),
-                        "score": score.get("total_score"),
-                        "market_regime": score.get("market_regime"),
+                        "planned_entry": final_decision.get("entry"),
+                        "score": confidence,
+                        "market_regime": final_decision.get("market_regime"),
                         "strategy_template": strategy,
                         "signal_types": signal_types,
-                        "layer_scores": score.get("layer_scores", {}),
+                        "decision_source": final_decision.get("decision_source"),
                         "max_favorable_pct": 0.0,
                         "max_adverse_pct": 0.0,
                     })
@@ -2390,7 +3259,7 @@ class OkxAiShortTermAssistant:
                 if item.get("state") in ("closed", "expired_unfilled"):
                     self._record_signal_performance(item)
         except Exception as exc:
-            print(f"load signal performance failed: {exc}")
+            console_debug(f"load signal performance failed: {exc}")
 
     def _append_signal_performance(self, item: Dict[str, Any]) -> None:
         # 单独持久化结算样本，避免程序重启后只剩内存统计。
@@ -2401,7 +3270,7 @@ class OkxAiShortTermAssistant:
             with SIGNAL_PERFORMANCE_FILE.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(item, ensure_ascii=False) + "\n")
         except Exception as exc:
-            print(f"signal performance log failed: {exc}")
+            console_debug(f"signal performance log failed: {exc}")
 
     def _rotate_signal_performance_if_needed(self) -> None:
         if not SIGNAL_PERFORMANCE_FILE.exists() or SIGNAL_PERFORMANCE_FILE.stat().st_size < SIGNAL_PERFORMANCE_MAX_BYTES:
@@ -2457,7 +3326,7 @@ class OkxAiShortTermAssistant:
             try:
                 return self._okx_call(f"{label}-sdk", sdk_func)
             except Exception as exc:
-                print(f"[{now_text()}] {label} SDK failed, fallback to REST: {exc}")
+                console_debug(f"[{now_text()}] {label} SDK failed, fallback to REST: {exc}")
         return self._okx_call(f"{label}-rest", rest_func)
 
     def _get_ticker(self, inst_id: str) -> Dict[str, float]:
@@ -2819,6 +3688,7 @@ class OkxAiShortTermAssistant:
         move_5m = self._recent_move_pct(candles.get("1m", []), 5)
         move_10m = self._recent_move_pct(candles.get("1m", []), 10)
         move_15m = self._recent_move_pct(candles.get("1m", []), 15)
+        move_20m = self._recent_move_pct(candles.get("1m", []), 20)
         recent_price_pressure = self._recent_price_pressure(move_5m, move_10m, move_15m, volatility)
 
         long_confirmed = higher_up >= 1 and up_count > down_count and (
@@ -2904,6 +3774,7 @@ class OkxAiShortTermAssistant:
                 "5m": move_5m,
                 "10m": move_10m,
                 "15m": move_15m,
+                "20m": move_20m,
             },
             "price_change_15m": price_change_15m,
             "oi_price_state": oi_price_state,
@@ -3126,6 +3997,14 @@ class OkxAiShortTermAssistant:
         if parsed.get("risk_level") not in ("低", "中", "高"):
             errors.append("risk_level must be 低/中/高")
 
+        push_rec = parsed.get("push_recommendation")
+        if push_rec not in (None, "", "none", "watch", "trade", "spike"):
+            errors.append("push_recommendation must be none/watch/trade/spike")
+
+        confidence = parsed.get("confidence")
+        if confidence is not None and not isinstance(confidence, (int, float)):
+            errors.append("confidence must be a number")
+
         if not isinstance(parsed.get("reasons"), list):
             errors.append("reasons must be a list")
 
@@ -3206,6 +4085,7 @@ class OkxAiShortTermAssistant:
             "rule_outputs": {
                 "signals": signals,
                 "score": score,
+                "local_hint": self.build_local_hint(score, signals),
                 "direction_audit": {
                     "raw_direction": score.get("raw_direction"),
                     "final_direction": score.get("final_direction"),
@@ -3332,7 +4212,7 @@ class OkxAiShortTermAssistant:
             "你的任务是根据实时行情、多周期K线、EMA/MA/RSI/MACD/KDJ/BOLL/ADX/ATR结构画像、成交量、OI、资金费率、多空比、订单簿，"
             ""
             # "先审计程序规则结果是否可信，再输出短线交易观察建议。\n\n"
-            "直接忽略本地规则，独立根据原始数据和规则触发的信号来判断市场状态和交易机会。\n\n"
+            "直接根据原始数据和本地触发的 signals 独立判断；local_trigger.local_hint 与 rule_outputs 仅供参考，不得机械照搬。\n\n"
             "硬性限制：\n"
             "1. 只提供分析和风险提示，不允许表示系统会自动下单。\n"
             "2. 不允许承诺收益，不允许使用稳赚、必涨、必跌等确定性表述。\n"
@@ -3340,9 +4220,9 @@ class OkxAiShortTermAssistant:
             "4. 如果long_short_ratio.available=false，需要说明多空比不可用，不要凭空编造多空比。\n"
             "5. 如果oi_warmup_ready=false或funding_warmup_ready=false，需要降低对15分钟变化类指标的权重。\n\n"
             f"策略要求：当前主策略为{score.get('strategy_label')}，风险偏好为{score.get('risk_preference')}，AI输出风格为{score.get('ai_output_style')}。"
-            "必须优先按照rule_outputs.score.selected_strategy_view给出主结论，同时参考strategy_views里的超短线、短线、中线并行视角解释差异。"
+            "可参考 strategy_views 解释超短线/短线/中线差异，但最终 direction 与 push_recommendation 必须由你独立给出。"
             "超短线只看1m/3m/5m与15m过滤，4H只做背景；短线看5m/15m和1H确认；中线看1H/4H结构。"
-            "如果超短线出现急速异动但主策略不是超短线，应说明这是短打机会或风险提示，不要把它包装成中线趋势。\n\n"
+            "如果超短线出现急速异动但主策略不是超短线，应在 push_recommendation 中用 spike 或 watch 表达，不要包装成中线趋势。\n\n"
             "分析步骤：\n"
             "1. 规则审计：根据raw_evidence和signal_evidence，判断程序触发的signals是否有原始数据支持。\n"
             "2. 市场状态：优先参考market_context.regime/bias，区分趋势、震荡、高波动、混合状态。\n"
@@ -3353,7 +4233,8 @@ class OkxAiShortTermAssistant:
             "7. 订单簿：只作为入场确认，不允许单独用盘口不平衡决定方向；注意top5/top20分歧和价差。\n"
             "8. 回测反馈：signal_tracking只是在线复盘统计，样本少时不能过度依赖。\n"
             "9. 风险：结合ATR止损距离、资金费率、趋势冲突、信号数量、预热状态给出风险等级。\n"
-            "10. 建议：方向只能是做多、做空、观望。入场、止损、止盈优先参考rule_outputs.score.entry_plan，并可保守修正。\n\n"
+            "10. 建议：direction 只能是做多、做空、观望；push_recommendation 只能是 none/watch/trade/spike；"
+            "confidence 为 0-100 的把握度。若不应推送则 push_recommendation=none。\n\n"
             "必须只输出一个合法JSON对象，不要输出Markdown代码块，不要输出JSON以外的解释。"
             "JSON字段必须完全包含：\n"
             "{\n"
@@ -3369,7 +4250,9 @@ class OkxAiShortTermAssistant:
             '  "stop_loss": "建议止损，观望时填-",\n'
             '  "take_profit": "建议止盈，观望时填-",\n'
             '  "risk_level": "低/中/高",\n'
-            '  "score_comment": "对本地综合评分是否可信的说明",\n'
+            '  "confidence": 0,\n'
+            '  "push_recommendation": "none/watch/trade/spike",\n'
+            '  "score_comment": "对本地参考分是否可信的说明",\n'
             '  "rule_audit": {\n'
             '    "overall": "规则结果可信/部分可信/不可信",\n'
             '    "volume_signal_valid": true,\n'
@@ -3429,45 +4312,30 @@ class OkxAiShortTermAssistant:
         }
         return {"provider": "local-rule", "content": content}
 
-    def _resolve_push_analysis(
+    def _resolve_push_view(
         self,
-        analysis: Dict[str, Any],
-        score: Dict[str, Any],
+        final_decision: Dict[str, Any],
+        analysis: Optional[Dict[str, Any]],
+        local_score: Dict[str, Any],
     ) -> Dict[str, Any]:
-        # 推送优先使用 AI 有效 JSON；无效时回退 fallback/local-rule，再补 score 字段。
-        payload: Optional[Dict[str, Any]] = None
-        if analysis.get("valid_json") and isinstance(analysis.get("parsed"), dict):
-            payload = analysis["parsed"]
-        elif isinstance(analysis.get("fallback"), dict) and isinstance(analysis["fallback"].get("content"), dict):
-            payload = analysis["fallback"]["content"]
-        elif analysis.get("provider") == "local-rule" and isinstance(analysis.get("content"), dict):
-            payload = analysis["content"]
+        analysis = analysis or {}
+        parsed = analysis.get("parsed") if isinstance(analysis.get("parsed"), dict) else {}
+        trend = parsed.get("trend") if isinstance(parsed.get("trend"), dict) else {}
+        rule_audit = final_decision.get("rule_audit") if isinstance(final_decision.get("rule_audit"), dict) else {}
+        reasons = final_decision.get("reasons") if isinstance(final_decision.get("reasons"), list) else []
 
-        trend = payload.get("trend") if isinstance(payload, dict) and isinstance(payload.get("trend"), dict) else {}
-        rule_audit = payload.get("rule_audit") if isinstance(payload, dict) and isinstance(payload.get("rule_audit"), dict) else {}
-        reasons = payload.get("reasons") if isinstance(payload, dict) and isinstance(payload.get("reasons"), list) else []
-
-        def pick(field: str, score_key: Optional[str] = None) -> Any:
-            score_key = score_key or field
-            if isinstance(payload, dict):
-                value = payload.get(field)
-                if value not in (None, ""):
-                    return value
-            return score.get(score_key)
-
-        direction = display_push_value(pick("direction", "direction"), score.get("direction", "观望"))
         return {
-            "source": analysis.get("provider", "unknown"),
+            "source": final_decision.get("decision_source", analysis.get("provider", "unknown")),
             "ai_valid": bool(analysis.get("valid_json")),
-            "direction": direction,
-            "rule_direction": score.get("direction", "观望"),
-            "entry": display_push_value(pick("entry", "entry"), score.get("entry")),
-            "stop_loss": display_push_value(pick("stop_loss", "stop_loss"), score.get("stop_loss")),
-            "take_profit": display_push_value(pick("take_profit", "take_profit"), score.get("take_profit")),
-            "risk_level": display_push_value(pick("risk_level", "risk_level"), score.get("risk_level")),
-            "suggestion": clip_push_text(pick("suggestion"), 240),
-            "risk": clip_push_text(pick("risk"), 260),
-            "score_comment": clip_push_text(pick("score_comment"), 180),
+            "direction": display_push_value(final_decision.get("direction"), "观望"),
+            "rule_direction": local_score.get("direction", "观望"),
+            "entry": display_push_value(final_decision.get("entry"), "-"),
+            "stop_loss": display_push_value(final_decision.get("stop_loss"), "-"),
+            "take_profit": display_push_value(final_decision.get("take_profit"), "-"),
+            "risk_level": display_push_value(final_decision.get("risk_level"), "中"),
+            "suggestion": clip_push_text(final_decision.get("summary"), 240),
+            "risk": clip_push_text(parsed.get("risk"), 260),
+            "score_comment": clip_push_text(final_decision.get("score_comment", parsed.get("score_comment")), 180),
             "trend_summary": clip_push_text(trend.get("summary"), 120),
             "trend_conflict": clip_push_text(trend.get("conflict"), 120),
             "rule_audit_overall": clip_push_text(rule_audit.get("overall"), 40),
@@ -3477,7 +4345,30 @@ class OkxAiShortTermAssistant:
                 if clip_push_text(item, 80)
             ],
             "reasons": [clip_push_text(item, 100) for item in reasons[:3] if clip_push_text(item, 100)],
+            "confidence": final_decision.get("confidence", 0),
+            "push_recommendation": final_decision.get("push_recommendation", "none"),
         }
+
+    def _resolve_push_analysis(
+        self,
+        analysis: Dict[str, Any],
+        score: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        # 兼容旧调用：无 final_decision 时从 analysis/score 推断。
+        final_decision = {
+            "direction": score.get("direction", "观望"),
+            "entry": score.get("entry", "-"),
+            "stop_loss": score.get("stop_loss", "-"),
+            "take_profit": score.get("take_profit", "-"),
+            "risk_level": score.get("risk_level", "中"),
+            "summary": "",
+            "reasons": [],
+            "rule_audit": {},
+            "decision_source": analysis.get("provider", "unknown"),
+            "confidence": score.get("final_trade_score", score.get("raw_total_score", 0)),
+            "push_recommendation": self._local_push_recommendation(score, []),
+        }
+        return self._resolve_push_view(final_decision, analysis, score)
 
     def _signal_labels(self, signals: List[Dict[str, Any]], limit: int = 4) -> List[str]:
         labels = []
@@ -3492,24 +4383,27 @@ class OkxAiShortTermAssistant:
         self,
         snapshot: Dict[str, Any],
         signals: List[Dict[str, Any]],
-        score: Dict[str, Any],
+        final_decision: Dict[str, Any],
         analysis: Dict[str, Any],
         push_kind: str = "trade",
+        local_score: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, str]:
-        view = self._resolve_push_analysis(analysis, score)
+        local_score = local_score or {}
+        view = self._resolve_push_view(final_decision, analysis, local_score)
         inst_id = snapshot["inst_id"]
         symbol = symbol_ccy(inst_id)
         price = snapshot["price"]
         signal_labels = self._signal_labels(signals)
         signal_text = "、".join(signal_labels) or "规则评分达标"
-        raw_score = score.get("raw_total_score", score.get("total_score", "-"))
-        trade_score = score.get("final_trade_score", score.get("total_score", "-"))
+        local_raw = local_score.get("raw_total_score", local_score.get("total_score", "-"))
+        local_trade = local_score.get("final_trade_score", local_score.get("total_score", "-"))
+        final_confidence = view.get("confidence", final_decision.get("confidence", "-"))
 
         title_parts = [
             symbol,
             view["direction"],
             f"险{view['risk_level']}",
-            f"{raw_score}分",
+            f"{final_confidence}分",
         ]
         if signal_labels:
             title_parts.append(signal_labels[0])
@@ -3522,18 +4416,18 @@ class OkxAiShortTermAssistant:
         lines = [
             f"## {inst_id} · {snapshot.get('time', now_text())}",
             "",
-            f"**AI结论**：{view['direction']} | 风险 {view['risk_level']} | 来源 {view['source']}",
-            f"**价格**：{price} | 观察分/交易分 {raw_score}/{trade_score}",
-            f"**主策略**：{score.get('strategy_label', '-')} | 风险偏好 {score.get('risk_preference', '-')}",
+            f"**最终结论**：{view['direction']} | 风险 {view['risk_level']} | 来源 {view['source']} | 推送 {view.get('push_recommendation', push_kind)}",
+            f"**价格**：{price} | 最终置信 {final_confidence} | 本地观察/交易 {local_raw}/{local_trade}",
+            f"**主策略**：{final_decision.get('strategy_label', local_score.get('strategy_label', '-'))} | 风险偏好 {final_decision.get('risk_preference', local_score.get('risk_preference', '-'))}",
         ]
-        selected_view = score.get("selected_strategy_view", {})
+        selected_view = local_score.get("selected_strategy_view", {})
         if selected_view.get("summary"):
             lines.append(f"**主策略视角**：{selected_view.get('summary')}")
-        scalp_view = score.get("strategy_views", {}).get("scalp", {})
+        scalp_view = local_score.get("strategy_views", {}).get("scalp", {})
         if scalp_view.get("action_level") in ("急速异动", "可短打"):
             lines.append(f"**超短线提醒**：{scalp_view.get('direction')} / {scalp_view.get('action_level')} / {scalp_view.get('score')}分；{scalp_view.get('summary')}")
         if view["direction"] != view["rule_direction"]:
-            lines.append(f"**规则方向**：{view['rule_direction']}（与AI不一致，推送以AI为准）")
+            lines.append(f"**本地参考方向**：{view['rule_direction']}（与最终结论不一致，以最终结论为准）")
         if view["trend_summary"] != "-":
             lines.append(f"**趋势**：{view['trend_summary']}")
         if view["trend_conflict"] not in ("-", "none", "无", "否"):
@@ -3571,8 +4465,8 @@ class OkxAiShortTermAssistant:
         lines.extend([
             "",
             f"**触发信号**：{signal_text}",
-            f"**市场状态**：{score.get('market_regime', 'unknown')} / {score.get('bias', 'neutral')}",
-            f"**交易动作**：{score.get('trade_action_level', '-')}",
+            f"**市场状态**：{final_decision.get('market_regime', local_score.get('market_regime', 'unknown'))} / {local_score.get('bias', 'neutral')}",
+            f"**决策来源**：{final_decision.get('decision_source', '-')} | 触发等级 {final_decision.get('trigger_level', '-')}",
             "",
             "仅供观察，不构成投资建议。",
         ])
@@ -3582,23 +4476,25 @@ class OkxAiShortTermAssistant:
         self,
         snapshot: Dict[str, Any],
         signals: List[Dict[str, Any]],
-        score: Dict[str, Any],
+        final_decision: Dict[str, Any],
         analysis: Dict[str, Any],
         push_kind: str = "trade",
+        local_score: Optional[Dict[str, Any]] = None,
     ) -> str:
-        title, desp = self._build_wechat_push_content(snapshot, signals, score, analysis, push_kind)
+        title, desp = self._build_wechat_push_content(
+            snapshot, signals, final_decision, analysis, push_kind, local_score=local_score
+        )
         return f"[OKX AI短线助手][{push_kind}] {title}\n\n{desp}"
 
     def _push_key(
         self,
         snapshot: Dict[str, Any],
         signals: List[Dict[str, Any]],
-        score: Dict[str, Any],
+        final_decision: Dict[str, Any],
+        push_kind: str,
     ) -> str:
-        # 同币种、同方向、同信号组合视为同一类提醒，进入冷却窗口。
         signal_types = ",".join(sorted(item["type"] for item in signals)) or "score-only"
-        push_kind = self._push_kind(score, signals) or "none"
-        return f"{push_kind}:{snapshot['inst_id']}:{score['direction']}:{signal_types}"
+        return f"{push_kind}:{snapshot['inst_id']}:{final_decision.get('direction', '观望')}:{signal_types}"
 
     def _in_push_cooldown(self, push_key: str) -> bool:
         last_at = self.last_push_at.get(push_key, 0.0)
@@ -3609,12 +4505,14 @@ class OkxAiShortTermAssistant:
         send_key: str,
         snapshot: Dict[str, Any],
         signals: List[Dict[str, Any]],
-        score: Dict[str, Any],
+        final_decision: Dict[str, Any],
         analysis: Dict[str, Any],
         push_kind: str = "trade",
+        local_score: Optional[Dict[str, Any]] = None,
     ) -> None:
-        # Server酱推送至个人微信。正文优先展示 AI 分析结论，规则分数仅作参考。
-        title, desp = self._build_wechat_push_content(snapshot, signals, score, analysis, push_kind)
+        title, desp = self._build_wechat_push_content(
+            snapshot, signals, final_decision, analysis, push_kind, local_score=local_score
+        )
         try:
             http_post_json(
                 f"https://sctapi.ftqq.com/{send_key}.send",
@@ -3622,8 +4520,9 @@ class OkxAiShortTermAssistant:
                 self.runtime_config.retry_times,
                 self.runtime_config.retry_backoff,
             )
+            self._log_push_event(snapshot, signals, final_decision, push_kind, "sent")
         except Exception as exc:
-            print(f"WeChat push failed: {exc}")
+            self._log_push_event(snapshot, signals, final_decision, push_kind, f"failed: {exc}")
 
     def _rotate_log_if_needed(self) -> None:
         # 简单日志轮转：超过大小就把当前日志替换为 .1。
@@ -3637,24 +4536,55 @@ class OkxAiShortTermAssistant:
                 backup.unlink()
             LOG_FILE.replace(backup)
         except Exception as exc:
-            print(f"log rotation failed: {exc}")
+            console_debug(f"log rotation failed: {exc}")
 
-    def _print_console(
+    def _log_console_summary(
         self,
         snapshot: Dict[str, Any],
         signals: List[Dict[str, Any]],
-        score: Dict[str, Any],
-        analysis: Dict[str, Any],
+        final_decision: Dict[str, Any],
+        analysis: Optional[Dict[str, Any]],
+        trigger: Dict[str, Any],
     ) -> None:
-        # 控制台输出每轮核心摘要，方便命令行观察运行效果。
-        signal_text = ", ".join(item["desc"] for item in signals) if signals else "none"
-        print(
-            f"[{snapshot['time']}] {snapshot['inst_id']} "
-            f"price={snapshot['price']} score={score['total_score']} "
-            f"dir={score['direction']} risk={score['risk_level']} signals={signal_text}"
+        if not self.replay_mode and not self.runtime_config.analysis_log_enabled:
+            return
+        if not signals and trigger.get("level") == "L0":
+            return
+
+        signal_text = ", ".join(item.get("type", item.get("desc", "?")) for item in signals) or "none"
+        source_prefix = decision_source_prefix(final_decision)
+        trigger_text = format_ai_call_status(trigger, self.ai_enabled)
+
+        console_info(
+            f"[{snapshot['time']}] {snapshot['inst_id']} price={snapshot['price']} "
+            f"{source_prefix} {trigger_text} signals={signal_text}"
         )
-        if signals:
-            print(f"analysis={json.dumps(analysis, ensure_ascii=False)}")
+
+        decision_source = str(final_decision.get("decision_source", "") or "")
+        if decision_source == "ai":
+            for line in format_ai_analysis_lines(analysis or {}, final_decision):
+                console_info(line)
+        elif decision_source == "local_fallback":
+            for line in format_ai_analysis_lines(analysis or {}, final_decision):
+                console_info(line)
+            console_info(format_local_decision_line(final_decision))
+        else:
+            console_info(format_local_decision_line(final_decision))
+
+    def _log_push_event(
+        self,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        final_decision: Dict[str, Any],
+        push_kind: str,
+        status: str,
+    ) -> None:
+        signal_text = ",".join(item["type"] for item in signals)
+        console_info(
+            f"[{snapshot['time']}] {decision_source_prefix(final_decision)} push [{push_kind}] "
+            f"{snapshot['inst_id']} dir={final_decision.get('direction', '-')} "
+            f"conf={final_decision.get('confidence', '-')} signals={signal_text} -> {status}"
+        )
 
 
 def short_count_greater(trends: Dict[str, str]) -> bool:
@@ -3724,6 +4654,13 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("REPLAY_LOG_FILE", str(REPLAY_LOG_FILE)),
         help="Analysis JSONL output path when replaying",
     )
+    parser.add_argument(
+        "--analysis-log",
+        action="store_true",
+        default=os.getenv("ANALYSIS_LOG_ENABLED", "0") == "1",
+        help="Write JSON analysis log and per-round console summaries during live monitoring",
+    )
+    parser.add_argument("--no-analysis-log", action="store_false", dest="analysis_log")
 
     # add_argument只是向实例中注册参数，parse_args才是真正解析命令行参数的地方。会优先检测py执行时有没有传入参数，没有才会使用default；
     return parser.parse_args()
@@ -3764,6 +4701,7 @@ def main() -> int:
             retry_backoff=max(args.retry_backoff, 0.1),
             push_cooldown_seconds=max(args.push_cooldown, 0),
             log_max_bytes=max(args.log_max_bytes, 1024 * 1024),
+            analysis_log_enabled=bool(args.analysis_log),
         ),
     )
     if args.record_replay:
@@ -3775,12 +4713,12 @@ def main() -> int:
         try:
             assistant.run_replay(frames, max(float(args.replay_interval), 0.0))
         except KeyboardInterrupt:
-            print("Replay stopped.")
+            console_info("Replay stopped.")
         return 0
     try:
         assistant.run_forever(args.runtime)
     except KeyboardInterrupt:
-        print("Stopped.")
+        console_info("Stopped.")
     return 0
 
 

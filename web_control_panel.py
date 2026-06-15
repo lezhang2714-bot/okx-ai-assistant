@@ -28,14 +28,9 @@ if str(SCRIPT_DIR) not in sys.path:
 
 try:
     from okx_signal_monitor import (
-        KLINE_LIMIT,
         REPLAY_DATASET_FILE,
         REPLAY_LOG_FILE,
-        OkxAiShortTermAssistant,
-        RuntimeConfig,
-        SignalConfig,
         replay_dataset_stats,
-        trend_profile_from_candles,
     )
 except ModuleNotFoundError:
     import importlib.util
@@ -47,14 +42,9 @@ except ModuleNotFoundError:
     signal_monitor_module = importlib.util.module_from_spec(spec)
     sys.modules["okx_signal_monitor"] = signal_monitor_module
     spec.loader.exec_module(signal_monitor_module)
-    OkxAiShortTermAssistant = signal_monitor_module.OkxAiShortTermAssistant
-    KLINE_LIMIT = signal_monitor_module.KLINE_LIMIT
     REPLAY_DATASET_FILE = signal_monitor_module.REPLAY_DATASET_FILE
     REPLAY_LOG_FILE = signal_monitor_module.REPLAY_LOG_FILE
     replay_dataset_stats = signal_monitor_module.replay_dataset_stats
-    RuntimeConfig = signal_monitor_module.RuntimeConfig
-    SignalConfig = signal_monitor_module.SignalConfig
-    trend_profile_from_candles = signal_monitor_module.trend_profile_from_candles
 
 BUILD_DIR = SCRIPT_DIR / "build"
 CONFIG_DIR = SCRIPT_DIR / "config"
@@ -92,38 +82,24 @@ REPLAY_PROCESS: subprocess.Popen = None
 REPLAY_STARTED_AT = ""
 REPLAY_LOG_START_AT = ""
 REPLAY_STOPPED_AT = ""
+_DATASET_STATS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_LOG_LINE_COUNT_CACHE: Dict[str, Tuple[float, int]] = {}
+
+
+FIXED_MONITOR_RUNTIME = 0
+FIXED_OKX_FLAG = "0"
+LEGACY_CONFIG_KEYS = ("runtime", "flag")
 
 
 CONFIG_FIELDS = [
     ("基础运行", "interval", "number", "轮询间隔(秒)", "默认5秒执行一轮监控。"),
+    ("基础运行", "analysis_log_enabled", "checkbox", "写入分析日志", "开启后每轮写入 JSON 分析日志与控制台摘要；关闭可减磁盘与 Web 轮询开销。监控指标叠加与 live 压测依赖此项。"),
     ("基础运行", "record_replay_enabled", "checkbox", "录制回放数据集", "监控运行时把每轮 collect_snapshot 原始输入写入 replay_dataset.jsonl，供离线回放压测。"),
-    ("基础运行", "runtime", "number", "运行时长(秒)", "0表示一直运行，300表示运行5分钟。"),
-    ("基础运行", "flag", "choice", "OKX环境", "0正式环境，1模拟盘。"),
-    ("策略模式", "strategy_mode", "strategy_choice", "策略周期", "超短线捕捉1-15分钟急速波动；短线关注5m/15m结构；中线关注1H/4H趋势。"),
-    ("策略模式", "risk_preference", "risk_choice", "风险偏好", "保守提高确认门槛，激进更早提示机会。"),
-    ("策略模式", "signal_trade_enabled", "checkbox", "交易信号", "允许推送做多/做空交易信号。"),
-    ("策略模式", "signal_watch_enabled", "checkbox", "观察信号", "允许推送资金费率、背离、布林收口等观察型风险信号。"),
-    ("策略模式", "signal_spike_enabled", "checkbox", "急速异动提醒", "并行捕捉5-10分钟急速涨跌，即使主策略不是超短线也会提示。"),
-    ("策略模式", "ai_output_style", "ai_style_choice", "AI输出风格", "稳健确认偏保守；动量捕捉更关注短时波动；趋势跟随更关注顺势结构。"),
-    ("高级策略", "allow_scalp_trade", "checkbox", "允许超短线交易建议", "关闭时超短线只做异动提醒；开启后可给入场/止损/止盈。"),
-    ("高级策略", "allow_counter_4h_scalp", "checkbox", "允许逆4H短打", "仅影响超短线，开启后不因4H反向直接压低动量单。"),
-    ("高级策略", "allow_oi_divergence_momentum", "checkbox", "允许OI背离动量单", "仅影响超短线，允许价涨仓减这类逼空/回补型上涨提示。"),
-    ("高级策略", "scalp_move_pct_5m", "number", "5分钟急速阈值%", "最近5根已收盘1m K线涨跌幅超过该值时触发超短线动量评分。"),
-    ("高级策略", "scalp_move_pct_10m", "number", "10分钟急速阈值%", "最近10根已收盘1m K线涨跌幅超过该值时触发超短线动量评分。"),
-    ("AI与推送", "watch_push_score", "number", "观察/异动推送分", "观察信号和急速异动提醒达到该分数才推送。"),
-    ("AI与推送", "ai_enabled", "checkbox", "启用AI分析", "触发信号后调用AI。"),
-    ("AI与推送", "dry_run_ai", "checkbox", "AI dry-run", "只生成AI请求数据，不真实调用AI。"),
-    ("AI与推送", "push_enabled", "checkbox", "启用微信推送", "满足信号和评分条件时通过 Server酱 推送到个人微信。"),
-    ("AI与推送", "push_score", "number", "推送分数阈值", "触发信号且评分达到该值才推送。"),
-    ("策略阈值", "volume_multiplier", "number", "放量倍数", "当前1m成交量超过20根均量的倍数。"),
-    ("策略阈值", "oi_change_pct_15m", "number", "15分钟OI变化%", "预热满15分钟后生效。"),
-    ("策略阈值", "funding_abs_threshold", "number", "资金费率过热阈值", "资金费率绝对值超过该值触发。"),
-    ("策略阈值", "funding_change_threshold", "number", "资金费率变化阈值", "预热满15分钟后生效。"),
-    ("策略阈值", "long_short_extreme", "number", "多空极端占比", "例如0.75表示75%。"),
-    ("网络与日志", "retry_times", "number", "重试次数", "OKX/AI/推送请求失败重试次数。"),
-    ("网络与日志", "retry_backoff", "number", "重试退避(秒)", "第N次失败等待 backoff * N 秒。"),
-    ("网络与日志", "push_cooldown_seconds", "number", "推送冷却(秒)", "同类信号冷却期内不重复推送。"),
-    ("网络与日志", "log_max_bytes", "number", "日志最大字节", "超过后轮转为.1文件。"),
+    ("策略", "strategy_mode", "strategy_choice", "策略周期", "超短线抓5-10分钟脉冲；短线需5m+15m profile 同向或20分钟延伸；中线看1H/15m/4H结构。会切换本地主路径与 final_direction。"),
+    ("策略", "risk_preference", "risk_choice", "确认严格度", "保守：更高动量阈值与确认分(88)；标准：默认；激进：更低阈值(65)且短线可凭短窗压力给方向。"),
+    ("AI与推送", "ai_enabled", "checkbox", "启用AI分析", "L2/L3 触发后调用 AI 做主决策。"),
+    ("AI与推送", "push_enabled", "checkbox", "启用微信推送", "final_decision 过门槛后通过 Server酱 推送。"),
+    ("AI与推送", "push_score", "number", "推送分数阈值", "trade/watch/spike 均参考该置信度；观察与异动默认与交易同门槛。"),
 ]
 
 ENV_DEFAULTS = {
@@ -143,9 +119,8 @@ def default_config() -> Dict[str, Any]:
     return {
         "inst_ids": ["BTC-USDT-SWAP", "ETH-USDT-SWAP"],
         "interval": 5,
+        "analysis_log_enabled": False,
         "record_replay_enabled": False,
-        "runtime": 0,
-        "flag": "0",
         "strategy_mode": "short",
         "risk_preference": "standard",
         "signal_trade_enabled": True,
@@ -207,12 +182,51 @@ def load_json(path: Path, default: Any) -> Any:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
-def load_config() -> Dict[str, Any]:
-    config = default_config()
-    loaded = load_json(active_config_file(), {})
-    if isinstance(loaded, dict):
-        config.update(loaded)
+def visible_config_keys() -> set:
+    keys = {"inst_ids"}
+    for _, key, _, _, _ in CONFIG_FIELDS:
+        keys.add(key)
+    return keys
+
+
+def derive_ai_output_style(config: Dict[str, Any]) -> str:
+    risk = str(config.get("risk_preference", "standard") or "standard")
+    mode = str(config.get("strategy_mode", "short") or "short")
+    if risk == "aggressive":
+        return "momentum"
+    if mode == "swing":
+        return "trend"
+    return "steady"
+
+
+def normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    merged = default_config()
+    visible = visible_config_keys()
+    if isinstance(config, dict):
+        for key, value in config.items():
+            if key in visible:
+                merged[key] = value
+    defaults = default_config()
+    for key, value in defaults.items():
+        if key not in visible:
+            merged[key] = value
+    merged["ai_output_style"] = derive_ai_output_style(merged)
+    merged["watch_push_score"] = int(merged.get("push_score", 80))
+    merged["allow_scalp_trade"] = merged.get("strategy_mode") == "scalp" or bool(merged.get("allow_scalp_trade"))
+    return strip_legacy_config_keys(merged)
+
+
+def strip_legacy_config_keys(config: Dict[str, Any]) -> Dict[str, Any]:
+    for key in LEGACY_CONFIG_KEYS:
+        config.pop(key, None)
     return config
+
+
+def load_config() -> Dict[str, Any]:
+    loaded = load_json(active_config_file(), {})
+    if not isinstance(loaded, dict):
+        loaded = {}
+    return normalize_config(loaded)
 
 
 def configured_instruments() -> List[str]:
@@ -222,8 +236,15 @@ def configured_instruments() -> List[str]:
     return [inst for inst in inst_ids if inst in SUPPORTED_INSTRUMENTS]
 
 
+def analysis_log_enabled() -> bool:
+    return bool(load_config().get("analysis_log_enabled", False))
+
+
 def save_config(config: Dict[str, Any]) -> Path:
-    text = json.dumps(config, indent=2, ensure_ascii=False) + "\n"
+    normalized = normalize_config(config)
+    visible = visible_config_keys()
+    to_save = {key: normalized[key] for key in visible if key in normalized}
+    text = json.dumps(to_save, indent=2, ensure_ascii=False) + "\n"
     try:
         PORTABLE_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         PORTABLE_CONFIG_FILE.write_text(text, encoding="utf-8")
@@ -336,7 +357,14 @@ def update_from_form(form: Dict[str, Any]) -> Path:
 
 
 def export_config_bundle(name: str = "") -> Dict[str, Any]:
-    return {"name": name or "OKX_AI_Config", "version": "1.0", "config": load_config(), "env": load_env()}
+    config = load_config()
+    visible = visible_config_keys()
+    return {
+        "name": name or "OKX_AI_Config",
+        "version": "1.0",
+        "config": {key: config[key] for key in visible if key in config},
+        "env": load_env(),
+    }
 
 
 def import_config_bundle(bundle: Dict[str, Any]) -> None:
@@ -358,6 +386,7 @@ def build_child_env() -> Dict[str, str]:
 
 
 def build_monitor_args(config: Dict[str, Any]) -> List[str]:
+    config = normalize_config(config)
     args = [
         sys.executable,
         str(SCRIPT_DIR / "okx_signal_monitor.py"),
@@ -366,9 +395,9 @@ def build_monitor_args(config: Dict[str, Any]) -> List[str]:
         "--interval",
         str(config.get("interval", 5)),
         "--runtime",
-        str(config.get("runtime", 0)),
+        str(FIXED_MONITOR_RUNTIME),
         "--flag",
-        str(config.get("flag", "0")),
+        FIXED_OKX_FLAG,
         "--push-score",
         str(config.get("push_score", 80)),
         "--retry-times",
@@ -419,6 +448,7 @@ def build_monitor_args(config: Dict[str, Any]) -> List[str]:
         args.append("--push")
     if config.get("record_replay_enabled"):
         args.extend(["--record-replay", "--record-replay-file", str(REPLAY_DATASET_FILE)])
+    args.append("--analysis-log" if config.get("analysis_log_enabled") else "--no-analysis-log")
     return args
 
 
@@ -477,6 +507,7 @@ def start_replay(replay_interval: float = 0.5, dataset_path: Path = None) -> str
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     if REPLAY_ANALYSIS_LOG_FILE.exists():
         REPLAY_ANALYSIS_LOG_FILE.unlink()
+    _LOG_LINE_COUNT_CACHE.pop(str(REPLAY_ANALYSIS_LOG_FILE), None)
     log_file = REPLAY_PROCESS_LOG_FILE.open("a", encoding="utf-8")
     log_file.write(f"\n===== replay started at {REPLAY_STARTED_AT} dataset={dataset} =====\n")
     log_file.flush()
@@ -516,29 +547,66 @@ def stop_replay() -> str:
     return "回放已停止。"
 
 
-def count_nonempty_lines(path: Path) -> int:
+def count_nonempty_lines(path: Path, *, fast: bool = False) -> int:
     if not path.exists():
         return 0
+    try:
+        stat = path.stat()
+    except OSError:
+        return 0
+    cache_key = str(path)
+    if fast and replay_status()["running"]:
+        return max(0, int(stat.st_size / 1200))
+    cached = _LOG_LINE_COUNT_CACHE.get(cache_key)
+    if cached and cached[0] == stat.st_mtime:
+        return cached[1]
     count = 0
     with path.open("r", encoding="utf-8-sig") as file:
         for line in file:
             if line.strip():
                 count += 1
+    _LOG_LINE_COUNT_CACHE[cache_key] = (stat.st_mtime, count)
     return count
 
 
-def replay_dataset_info() -> Dict[str, Any]:
-    stats = replay_dataset_stats(REPLAY_DATASET_FILE)
+def cached_replay_dataset_stats(path: Path) -> Dict[str, Any]:
+    cache_key = str(path)
+    try:
+        mtime = path.stat().st_mtime if path.exists() else 0.0
+    except OSError:
+        mtime = 0.0
+    cached = _DATASET_STATS_CACHE.get(cache_key)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    stats = replay_dataset_stats(path)
+    _DATASET_STATS_CACHE[cache_key] = (mtime, stats)
+    return stats
+
+
+def analysis_log_bytes() -> int:
+    if not REPLAY_ANALYSIS_LOG_FILE.exists():
+        return 0
+    try:
+        return int(REPLAY_ANALYSIS_LOG_FILE.stat().st_size)
+    except OSError:
+        return 0
+
+
+def replay_dataset_info(*, lite: bool = False) -> Dict[str, Any]:
+    stats = cached_replay_dataset_stats(REPLAY_DATASET_FILE)
     status = replay_status()
     config = load_config()
+    running = bool(status["running"])
+    line_count = count_nonempty_lines(REPLAY_ANALYSIS_LOG_FILE, fast=lite or running)
     return {
         **stats,
         "record_enabled": bool(config.get("record_replay_enabled")),
         "monitor_running": bool(monitor_status()["running"]),
-        "replay_running": bool(status["running"]),
+        "replay_running": running,
         "replay_status": status,
         "analysis_log_path": str(REPLAY_ANALYSIS_LOG_FILE),
-        "analysis_log_lines": count_nonempty_lines(REPLAY_ANALYSIS_LOG_FILE),
+        "analysis_log_lines": line_count,
+        "analysis_log_bytes": analysis_log_bytes(),
         "replay_log_start_at": REPLAY_LOG_START_AT,
     }
 
@@ -554,14 +622,24 @@ def monitor_status() -> Dict[str, Any]:
         except Exception:
             elapsed_seconds = 0
     if MONITOR_PROCESS is None:
-        return {"running": False, "text": "未启动", "started_at": "", "elapsed_seconds": 0}
+        return {"running": False, "text": "未启动", "started_at": "", "elapsed_seconds": 0, "analysis_log_enabled": analysis_log_enabled()}
     code = MONITOR_PROCESS.poll()
     if code is None:
-        return {"running": True, "text": f"运行中 PID={MONITOR_PROCESS.pid}", "started_at": MONITOR_STARTED_AT, "elapsed_seconds": elapsed_seconds}
+        return {
+            "running": True,
+            "text": f"运行中 PID={MONITOR_PROCESS.pid}",
+            "started_at": MONITOR_STARTED_AT,
+            "elapsed_seconds": elapsed_seconds,
+            "analysis_log_enabled": analysis_log_enabled(),
+        }
     if not MONITOR_STOPPED_AT:
         MONITOR_STOPPED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
         return monitor_status()
-    return {"running": False, "text": f"已停止，退出码={code}", "started_at": MONITOR_STARTED_AT, "elapsed_seconds": elapsed_seconds}
+    return {"running": False, "text": f"已停止，退出码={code}", "started_at": MONITOR_STARTED_AT, "elapsed_seconds": elapsed_seconds, "analysis_log_enabled": analysis_log_enabled()}
+
+
+def analysis_log_disabled_message() -> str:
+    return "分析日志写入已关闭。请在配置页或本页打开「写入分析日志」开关，保存后重新启动监控才会输出。"
 
 
 def start_monitor() -> str:
@@ -726,8 +804,42 @@ def merge_price_points(history_points: List[Dict[str, Any]], realtime_points: Li
     return merged[-max_points:]
 
 
-def point_from_log_item(item: Dict[str, Any], price: float) -> Dict[str, Any]:
+def effective_fields_from_log_item(item: Dict[str, Any]) -> Dict[str, Any]:
     score = item.get("score") if isinstance(item.get("score"), dict) else {}
+    final_decision = item.get("final_decision") if isinstance(item.get("final_decision"), dict) else {}
+    if not final_decision:
+        return score
+
+    direction = final_decision.get("direction", score.get("direction", "观望"))
+    confidence = final_decision.get("confidence", score.get("raw_total_score", 0))
+    final_trade_score = confidence if direction in ("做多", "做空") else 0
+    raw_total_score = score.get("raw_total_score", confidence)
+    entry_plan = score.get("entry_plan") if isinstance(score.get("entry_plan"), dict) else {}
+    merged = dict(score)
+    merged.update(
+        {
+            "direction": direction,
+            "final_direction": direction,
+            "raw_total_score": raw_total_score,
+            "final_trade_score": final_trade_score,
+            "total_score": confidence if direction in ("做多", "做空") else raw_total_score,
+            "entry": final_decision.get("entry", score.get("entry")),
+            "stop_loss": final_decision.get("stop_loss", score.get("stop_loss")),
+            "take_profit": final_decision.get("take_profit", score.get("take_profit")),
+            "risk_level": final_decision.get("risk_level", score.get("risk_level")),
+            "trade_action_level": final_decision.get("push_recommendation", score.get("trade_action_level")),
+            "decision_source": final_decision.get("decision_source"),
+            "ai_called": final_decision.get("ai_called"),
+            "trigger_level": final_decision.get("trigger_level"),
+        }
+    )
+    if not entry_plan:
+        merged["entry_plan"] = {}
+    return merged
+
+
+def point_from_log_item(item: Dict[str, Any], price: float) -> Dict[str, Any]:
+    score = effective_fields_from_log_item(item)
     volume = item.get("volume") if isinstance(item.get("volume"), dict) else {}
     long_short = item.get("long_short_ratio") if isinstance(item.get("long_short_ratio"), dict) else {}
     signals = item.get("signals") if isinstance(item.get("signals"), list) else []
@@ -840,8 +952,10 @@ def tail_text(path: Path, max_bytes: int = 160000) -> str:
 
 
 def monitor_log_text() -> str:
+    if not analysis_log_enabled():
+        return analysis_log_disabled_message()
     if not MONITOR_LOG_START_AT:
-        return "等待启动监控。本窗口只显示本次启动后的JSON分析日志。"
+        return "等待启动监控。本窗口只显示本次启动后的 JSON 分析日志，供图表与压测使用。"
     lines = []
     for line in tail_text(MONITOR_JSON_LOG_FILE, 40 * 1024 * 1024).splitlines():
         try:
@@ -854,8 +968,10 @@ def monitor_log_text() -> str:
 
 
 def monitor_console_log_text() -> str:
+    if not analysis_log_enabled():
+        return analysis_log_disabled_message() + " 推送等关键事件仍可能写入进程控制台。"
     if not MONITOR_LOG_START_AT:
-        return "等待启动监控。本窗口只显示本次启动后的控制台输出。"
+        return "等待启动监控。本窗口只显示本次启动后的控制台摘要，包含信号、推送与异常。"
     if not MONITOR_PROCESS_LOG_FILE.exists():
         return "暂无控制台日志文件。"
     marker = f"===== signal monitor started at {MONITOR_LOG_START_AT} ====="
@@ -871,23 +987,25 @@ def read_monitor_points(inst_id: str, max_points: int = 20000) -> Dict[str, Any]
     realtime_points = []
     log_chart_points = []
     running = bool(monitor_status()["running"])
-    for line in tail_text(MONITOR_JSON_LOG_FILE, 40 * 1024 * 1024).splitlines():
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if item.get("inst_id") != inst_id:
-            continue
-        try:
-            price = float(item.get("price"))
-        except (TypeError, ValueError):
-            continue
-        if MONITOR_LOG_START_AT and str(item.get("time", "")) < MONITOR_LOG_START_AT:
-            continue
-        item_chart_points = chart_points_from_log_item(item)
-        if item_chart_points:
-            log_chart_points = item_chart_points
-        realtime_points.append(point_from_log_item(item, price))
+    log_enabled = analysis_log_enabled()
+    if log_enabled:
+        for line in tail_text(MONITOR_JSON_LOG_FILE, 40 * 1024 * 1024).splitlines():
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if item.get("inst_id") != inst_id:
+                continue
+            try:
+                price = float(item.get("price"))
+            except (TypeError, ValueError):
+                continue
+            if MONITOR_LOG_START_AT and str(item.get("time", "")) < MONITOR_LOG_START_AT:
+                continue
+            item_chart_points = chart_points_from_log_item(item)
+            if item_chart_points:
+                log_chart_points = item_chart_points
+            realtime_points.append(point_from_log_item(item, price))
     realtime_points = realtime_points[-max_points:]
     source = "signal-monitor-log"
     points = realtime_points
@@ -939,198 +1057,6 @@ def parse_history_time(value: str) -> datetime:
     return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
 
 
-def find_log_item_near(inst_id: str, target: datetime, tolerance_seconds: int = 90) -> Tuple[Dict[str, Any], int]:
-    best = {}
-    best_delta = 10 ** 9
-    for line in tail_text(MONITOR_JSON_LOG_FILE, 40 * 1024 * 1024).splitlines():
-        try:
-            item = json.loads(line)
-            if item.get("inst_id") != inst_id:
-                continue
-            item_time = parse_history_time(str(item.get("time", "")))
-        except Exception:
-            continue
-        delta = abs(int((item_time - target).total_seconds()))
-        if delta < best_delta:
-            best = item
-            best_delta = delta
-    return (best, best_delta) if best and best_delta <= tolerance_seconds else ({}, best_delta)
-
-
-def log_candles_between(inst_id: str, start_time: datetime, end_time: datetime) -> List[Dict[str, Any]]:
-    # 近期历史回放优先使用本地监控日志里的1m K线。
-    # 原因：用户通常验证的是当前时间前十几二十分钟，monitor日志已经保存了当时及后续每轮的chart.points。
-    # 直接用日志能避免OKX history-candles分页参数、网络不可用、最新K线尚未归档等问题。
-    by_minute: Dict[str, Dict[str, Any]] = {}
-    for line in tail_text(MONITOR_JSON_LOG_FILE, 40 * 1024 * 1024).splitlines():
-        try:
-            item = json.loads(line)
-            if item.get("inst_id") != inst_id:
-                continue
-            item_time = parse_history_time(str(item.get("time", "")))
-        except Exception:
-            continue
-        if not (start_time < item_time <= end_time):
-            continue
-        chart = item.get("chart") if isinstance(item.get("chart"), dict) else {}
-        rows = chart.get("points") if chart.get("bar") == "1m" and isinstance(chart.get("points"), list) else []
-        for row in rows[:3]:
-            if not isinstance(row, dict):
-                continue
-            try:
-                row_time = parse_history_time(str(row.get("time", "")))
-                candle = {
-                    "time": row_time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "open": float(row.get("open")),
-                    "high": float(row.get("high")),
-                    "low": float(row.get("low")),
-                    "close": float(row.get("close")),
-                    "volume": float(row.get("volume", 0.0)),
-                    "confirmed": str(row.get("confirmed", "1")),
-                }
-            except Exception:
-                continue
-            if start_time < row_time <= end_time:
-                by_minute[minute_bucket_key(candle["time"])] = candle
-    return [by_minute[key] for key in sorted(by_minute)]
-
-
-def get_history_candles_before(inst_id: str, bar: str, at_time: datetime, limit: int = KLINE_LIMIT) -> List[Dict[str, Any]]:
-    before_ms = int(at_time.timestamp() * 1000)
-    query = urllib.parse.urlencode({"instId": inst_id, "bar": bar, "before": str(before_ms), "limit": str(limit)})
-    request = urllib.request.Request(
-        f"{OKX_BASE_URL}/api/v5/market/history-candles?{query}",
-        headers={"Accept": "application/json", "User-Agent": "okx-ai-assistant-web/1.0"},
-    )
-    with urllib.request.urlopen(request, timeout=10) as response:
-        payload = json.loads(response.read().decode("utf-8", errors="ignore"))
-    candles = []
-    for row in payload.get("data") or []:
-        if not isinstance(row, list) or len(row) < 6:
-            continue
-        candles.append({
-            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(row[0]) / 1000)),
-            "open": float(row[1]),
-            "high": float(row[2]),
-            "low": float(row[3]),
-            "close": float(row[4]),
-            "volume": float(row[5]),
-            "confirmed": str(row[8]) if len(row) > 8 else "1",
-        })
-    return candles
-
-
-def build_history_assistant(config: Dict[str, Any]) -> OkxAiShortTermAssistant:
-    return OkxAiShortTermAssistant(
-        instruments=config.get("inst_ids", list(SUPPORTED_INSTRUMENTS)),
-        interval=max(int(config.get("interval", 5)), 1),
-        flag=str(config.get("flag", "0")),
-        ai_enabled=False,
-        push_enabled=False,
-        push_score=int(config.get("push_score", 80)),
-        dry_run_ai=False,
-        config=SignalConfig(
-            volume_multiplier=float(config.get("volume_multiplier", 2.0)),
-            oi_change_pct_15m=float(config.get("oi_change_pct_15m", 5.0)),
-            funding_abs_threshold=float(config.get("funding_abs_threshold", 0.0008)),
-            funding_change_threshold=float(config.get("funding_change_threshold", 0.0003)),
-            long_short_extreme=float(config.get("long_short_extreme", 0.75)),
-            strategy_mode=str(config.get("strategy_mode", "short")),
-            risk_preference=str(config.get("risk_preference", "standard")),
-            signal_trade_enabled=bool(config.get("signal_trade_enabled", True)),
-            signal_watch_enabled=bool(config.get("signal_watch_enabled", True)),
-            signal_spike_enabled=bool(config.get("signal_spike_enabled", True)),
-            ai_output_style=str(config.get("ai_output_style", "steady")),
-            allow_scalp_trade=bool(config.get("allow_scalp_trade", False)),
-            allow_counter_4h_scalp=bool(config.get("allow_counter_4h_scalp", False)),
-            allow_oi_divergence_momentum=bool(config.get("allow_oi_divergence_momentum", False)),
-            scalp_move_pct_5m=float(config.get("scalp_move_pct_5m", 0.22)),
-            scalp_move_pct_10m=float(config.get("scalp_move_pct_10m", 0.35)),
-            watch_push_score=int(config.get("watch_push_score", config.get("push_score", 80))),
-        ),
-        runtime_config=RuntimeConfig(),
-    )
-
-
-def snapshot_from_log_or_history(inst_id: str, at_time: datetime, assistant: OkxAiShortTermAssistant) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    log_item, delta = find_log_item_near(inst_id, at_time)
-    if log_item:
-        candles = {}
-        chart = log_item.get("chart") if isinstance(log_item.get("chart"), dict) else {}
-        chart_rows = chart.get("points") if isinstance(chart.get("points"), list) else []
-        if chart_rows:
-            # okx_signal_monitor.py 写入日志时保存的是供指标计算使用的 K 线顺序：
-            # 最新 K 线在前、越往后越旧。这里回放的是同一套评分逻辑，
-            # 因此必须保留原顺序，不能按 Web 画图的时间轴习惯反转。
-            candles["1m"] = chart_rows
-        for bar in ("3m", "5m", "15m", "1H", "4H"):
-            try:
-                candles[bar] = get_history_candles_before(inst_id, bar, at_time)
-            except Exception:
-                candles[bar] = []
-        if not candles.get("1m"):
-            candles["1m"] = get_history_candles_before(inst_id, "1m", at_time)
-        source_meta = {"source": "signal-monitor-log", "nearest_log_delta_seconds": delta}
-        base = log_item
-    else:
-        candles = {bar: get_history_candles_before(inst_id, bar, at_time) for bar in ("1m", "3m", "5m", "15m", "1H", "4H")}
-        source_meta = {"source": "rebuilt-kline", "nearest_log_delta_seconds": delta, "data_quality": "partial"}
-        base = {}
-
-    price = float(base.get("price") or (candles.get("1m", [{}])[0].get("close") if candles.get("1m") else 0.0))
-    volume = assistant._volume_stats(candles.get("1m", []))
-    profiles = {bar: trend_profile_from_candles(rows) for bar, rows in candles.items()}
-    volatility = assistant._volatility_context(inst_id, profiles)
-    dynamic = assistant._dynamic_thresholds(inst_id)
-    long_short = base.get("long_short_ratio") if isinstance(base.get("long_short_ratio"), dict) else {"available": False, "long_ratio": 0.0, "short_ratio": 0.0, "long_short_ratio": 0.0}
-    order_book = base.get("order_book") if isinstance(base.get("order_book"), dict) else {"available": False, "imbalance": 0.0, "imbalance_5": 0.0, "spread_pct": 0.0}
-    oi_change = float(base.get("oi_change_pct_15m") or 0.0)
-    funding_change = float(base.get("funding_change") or 0.0)
-    funding_rate = float(base.get("funding_rate") or 0.0)
-    context = assistant._market_context(price, candles, profiles, volume, float(base.get("open_interest") or 0.0), oi_change, funding_rate, funding_change, long_short, order_book, volatility, dynamic)
-    snapshot = {
-        "time": at_time.strftime("%Y-%m-%d %H:%M:%S"),
-        "inst_id": inst_id,
-        "price": price,
-        "best_bid": price,
-        "best_ask": price,
-        "candles": candles,
-        "volume": volume,
-        "open_interest": base.get("open_interest"),
-        "oi_change_pct_15m": oi_change,
-        "oi_warmup_ready": bool(base.get("oi_warmup_ready", False)),
-        "funding_rate": funding_rate,
-        "funding_change": funding_change,
-        "funding_warmup_ready": bool(base.get("funding_warmup_ready", False)),
-        "long_short_ratio": long_short,
-        "order_book": order_book,
-        "trend_profiles": profiles,
-        "volatility": volatility,
-        "dynamic_thresholds": dynamic,
-        "instrument_profile": assistant._instrument_profile(inst_id),
-        "market_context": context,
-    }
-    return snapshot, source_meta
-
-
-def get_future_1m_candles(inst_id: str, at_time: datetime, minutes: int = 25) -> Tuple[List[Dict[str, Any]], str]:
-    end_time = min(datetime.now(), datetime.fromtimestamp(at_time.timestamp() + minutes * 60))
-    rows = log_candles_between(inst_id, at_time, end_time)
-    if rows:
-        return rows, "signal-monitor-log"
-    rows = get_history_candles_before(inst_id, "1m", end_time, limit=max(80, minutes + 40))
-    selected = []
-    for row in rows:
-        try:
-            row_time = parse_history_time(str(row.get("time", "")))
-        except Exception:
-            continue
-        if at_time < row_time <= end_time:
-            selected.append(row)
-    selected.sort(key=lambda item: item.get("time", ""))
-    return selected, "okx-history-candles"
-
-
 def parse_level_pair(text: Any) -> Tuple[float, float]:
     if not text or text == "-":
         return 0.0, 0.0
@@ -1152,112 +1078,6 @@ def parse_targets(text: Any) -> List[float]:
         except ValueError:
             continue
     return out
-
-
-def evaluate_history_outcome(snapshot: Dict[str, Any], score: Dict[str, Any], future: List[Dict[str, Any]]) -> Dict[str, Any]:
-    price = float(snapshot.get("price") or 0.0)
-    direction = score.get("raw_direction") if score.get("raw_direction") in ("做多", "做空") else score.get("direction")
-    entry_low, entry_high = parse_level_pair(score.get("entry"))
-    stop = float(score.get("stop_loss")) if score.get("stop_loss") not in (None, "-") else 0.0
-    targets = parse_targets(score.get("take_profit"))
-    entry_touched = False
-    entry_price = 0.0
-    stop_hit = False
-    tp_hits = [False for _ in targets]
-    mfe = 0.0
-    mae = 0.0
-    returns = {}
-    for index, row in enumerate(future, start=1):
-        high = float(row.get("high") or 0.0)
-        low = float(row.get("low") or 0.0)
-        close = float(row.get("close") or 0.0)
-        if not entry_touched and entry_low and entry_high and high >= entry_low and low <= entry_high:
-            entry_touched = True
-            entry_price = entry_high if direction == "做多" else entry_low
-        ref = entry_price if entry_touched else price
-        if ref:
-            move_high = (high - ref) / ref * 100
-            move_low = (low - ref) / ref * 100
-            if direction == "做空":
-                move_high, move_low = -move_low, -move_high
-            mfe = max(mfe, move_high)
-            mae = min(mae, move_low)
-        if entry_touched and stop:
-            if direction == "做多" and low <= stop:
-                stop_hit = True
-            if direction == "做空" and high >= stop:
-                stop_hit = True
-        if entry_touched:
-            for target_index, target in enumerate(targets):
-                if direction == "做多" and high >= target:
-                    tp_hits[target_index] = True
-                if direction == "做空" and low <= target:
-                    tp_hits[target_index] = True
-        if index in (5, 15, 20) and price:
-            ret = (close - price) / price * 100
-            returns[f"{index}m"] = -ret if direction == "做空" else ret
-    return {
-        "future_points": len(future),
-        "entry_touched": entry_touched,
-        "entry_price_assumed": entry_price,
-        "stop_hit": stop_hit,
-        "take_profit_hits": tp_hits,
-        "mfe_pct": mfe,
-        "mae_pct": mae,
-        "returns": returns,
-    }
-
-
-def judge_history_reliability(score: Dict[str, Any], outcome: Dict[str, Any]) -> Dict[str, Any]:
-    notes = []
-    direction = score.get("raw_direction") or score.get("direction")
-    ret15 = outcome.get("returns", {}).get("15m")
-    direction_ok = ret15 is not None and ret15 > 0
-    if score.get("final_direction") == "观望":
-        notes.append("系统最终为观望，主要验证观察分和风险提示是否有意义。")
-    if not outcome.get("entry_touched"):
-        notes.append("后续走势未触达入场区，入场计划未成交。")
-    if outcome.get("stop_hit"):
-        notes.append("入场后触发止损，需结合MFE/MAE判断入场质量。")
-    if any(outcome.get("take_profit_hits", [])):
-        notes.append("后续触达至少一档止盈。")
-    return {
-        "direction": direction,
-        "direction_result": "正向" if direction_ok else ("反向/无效" if ret15 is not None else "样本不足"),
-        "entry_result": "触达" if outcome.get("entry_touched") else "未触达",
-        "risk_result": "止损触发" if outcome.get("stop_hit") else "未先触发止损",
-        "notes": notes,
-    }
-
-
-def run_history_test(inst_id: str, at_time_text: str) -> Dict[str, Any]:
-    if inst_id not in SUPPORTED_INSTRUMENTS:
-        raise ValueError("仅支持 BTC-USDT-SWAP 或 ETH-USDT-SWAP")
-    at_time = parse_history_time(at_time_text)
-    now = datetime.now()
-    delta_minutes = (now - at_time).total_seconds() / 60
-    if delta_minutes < 5 or delta_minutes > 90:
-        raise ValueError("请选择当前时间前5到90分钟内的时间点。")
-    assistant = build_history_assistant(load_config())
-    snapshot, source_meta = snapshot_from_log_or_history(inst_id, at_time, assistant)
-    signals = assistant.detect_signals(snapshot)
-    score = assistant.score_snapshot(snapshot, signals)
-    analysis = assistant._local_analysis(snapshot, signals, score)
-    future, future_source = get_future_1m_candles(inst_id, at_time, 25)
-    outcome = evaluate_history_outcome(snapshot, score, future)
-    outcome["future_source"] = future_source
-    verdict = judge_history_reliability(score, outcome)
-    return {
-        "ok": True,
-        "inst_id": inst_id,
-        "time": at_time.strftime("%Y-%m-%d %H:%M:%S"),
-        "source": source_meta,
-        "signals": signals,
-        "score": score,
-        "analysis": analysis,
-        "outcome": outcome,
-        "verdict": verdict,
-    }
 
 
 def direction_value(direction: Any) -> int:
@@ -1335,11 +1155,30 @@ def realtime_accuracy_threshold_pct(horizon_seconds: int) -> float:
         return 0.010
     if horizon_seconds <= 60:
         return 0.015
-    return 0.025
+    if horizon_seconds <= 180:
+        return 0.025
+    if horizon_seconds <= 600:
+        return 0.040
+    if horizon_seconds <= 1200:
+        return 0.055
+    return 0.070
 
 
 def pct_rate(hit: int, total: int) -> float:
     return (hit / total * 100) if total else 0.0
+
+
+def trade_direction_hit(
+    pred_value: int,
+    actual_return_pct: float,
+    threshold_pct: float,
+) -> bool:
+    """交易方向是否在验证窗内按预期波动（与策略周期匹配，不看入场/止盈）。"""
+    if pred_value > 0:
+        return actual_return_pct > threshold_pct
+    if pred_value < 0:
+        return actual_return_pct < -threshold_pct
+    return False
 
 
 def watch_reasonable_threshold_pct(item: Dict[str, Any], base_threshold_pct: float) -> float:
@@ -1373,7 +1212,7 @@ def price_crosses_range(prev_price: float, price: float, low: float, high: float
 
 
 def evaluate_realtime_advice(item: Dict[str, Any], price: float, future_path: List[Tuple[datetime, float]], threshold_pct: float) -> Dict[str, Any]:
-    score = item.get("score") if isinstance(item.get("score"), dict) else {}
+    score = effective_fields_from_log_item(item)
     raw_direction = score.get("raw_direction")
     final_direction = score.get("final_direction", score.get("direction", "观望")) or "观望"
     pred_value = direction_value(final_direction)
@@ -1408,6 +1247,8 @@ def evaluate_realtime_advice(item: Dict[str, Any], price: float, future_path: Li
         "price_strict_hit": strict_hit,
         "trend_bias_hit": trend_hit,
         "baseline_watch_hit": max_abs_pct <= watch_threshold_pct,
+        "trade_direction_hit": False,
+        "trade_plan_hit": False,
         "entry_touched": False,
         "no_fill": False,
         "stop_hit": False,
@@ -1424,16 +1265,20 @@ def evaluate_realtime_advice(item: Dict[str, Any], price: float, future_path: Li
         result["outcome_type"] = "watch_ok" if result["hit"] else "watch_missed_opportunity"
         return result
 
+    result["trade_direction_hit"] = trade_direction_hit(pred_value, actual_return, threshold_pct)
+
     try:
         entry_low, entry_high = parse_level_pair(score.get("entry"))
         stop = safe_float(score.get("stop_loss"), 0.0) if score.get("stop_loss") not in (None, "-") else 0.0
         targets = parse_targets(score.get("take_profit"))
     except Exception:
         result["outcome_type"] = "trade_bad_levels"
+        result["hit"] = result["trade_direction_hit"]
         return result
     first_target = targets[0] if targets else 0.0
     if not entry_low or not entry_high:
         result["outcome_type"] = "trade_missing_levels"
+        result["hit"] = result["trade_direction_hit"]
         return result
 
     entry_price = 0.0
@@ -1470,17 +1315,18 @@ def evaluate_realtime_advice(item: Dict[str, Any], price: float, future_path: Li
 
     if not result["entry_touched"]:
         result["no_fill"] = True
-        result["hit"] = True
+        result["trade_plan_hit"] = True
         result["outcome_type"] = "trade_no_fill"
     elif result["trade_win"]:
-        result["hit"] = True
+        result["trade_plan_hit"] = True
         result["outcome_type"] = "trade_take_profit"
     elif result["stop_hit"]:
-        result["hit"] = False
+        result["trade_plan_hit"] = False
         result["outcome_type"] = "trade_stop_loss"
     else:
-        result["hit"] = result["mfe_pct"] >= abs(result["mae_pct"])
-        result["outcome_type"] = "trade_open_favorable" if result["hit"] else "trade_open_adverse"
+        result["trade_plan_hit"] = result["mfe_pct"] >= abs(result["mae_pct"])
+        result["outcome_type"] = "trade_open_favorable" if result["trade_plan_hit"] else "trade_open_adverse"
+    result["hit"] = result["trade_direction_hit"]
     return result
 
 
@@ -1492,12 +1338,18 @@ def empty_accuracy_summary() -> Dict[str, Any]:
         "mature_rate_pct": 0.0,
         "reliability_score": 0.0,
         "reliability_level": "样本不足",
+        "horizon_seconds": 0,
+        "threshold_pct": 0.0,
+        "prediction_accuracy_pct": 0.0,
         "decision_total": 0,
         "decision_accuracy_pct": 0.0,
         "baseline_watch_pct": 0.0,
         "model_edge_pct": 0.0,
+        "watch_edge_pct": 0.0,
         "trade_signal_total": 0,
+        "trade_direction_accuracy_pct": 0.0,
         "trade_signal_accuracy_pct": 0.0,
+        "watch_missed_pct": 0.0,
         "entry_touch_total": 0,
         "entry_touch_pct": 0.0,
         "no_fill_total": 0,
@@ -1518,22 +1370,31 @@ def empty_accuracy_summary() -> Dict[str, Any]:
     }
 
 
-def reliability_level(total: int, mature_rate_pct: float, edge_pct: float, trade_total: int) -> Tuple[float, str]:
-    """给压测页一个直观可靠性等级。
-
-    这个分数不是交易收益率，而是样本量、成熟率、相对基准优势和真实交易信号覆盖的综合健康度。
-    压测时重点看它是否长期稳定上升，而不是单次短窗波动。
-    """
+def reliability_level(
+    total: int,
+    mature_rate_pct: float,
+    watch_reasonable_pct: float,
+    watch_total: int,
+    trade_direction_pct: float,
+    trade_total: int,
+) -> Tuple[float, str]:
+    """压测可靠性：样本量 + 成熟率 + 分层预测质量（观望/交易分开加权）。"""
     sample_score = min(35.0, total / 120.0 * 35.0)
     mature_score = min(20.0, max(0.0, mature_rate_pct) / 100.0 * 20.0)
-    edge_score = max(0.0, min(30.0, (edge_pct + 5.0) / 35.0 * 30.0))
-    trade_score = min(15.0, trade_total / 20.0 * 15.0)
-    score = sample_score + mature_score + edge_score + trade_score
+    watch_weight = watch_total / total if total else 1.0
+    trade_weight = trade_total / total if total else 0.0
+    if trade_total >= 8:
+        quality_pct = watch_reasonable_pct * watch_weight + trade_direction_pct * trade_weight
+    else:
+        quality_pct = watch_reasonable_pct
+    quality_score = max(0.0, min(35.0, (quality_pct - 55.0) / 35.0 * 35.0))
+    trade_coverage = min(10.0, trade_total / 15.0 * 10.0)
+    score = sample_score + mature_score + quality_score + trade_coverage
     if total < 30:
         level = "样本不足"
-    elif score >= 75 and edge_pct > 8:
+    elif score >= 75 and quality_pct >= 78:
         level = "较可靠"
-    elif score >= 55 and edge_pct > 0:
+    elif score >= 55 and quality_pct >= 65:
         level = "观察中"
     else:
         level = "需优化"
@@ -1543,8 +1404,22 @@ def reliability_level(total: int, mature_rate_pct: float, edge_pct: float, trade
 def accuracy_chart_max_points(retention_hours: float, interval_seconds: int) -> int:
     """图表保留点数 = 保留时长 / 轮询间隔，与配置页 interval 对齐。"""
     interval_seconds = max(1, int(interval_seconds or 5))
-    retention_hours = max(0.5, min(168.0, float(retention_hours or 4)))
+    retention_hours = max(0.5, min(168.0, float(retention_hours or 12)))
     return max(100, min(50000, int(retention_hours * 3600 / interval_seconds)))
+
+
+def replay_results_available() -> bool:
+    """Only expose replay chart data while replay runs or after it finishes in the current web session."""
+    if not REPLAY_ANALYSIS_LOG_FILE.exists():
+        return False
+    try:
+        if REPLAY_ANALYSIS_LOG_FILE.stat().st_size <= 0:
+            return False
+    except OSError:
+        return False
+    if replay_status()["running"]:
+        return True
+    return bool(REPLAY_STARTED_AT and REPLAY_STOPPED_AT)
 
 
 def accuracy_report(
@@ -1552,14 +1427,14 @@ def accuracy_report(
     horizon_seconds: int = 5,
     max_points: int = 2400,
     scope: str = "session",
-    retention_hours: float = 4.0,
+    retention_hours: float = 12.0,
     interval_seconds: int = 5,
 ) -> Dict[str, Any]:
     if inst_id not in SUPPORTED_INSTRUMENTS:
         raise ValueError("仅支持 BTC-USDT-SWAP 或 ETH-USDT-SWAP")
     horizon_seconds = max(5, min(3600, int(horizon_seconds or 5)))
     interval_seconds = max(1, int(interval_seconds or 5))
-    retention_hours = max(0.5, min(168.0, float(retention_hours or 4)))
+    retention_hours = max(0.5, min(168.0, float(retention_hours or 12)))
     max_points = max(100, min(50000, int(max_points or accuracy_chart_max_points(retention_hours, interval_seconds))))
     replay_scope = scope == "replay"
     session_scope = scope == "session"
@@ -1584,8 +1459,12 @@ def accuracy_report(
     }
     if replay_scope:
         # 回放日志里的 time 是录制时的虚拟时间，不能用启动回放的墙钟时间过滤。
-        if not REPLAY_ANALYSIS_LOG_FILE.exists() or REPLAY_ANALYSIS_LOG_FILE.stat().st_size == 0:
-            return empty_accuracy_payload
+        # 未点击「开始回放」时不展示磁盘上的旧 replay_analysis.jsonl，避免误以为自动回放。
+        if not replay_results_available():
+            pending = dict(empty_accuracy_payload)
+            pending["replay_pending"] = True
+            pending["hint"] = "请先点击下方「开始回放」；切换「回放会话」仅切换压测数据源，不会自动启动回放。"
+            return pending
         since_time = None
     elif session_scope:
         since_time = parse_history_time(MONITOR_LOG_START_AT) if MONITOR_LOG_START_AT else None
@@ -1601,6 +1480,7 @@ def accuracy_report(
     decision_hit = 0
     trade_signal_total = 0
     trade_signal_hit = 0
+    trade_direction_hit = 0
     entry_touch_total = 0
     no_fill_total = 0
     trade_resolved_total = 0
@@ -1613,6 +1493,7 @@ def accuracy_report(
     trend_bias_hit = 0
     watch_total = 0
     watch_hit = 0
+    watch_baseline_hit = 0
     baseline_watch_hit = 0
     price_strict_hit = 0
     signed_error_sum = 0.0
@@ -1644,6 +1525,7 @@ def accuracy_report(
         baseline_watch_hit += 1 if baseline_watch_current else 0
         if pred_value != 0:
             trade_signal_total += 1
+            trade_direction_hit += 1 if advice["trade_direction_hit"] else 0
             entry_touch_total += 1 if advice["entry_touched"] else 0
             no_fill_total += 1 if advice["no_fill"] else 0
             stop_hit_total += 1 if advice["stop_hit"] else 0
@@ -1654,10 +1536,11 @@ def accuracy_report(
             if advice["trade_resolved"]:
                 trade_resolved_total += 1
                 trade_win_total += 1 if advice["trade_win"] else 0
-            trade_signal_hit += 1 if advice["hit"] else 0
+            trade_signal_hit += 1 if advice["trade_plan_hit"] else 0
         else:
             watch_total += 1
             watch_hit += 1 if advice["hit"] else 0
+            watch_baseline_hit += 1 if baseline_watch_current else 0
         decision_hit_current = bool(advice["hit"])
         decision_total += 1
         decision_hit += 1 if decision_hit_current else 0
@@ -1674,6 +1557,8 @@ def accuracy_report(
             "actual_direction": advice["actual_direction"],
             "actual_return_pct": advice["actual_return_pct"],
             "hit": decision_hit_current,
+            "trade_direction_hit": advice["trade_direction_hit"],
+            "trade_plan_hit": advice["trade_plan_hit"],
             "price_strict_hit": price_strict_hit_current,
             "baseline_watch_hit": baseline_watch_current,
             "trend_bias_hit": advice["trend_bias_hit"],
@@ -1703,13 +1588,26 @@ def accuracy_report(
             "hit": row["hit"],
             "direction": row["final_direction"],
             "actual_direction": row["actual_direction"],
+            "outcome_type": row.get("outcome_type", ""),
         })
     total = len(rows)
     mature_rate_pct = pct_rate(total, raw_log_total)
-    decision_accuracy_pct = pct_rate(decision_hit, decision_total)
+    prediction_accuracy_pct = pct_rate(decision_hit, decision_total)
+    decision_accuracy_pct = prediction_accuracy_pct
     baseline_watch_pct = pct_rate(baseline_watch_hit, total)
-    model_edge_pct = decision_accuracy_pct - baseline_watch_pct if total else 0.0
-    reliability_score, reliability_label = reliability_level(total, mature_rate_pct, model_edge_pct, trade_signal_total)
+    watch_reasonable_pct = pct_rate(watch_hit, watch_total)
+    watch_baseline_pct = pct_rate(watch_baseline_hit, watch_total)
+    watch_edge_pct = watch_reasonable_pct - watch_baseline_pct if watch_total else 0.0
+    trade_direction_accuracy_pct = pct_rate(trade_direction_hit, trade_signal_total)
+    model_edge_pct = prediction_accuracy_pct - baseline_watch_pct if total else 0.0
+    reliability_score, reliability_label = reliability_level(
+        total,
+        mature_rate_pct,
+        watch_reasonable_pct,
+        watch_total,
+        trade_direction_accuracy_pct,
+        trade_signal_total,
+    )
     return {
         "ok": True,
         "inst_id": inst_id,
@@ -1726,12 +1624,18 @@ def accuracy_report(
             "mature_rate_pct": mature_rate_pct,
             "reliability_score": reliability_score,
             "reliability_level": reliability_label,
+            "horizon_seconds": horizon_seconds,
+            "threshold_pct": threshold_pct,
+            "prediction_accuracy_pct": prediction_accuracy_pct,
             "decision_total": decision_total,
             "decision_accuracy_pct": decision_accuracy_pct,
             "baseline_watch_pct": baseline_watch_pct,
             "model_edge_pct": model_edge_pct,
+            "watch_edge_pct": watch_edge_pct,
             "trade_signal_total": trade_signal_total,
+            "trade_direction_accuracy_pct": trade_direction_accuracy_pct,
             "trade_signal_accuracy_pct": pct_rate(trade_signal_hit, trade_signal_total),
+            "watch_missed_pct": pct_rate(watch_total - watch_hit, watch_total) if watch_total else 0.0,
             "entry_touch_total": entry_touch_total,
             "entry_touch_pct": pct_rate(entry_touch_total, trade_signal_total),
             "no_fill_total": no_fill_total,
@@ -1878,6 +1782,153 @@ addEventListener('resize',r);r();a();
     return body.encode("utf-8")
 
 
+def pipeline_design_html() -> str:
+    return """
+	<div class="page-panel" data-page="design"><section class="card toolbar-card"><div><h2>流程设计</h2><p class="section-sub">本地触发 → AI 主决策 → final_decision 统一出口。与 okx_signal_monitor.py 中 <code>_process_inst</code> 实现一致。</p></div></section><div class="help-panel">
+	<section class="card help-card"><h2>架构原则</h2>
+	<table class="help-table"><thead><tr><th>层级</th><th>职责</th><th>写入字段</th><th>是否决定推送</th></tr></thead><tbody>
+	<tr><td>本地检测 + 评分</td><td>便宜预筛、方向/价位参考、AI 触发判定</td><td><code>signals</code>、<code>score</code>、<code>local_trigger</code></td><td>否（仅 L1 可走 local 的 watch）</td></tr>
+	<tr><td>AI 分析</td><td>L2/L3 深分析，输出语义结论</td><td><code>analysis</code></td><td>否（需经 merge）</td></tr>
+	<tr><td>final_decision</td><td>权威结论：方向、置信度、推送建议、价位</td><td><code>final_decision</code></td><td>是</td></tr>
+	</tbody></table>
+	<div class="help-note">Web 监控图、压测、微信推送、信号跟踪均优先读 <code>final_decision</code>；<code>score</code> 保留为本地参考分，便于对比 AI 与规则差异。</div>
+	</section>
+	<section class="card help-card"><h2>总览：单轮处理链路</h2>
+	<p>主循环 <code>run_forever → run_once → _process_inst</code>，每个币种每轮固定执行：</p>
+	<ol class="help-list">
+	<li><code>collect_snapshot</code> — 采集市场快照</li>
+	<li><code>detect_signals</code> — 阈值检测，判断「是否值得关注」</li>
+	<li><code>score_snapshot</code> — 本地多层评分，产出参考方向/分数/价位</li>
+	<li><code>evaluate_ai_trigger</code> — 判定 L0–L3，决定是否调用 AI</li>
+	<li><code>analyze_with_ai</code> — 仅 L2/L3 且满足间隔/指纹时执行</li>
+	<li><code>merge_final_decision</code> — AI 有效 JSON → AI 结论；否则 local / local_fallback</li>
+	<li><code>update_signal_tracking</code> — 基于 final_decision 登记/结算样本</li>
+	<li><code>push_gate(final_decision)</code> + <code>push_if_needed</code> — 微信推送</li>
+	<li><code>log_result</code> — 写入 JSONL</li>
+	</ol>
+	<h3>流程图</h3>
+	<div class="flow-chain"><span>采集</span><span>检测</span><span>本地评分</span><span>AI触发</span><span>AI(可选)</span><span>merge</span><span>跟踪</span><span>推送</span><span>JSONL</span></div>
+	<h3>AI 触发等级 evaluate_ai_trigger</h3>
+	<table class="help-table"><thead><tr><th>等级</th><th>典型条件</th><th>调 AI</th><th>推送预期</th></tr></thead><tbody>
+	<tr><td>L0</td><td>无信号</td><td>否</td><td>不推</td></tr>
+	<tr><td>L1</td><td>单条弱信号</td><td>否</td><td>最多 watch，不推 trade</td></tr>
+	<tr><td>L2</td><td>多信号 / 交易类信号 / raw≥72 / 多观察信号</td><td>是（同指纹 <code>AI_CALL_MIN_INTERVAL_SECONDS</code> 内不重复，默认 60s）</td><td>看 final_decision</td></tr>
+	<tr><td>L3</td><td>scalp 急速异动 或 资金费率极端</td><td>是（可 bypass 间隔）</td><td>看 final_decision，可能 spike</td></tr>
+	</tbody></table>
+	</section>
+	<section class="card help-card"><h2>第一阶段：数据采集 collect_snapshot</h2>
+	<table class="help-table"><thead><tr><th>数据</th><th>用途</th></tr></thead><tbody>
+	<tr><td>ticker（最新价、买卖价）</td><td>价格基准</td></tr>
+	<tr><td>多周期 K 线（1m/3m/5m/15m/1H/4H）</td><td>趋势、结构、技术指标</td></tr>
+	<tr><td>1m 成交量统计</td><td>放量检测</td></tr>
+	<tr><td>OI 持仓量</td><td>15 分钟变化率</td></tr>
+	<tr><td>资金费率</td><td>过热 / 快速变化</td></tr>
+	<tr><td>5m 多空比</td><td>拥挤度</td></tr>
+	<tr><td>订单簿 top20</td><td>盘口压力</td></tr>
+	</tbody></table>
+	<p>衍生：<code>trend_profiles</code>（各周期 EMA/ADX/结构 trend 标签）、<code>volatility</code>、<code>dynamic_thresholds</code>、<code>market_context</code>（含 bias、trade_up/down、recent_move_pct 含 20m）。OI/资金费率按分钟采样，<strong>满 15 分钟预热</strong>后变化类信号才生效。</p>
+	</section>
+	<section class="card help-card"><h2>第二阶段：信号检测 detect_signals</h2>
+	<p>职责：判断「是否值得进一步分析」，<strong>不直接定最终交易方向</strong>。以下任一满足即追加 signal（可多条并存）：</p>
+	<table class="help-table"><thead><tr><th>信号类型</th><th>触发条件（概要）</th></tr></thead><tbody>
+	<tr><td><code>volume_spike</code></td><td>1m 放量 ≥ max(用户阈值, 动态 P85)</td></tr>
+	<tr><td><code>structure_break</code></td><td>5m/15m 结构突破 up/down</td></tr>
+	<tr><td><code>boll_squeeze</code></td><td>15m 布林收口 + ADX 偏弱</td></tr>
+	<tr><td><code>rsi_divergence</code></td><td>15m RSI 顶/底背离</td></tr>
+	<tr><td><code>rsi_extreme</code></td><td>15m RSI ≥80 或 ≤20</td></tr>
+	<tr><td><code>macd_momentum_change</code></td><td>MACD 柱体斜率显著</td></tr>
+	<tr><td><code>oi_change</code></td><td>预热完成 且 |15m OI 变化| ≥ 配置阈值</td></tr>
+	<tr><td><code>funding_hot</code></td><td>|资金费率| ≥ 绝对值阈值</td></tr>
+	<tr><td><code>funding_fast_change</code></td><td>预热完成 且 |15m 费率变化| ≥ 阈值</td></tr>
+	<tr><td><code>long_short_extreme</code></td><td>多/空账户占比 ≥ 75%</td></tr>
+	<tr><td><code>order_book_imbalance</code></td><td>top20 盘口不平衡 ≥ max(0.35, 动态 P85)</td></tr>
+	</tbody></table>
+	<div class="help-note">检测不受「交易/观察/急速异动」推送开关影响；开关只影响 push_gate 最终是否发出对应类型。</div>
+	</section>
+	<section class="card help-card"><h2>第三阶段：本地评分 score_snapshot（参考分 → 权威方向）</h2>
+	<h3>方向决策流水线（与配置页「策略周期」「确认严格度」联动）</h3>
+	<ol class="help-list">
+	<li><code>_raw_direction_for_mode</code> — 按当前 <code>strategy_mode</code> 选路径：scalp / short / swing 各自独立逻辑（见下）</li>
+	<li><code>_direction_guard</code> — 按策略 + 风险偏好拦截逆势/结构不足（如短线 neutral 时 trade 票不足）</li>
+	<li><code>_suggest_levels</code> + <code>_should_downgrade_direction</code> — 入场质量与观察分不足时降为观望</li>
+	<li><code>strategy_views</code> — 每轮同时计算三种策略视图（scalp / short / swing）</li>
+	<li><code>_apply_selected_strategy_view</code> — <strong>仅当前 strategy_mode</strong> 且无 guard 时，用对应视图覆盖 <code>final_direction</code>、价位与展示分</li>
+	</ol>
+	<div class="flow-chain"><span>raw_direction</span><span>guard</span><span>降级</span><span>三视图</span><span>选中视图覆盖</span><span>final_direction</span></div>
+	<p>七层评分加权 → <code>raw_total_score</code>（0–100）；权重随 strategy_mode 的 <code>score_weights</code> 变化。推送与压测读 merge 后的 <code>final_decision</code>，本地 <code>score</code> 供对比与 fallback。</p>
+	<h3>15m 趋势标签（短线/中线共用瓶颈）</h3>
+	<p>策略判断用的是 <code>trend_profiles["15m"].trend</code>（EMA9/20/60 排列 + 近 4 根 15m 斜率），<strong>不是</strong>简单数几根阳线。日志里 <code>score.trends["15m"]</code> 仅为 5 根首尾对比，可能与 profile 不一致；<strong>以 profile 为准</strong>。急涨时 15m 常长期为 <code>mixed</code>，故短线/中线都会滞后。</p>
+	<h3>多策略视图 strategy_views（三选一覆盖 final）</h3><div class="help-grid">
+	<div class="help-item"><strong>scalp 超短线</strong><p><em>主看 1m/3m/5m，持仓 3–15 分钟。</em> 5m/10m 涨跌幅达阈值（默认约 0.22%/0.35%，随严格度缩放），或 1m/3m/5m 投票 + 反弹/回落形态。<strong>过滤：</strong>15m profile 明显反向时不追小脉冲。仅 <code>strategy_mode=scalp</code>（或 allow_scalp_trade）时主方向可执行；否则视图仅供参考、L3/spike 仍可触发。</p></div>
+	<div class="help-item"><strong>short 短线</strong><p><em>主看 5m+15m profile，持仓 15 分钟–数小时。</em> 由严到宽：① bias 偏多且 5m/15m 未背离 ② 5m+15m 均 <code>up/down</code> ③ developing：同向 + 20m 延伸 ④ momentum：20m 达阈值且 15m 已 <code>up/down</code>。<strong>标准模式无</strong>「单靠短窗 pressure」档（仅激进有）。止损参考 15m ATR。</p></div>
+	<div class="help-item"><strong>swing 中线</strong><p><em>主看 1H/4H，15m 确认，持仓数小时–数天。</em> aligned：1H+4H 同向；developing：1H 领先 + 15m 确认 + 4H 不反向；momentum：30–60 分钟延伸。动量档允许 15m 为 <code>mixed</code>（比短线宽）。止损参考 1H ATR。</p></div>
+	</div>
+	<h3>确认严格度 risk_preference（与策略正交）</h3>
+	<table class="help-table"><thead><tr><th>档位</th><th>动量阈值</th><th>wait_confirmation 保留方向约需分</th><th>其它</th></tr></thead><tbody>
+	<tr><td>保守</td><td>×1.15（要更大波动）</td><td>scalp ≥61 / short ≥67 / swing ≥65</td><td>短线 neutral 需 5m+15m 双票；风控层 ×1.15</td></tr>
+	<tr><td>标准</td><td>×1.0</td><td>scalp ≥55 / short ≥60 / swing ≥58</td><td>短线 neutral 需 1 票；默认推荐</td></tr>
+	<tr><td>激进</td><td>×0.9（scalp ×0.82）</td><td>scalp ≥55 / short ≥60 / swing ≥58</td><td>短线可凭 pressure 给方向；scalp guard 最松</td></tr>
+	</tbody></table>
+	<h3>周期分工（避免混用预期）</h3>
+	<table class="help-table"><thead><tr><th>行情特征</th><th>更合适策略</th></tr></thead><tbody>
+	<tr><td>5–10 分钟脉冲，15m 尚未转多</td><td>超短线（主策略须选 scalp）</td></tr>
+	<tr><td>20–40 分钟延伸，5m+15m profile 同向</td><td>短线</td></tr>
+	<tr><td>30–60 分钟及以上，1H/4H 结构</td><td>中线</td></tr>
+	</tbody></table>
+	</section>
+	<section class="card help-card"><h2>第四阶段：AI 触发 evaluate_ai_trigger</h2>
+	<p>在 <code>ai_enabled=true</code> 时，仅 L2/L3 可能置 <code>should_call_ai=true</code>。L2 需满足：指纹变化、或首次调用、或距上次调用 ≥ <code>AI_CALL_MIN_INTERVAL_SECONDS</code>（默认 60）。L3 可跳过间隔。</p>
+	<p>未调 AI 时，<code>merge_final_decision</code> 走 <code>decision_source=local</code>；L1 时 local 的 trade 建议会降级为 watch 或 none。</p>
+	</section>
+	<section class="card help-card"><h2>第五阶段：AI 分析 analyze_with_ai</h2>
+	<p><strong>前置：</strong><code>should_call_ai=true</code>。本地 <code>score</code> 与 <code>local_hint</code> 仅作参考，AI 需独立输出 direction、confidence、push_recommendation 等。</p>
+	<table class="help-table"><thead><tr><th>条件</th><th>结果</th></tr></thead><tbody>
+	<tr><td><code>ai_enabled=false</code></td><td>不调用，merge 走 local</td></tr>
+	<tr><td><code>dry_run_ai=true</code></td><td>只构造 payload，不调 API</td></tr>
+	<tr><td>API Key 未配置 / openai 未安装</td><td>merge 走 local_fallback</td></tr>
+	<tr><td>AI 熔断 open</td><td>探活失败则 local_fallback</td></tr>
+	<tr><td>以上通过</td><td>chat completion → 解析 JSON</td></tr>
+	</tbody></table>
+	<p>校验：<code>_validate_ai_result</code>。JSON 无效或缺字段 → 保留原文但 merge 为 local_fallback。</p>
+	</section>
+	<section class="card help-card"><h2>第六阶段：合并 merge_final_decision</h2>
+	<table class="help-table"><thead><tr><th>decision_source</th><th>含义</th></tr></thead><tbody>
+	<tr><td><code>ai</code></td><td>AI 返回有效 JSON，由 <code>_build_ai_final_decision</code> 生成</td></tr>
+	<tr><td><code>local</code></td><td>未调 AI（L0/L1 或 ai 关闭），由本地规则生成</td></tr>
+	<tr><td><code>local_fallback</code></td><td>已调 AI 但失败/无效，回退本地规则</td></tr>
+	</tbody></table>
+	<p><code>final_decision</code> 核心字段：<code>direction</code>、<code>confidence</code>、<code>push_recommendation</code>（none/watch/trade/spike）、<code>entry/stop_loss/take_profit</code>、<code>risk_level</code>、<code>reasons</code>、<code>rule_audit</code>、<code>trigger_level</code>。</p>
+	<p>AI 侧 <code>push_recommendation</code> 可由模型显式给出；否则由 direction、confidence、audit、trigger level 推导。audit 为「不可信」时 trade 会降级。</p>
+	</section>
+	<section class="card help-card"><h2>第七阶段：信号跟踪 update_signal_tracking</h2>
+	<ul class="help-list"><li>依据 <code>final_decision.direction</code> 与 <code>confidence</code> 登记样本</li><li>价格触达 entry → active_review，跟踪 MFE/MAE</li><li>到期结算 → <code>signal_performance.jsonl</code></li></ul>
+	<p>与推送无直接关系，供压测与复盘。</p>
+	</section>
+	<section class="card help-card"><h2>第八阶段：微信推送 push_gate</h2>
+	<ol class="help-list"><li><code>signals</code> 非空</li><li><code>final_decision.push_recommendation</code> ≠ none</li><li><code>push_gate</code> 校验 confidence 阈值与类型开关</li><li>不在冷却期</li><li><code>push_enabled</code> + <code>WECHAT_SEND_KEY</code> 决定是否真发</li></ol>
+	<table class="help-table"><thead><tr><th>push_recommendation</th><th>push_gate 额外校验</th></tr></thead><tbody>
+	<tr><td><strong>trade</strong></td><td>direction 为做多/做空，confidence ≥ push_score</td></tr>
+	<tr><td><strong>watch</strong></td><td>confidence ≥ push_score（与 trade 同门槛）；本地来源需命中观察类信号或 AI 来源</td></tr>
+	<tr><td><strong>spike</strong></td><td>通道默认开启，由 final_decision 给出 spike 建议</td></tr>
+	</tbody></table>
+	<p>冷却 key：<code>{push_kind}:{inst_id}:{direction}:{信号类型组合}</code>。推送正文同样来自 final_decision。<strong>trade/watch/spike 三类通道 Web 配置默认全开</strong>，是否发出由 final_decision 与 push_score 决定。</p>
+	</section>
+	<section class="card help-card"><h2>第九阶段：日志 log_result</h2>
+	<p>配置页或日志页可开关「写入分析日志」。关闭时 live 监控跳过 JSON 与控制台摘要写入；离线回放仍写入 <code>replay_analysis.jsonl</code>。开启后写入 <code>okx_signal_analysis.jsonl</code>：<code>score</code>（本地参考）、<code>local_trigger</code>、<code>analysis</code>、<code>final_decision</code>（权威）。控制台以 <code>【AI分析/本地规则/本地兜底】</code> 前缀输出触发原因、分析结论与推送摘要；详细 debug 设 <code>CONSOLE_VERBOSE=1</code>。</p>
+	<h3>关键配置对照</h3>
+	<table class="help-table"><thead><tr><th>Web 可配项</th><th>影响阶段</th></tr></thead><tbody>
+	<tr><td>策略周期 / 确认严格度</td><td>raw_direction 路径、guard、降级门槛、strategy_view 覆盖、动量阈值、score_weights</td></tr>
+	<tr><td>push_score</td><td>trade/watch/spike 推送门槛（观察分默认同值）</td></tr>
+	<tr><td>ai_enabled / push_enabled</td><td>是否调 AI / 是否发微信</td></tr>
+	<tr><td>写入分析日志</td><td>是否每轮写 JSON 与控制台摘要；关闭可减磁盘与 Web 开销</td></tr>
+	<tr><td>AI 密钥与 Base URL</td><td>AI 连接</td></tr>
+	</tbody></table>
+	<p>以下使用内置默认，不在 Web 暴露：策略检测阈值、高级 scalp 开关、trade/watch/spike 通道开关（默认全开）、网络重试与日志轮转等。</p>
+	<div class="help-note">一句话：本地负责「发现异常 + 决定是否叫 AI」；AI 负责「被叫时的主决策」；final_decision 负责「推送、跟踪、Web 展示」的统一出口。</div>
+	</section></div></div>
+"""
+
+
 def render_page(message: str = "") -> bytes:
     config = load_config()
     env = load_env()
@@ -1931,18 +1982,28 @@ button,.button{{border:0;border-radius:12px;padding:11px 16px;background:#f1f3f8
 .toolbar-card{{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:16px}} .toolbar-card::before{{display:none}} .coin-tabs{{display:inline-flex;gap:8px;padding:4px;border-radius:14px;background:#f1f5f9;border:1px solid #e2e8f0}} .coin-tab.active{{background:#8b6cf6;color:#fff}} .empty-coin{{display:inline-flex;align-items:center;padding:0 12px;color:#64748b;font-size:13px;font-weight:650}}
 	.market-card{{background:#242424;border:1px solid #3a3a3a;border-radius:18px;margin:0;padding:18px 20px 16px;color:#f8fafc;box-shadow:0 12px 34px rgba(15,23,42,.16);overflow:hidden;height:calc(100vh - 40px);display:flex;flex-direction:column}} .monitor-card{{height:calc(100vh - 188px);min-height:520px}} .market-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:12px}} .market-title{{font-size:18px;font-weight:800;margin-bottom:4px}} .market-sub{{color:#a3a3a3;font-size:12px}} .market-price{{text-align:right}} .market-price strong{{display:block;font-size:24px;line-height:1.1}} .market-price span{{font-size:13px;color:#94a3b8}} .market-price.up span{{color:#fb7185}} .market-price.down span{{color:#22c55e}} .market-canvas-wrap{{position:relative;flex:1;min-height:0;border-top:1px solid #393939;background:linear-gradient(rgba(255,255,255,.055) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);background-size:100% 72px,72px 100%}} canvas{{width:100%;height:100%;display:block;cursor:grab}} canvas.dragging{{cursor:grabbing}} .market-loading{{position:absolute;inset:0;display:grid;place-items:center;color:#a3a3a3;pointer-events:none}} .snapshot-panel{{position:absolute;left:16px;top:16px;z-index:2;min-width:260px;max-width:min(500px,calc(100% - 32px));max-height:calc(100% - 32px);overflow:auto;padding:10px 12px;border-radius:12px;background:rgba(15,23,42,.62);border:1px solid rgba(148,163,184,.20);box-shadow:0 12px 28px rgba(0,0,0,.18);backdrop-filter:blur(8px);font-size:12px;line-height:1.35;color:#dbeafe;pointer-events:none}} .snapshot-panel strong{{display:block;color:#fff;font-size:13px;margin-bottom:5px}} .snapshot-grid{{display:grid;grid-template-columns:68px minmax(0,1fr);gap:3px 8px;align-items:start}} .snapshot-grid span{{color:#9ca3af}} .snapshot-grid b{{font-weight:700;color:#e5e7eb;word-break:break-word}} .market-time-range{{margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.08);color:#a3a3a3;font-size:12px;display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}}
 	.log-window{{width:100%;min-height:220px;height:34vh;max-height:46vh;resize:vertical;border:1px solid #dbe4ef;border-radius:16px;padding:16px;background:#0f172a;color:#d1fae5;font-family:Consolas,"Courier New",monospace;font-size:13px;line-height:1.55;white-space:pre}} .log-window-console{{background:#111827;color:#e5e7eb}} .log-panel{{display:block;margin-bottom:14px}} .log-panel h3{{margin:0 0 6px;font-size:16px;color:#111827}} .log-panel p{{margin:0 0 10px;color:#64748b;font-size:12px}} .notice{{background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0;padding:13px 15px;border-radius:14px;margin-bottom:16px}}
-	.help-panel{{display:grid;grid-template-columns:1fr;gap:16px}} .help-card{{display:block;line-height:1.68}} .help-card::before{{display:none}} .help-card h3{{margin:18px 0 8px;font-size:16px;color:#111827}} .help-card h3:first-child{{margin-top:0}} .help-card p{{margin:6px 0;color:#475569;font-size:13px}} .help-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}} .help-item{{border:1px solid #e2e8f0;border-radius:12px;padding:12px;background:#f8fafc}} .help-item strong{{display:block;margin-bottom:4px;color:#1f2937}} .help-list{{margin:8px 0 0;padding-left:18px;color:#475569;font-size:13px}} .help-list li{{margin:4px 0}} .help-table{{width:100%;border-collapse:collapse;margin-top:10px;font-size:13px}} .help-table th,.help-table td{{border:1px solid #e2e8f0;padding:9px 10px;text-align:left;vertical-align:top}} .help-table th{{background:#f1f5f9;color:#334155}} .help-note{{border-left:4px solid #8b6cf6;background:#f5f3ff;padding:10px 12px;border-radius:10px;color:#4c1d95;font-size:13px;margin-top:10px}} code{{background:#eef2ff;color:#4338ca;border-radius:6px;padding:1px 5px}}
-	.history-result{{grid-column:1/-1;display:block;border:1px solid #e2e8f0;border-radius:14px;background:#f8fafc;padding:14px;min-height:86px;white-space:pre-wrap;font-family:Consolas,"Courier New",monospace;font-size:13px;color:#334155}} .accuracy-card{{display:block}} .accuracy-controls{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0 12px}} .accuracy-controls select{{width:auto;min-width:150px}} .accuracy-controls .btn-save{{min-width:88px}} .accuracy-summary{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:12px}} .accuracy-summary div{{border:1px solid #e2e8f0;border-radius:12px;padding:10px;background:#f8fafc}} .accuracy-summary span{{display:block;color:#64748b;font-size:12px}} .accuracy-summary b{{display:block;margin-top:3px;font-size:18px;color:#111827}} .accuracy-canvas-wrap{{position:relative;height:320px;border:1px solid #e2e8f0;border-radius:14px;background:#0f172a;overflow:hidden}} .accuracy-canvas-wrap canvas{{width:100%;height:100%;cursor:default}} .accuracy-note{{margin:10px 0 0;color:#64748b;font-size:12px}}
+	.help-panel{{display:grid;grid-template-columns:1fr;gap:16px}} .help-card{{display:block;line-height:1.68}} .help-card::before{{display:none}} .help-card h3{{margin:18px 0 8px;font-size:16px;color:#111827}} .help-card h3:first-child{{margin-top:0}} .help-card p{{margin:6px 0;color:#475569;font-size:13px}} .help-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}} .help-item{{border:1px solid #e2e8f0;border-radius:12px;padding:12px;background:#f8fafc}} .help-item strong{{display:block;margin-bottom:4px;color:#1f2937}} .help-list{{margin:8px 0 0;padding-left:18px;color:#475569;font-size:13px}} .help-list li{{margin:4px 0}} .help-table{{width:100%;border-collapse:collapse;margin-top:10px;font-size:13px}} .help-table th,.help-table td{{border:1px solid #e2e8f0;padding:9px 10px;text-align:left;vertical-align:top}} .help-table th{{background:#f1f5f9;color:#334155}} .help-note{{border-left:4px solid #8b6cf6;background:#f5f3ff;padding:10px 12px;border-radius:10px;color:#4c1d95;font-size:13px;margin-top:10px}} .flow-chain{{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0 4px}} .flow-chain span{{display:inline-flex;align-items:center;padding:8px 12px;border-radius:999px;background:#eef2ff;border:1px solid #c7d2fe;color:#3730a3;font-size:12px;font-weight:650}} .flow-chain span:not(:last-child)::after{{content:"→";margin-left:8px;color:#94a3b8;font-weight:400}} code{{background:#eef2ff;color:#4338ca;border-radius:6px;padding:1px 5px}}
+	.accuracy-card{{display:block}} .accuracy-controls{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0 12px}} .accuracy-controls select{{width:auto;min-width:150px}} .accuracy-controls .btn-save{{min-width:88px}} .accuracy-summary{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px}} .accuracy-summary div{{border:1px solid #e2e8f0;border-radius:12px;padding:10px;background:#f8fafc}} .accuracy-summary div.accuracy-primary{{border-color:#93c5fd;background:#eff6ff}} .accuracy-summary span{{display:block;color:#64748b;font-size:12px}} .accuracy-summary b{{display:block;margin-top:3px;font-size:18px;color:#111827}} .accuracy-canvas-wrap{{position:relative;height:320px;border:1px solid #e2e8f0;border-radius:14px;background:#0f172a;overflow:hidden}} .accuracy-canvas-wrap canvas{{width:100%;height:100%;cursor:grab}} .accuracy-canvas-wrap canvas.dragging{{cursor:grabbing}} .accuracy-point-panel{{position:absolute;left:12px;top:12px;z-index:2;min-width:240px;max-width:min(420px,calc(100% - 24px));max-height:calc(100% - 24px);overflow:auto;padding:10px 12px;border-radius:12px;background:rgba(15,23,42,.78);border:1px solid rgba(148,163,184,.28);box-shadow:0 12px 28px rgba(0,0,0,.22);backdrop-filter:blur(8px);font-size:12px;line-height:1.35;color:#dbeafe;pointer-events:none}} .accuracy-point-panel strong{{display:block;color:#fff;font-size:13px;margin-bottom:5px}} .accuracy-point-panel .snapshot-grid{{display:grid;grid-template-columns:72px minmax(0,1fr);gap:3px 8px;align-items:start}} .accuracy-point-panel .snapshot-grid span{{color:#9ca3af}} .accuracy-point-panel .snapshot-grid b{{font-weight:700;color:#e5e7eb;word-break:break-word}} .accuracy-note{{margin:10px 0 0;color:#64748b;font-size:12px}}
 	@media(max-width:860px){{.app{{grid-template-columns:1fr}}.sidebar{{position:relative;height:auto}}.card{{grid-template-columns:1fr}}.field{{grid-template-columns:1fr}}}}
 	</style></head><body><div class="app"><aside class="sidebar"><div class="brand"><span class="logo">O</span><span>OKX AI</span></div>
-	<a class="nav-item active" href="#monitor" data-page-link="monitor">监控</a><a class="nav-item" href="#config" data-page-link="config">配置</a><a class="nav-item" href="#logs" data-page-link="logs">日志</a><a class="nav-item" href="#tests" data-page-link="tests">测试</a><a class="nav-item" href="#help" data-page-link="help">帮助</a><a class="nav-item" href="#settings" data-page-link="settings">设置</a>
+	<a class="nav-item active" href="#monitor" data-page-link="monitor">监控</a><a class="nav-item" href="#config" data-page-link="config">配置</a><a class="nav-item" href="#logs" data-page-link="logs">日志</a><a class="nav-item" href="#tests" data-page-link="tests">测试</a><a class="nav-item" href="#design" data-page-link="design">流程设计</a><a class="nav-item" href="#help" data-page-link="help">帮助</a><a class="nav-item" href="#settings" data-page-link="settings">设置</a>
 </aside><div class="content"><main>
 <form class="config-form" method="post" action="/save#config">{''.join(rows)}<div class="actions config-actions" data-page-actions="config"><div class="action-group"><button class="action-control btn-save" type="button" id="saveConfigBtn">另存为配置</button><button class="action-control btn-save" type="button" id="importConfigBtn">导入配置</button><a class="button action-control btn-save" href="/config-json#config">查看配置</a></div></div></form>
 <form class="settings-form" method="post" action="/save-auth#settings"><section class="card page-panel" data-page="settings"><h2>登录账号</h2><div class="field"><label>用户名</label><div><input type="text" name="auth_username" value="{esc(auth.get("username","admin"))}"><p>Web控制台登录用户名。</p></div></div><div class="field"><label>新密码</label><div><div class="password-wrap"><input type="password" name="auth_password" placeholder="留空则不修改"><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>建议首次部署后立即修改默认密码。</p></div></div></section><div class="actions settings-actions" data-page-actions="settings"><div class="action-group"><button class="action-control btn-save" type="submit">保存账号密码</button><a class="button action-control btn-view" href="/logout">切换账号</a><a class="button action-control btn-danger" href="/logout">退出登录</a></div></div></form>
 <div class="page-panel active" data-page="monitor"><section class="card toolbar-card"><div><h2>实时监控</h2><p class="section-sub">未启动时显示虚拟行情；启动后读取真实监控日志，鼠标滚轮可缩放，拖动可平移。</p></div><div class="toolbar-right"><div class="coin-tabs">{monitor_tabs}</div><button class="button btn-run action-control" type="button" id="monitorToggleBtn">开始监控</button></div></section><section class="market-card monitor-card"><div class="market-head"><div><div class="market-title" id="monitorTitle">{esc(monitor_initial or "未配置币种")} 实时走势</div><div class="market-sub" id="monitorMeta">{esc("虚拟行情预览 · 启动监控后自动切换真实数据" if monitor_initial else "请先在配置页选择监控币种")}</div></div><div class="market-price" id="monitorPrice"><strong>--</strong><span>生成模拟行情</span></div></div><div class="market-canvas-wrap"><canvas id="monitorChart"></canvas><div class="market-loading" id="monitorLoading">正在生成虚拟走势...</div><div class="snapshot-panel" id="snapshotPanel"><strong>Snapshot</strong><div class="snapshot-grid"><span>价格</span><b>--</b><span>时间</span><b>--</b><span>评分</span><b>--</b><span>方向</span><b>--</b></div></div></div><div class="market-time-range"><span id="monitorUptime">已监控：未启动</span><span id="monitorPointCount">数据点：0</span></div></section></div>
-	<div class="page-panel" data-page="logs"><section class="card toolbar-card"><div><h2>实时日志</h2><p class="section-sub">上方为 JSON 分析日志，下方为 okx_signal_monitor.py 控制台输出；均仅显示本次启动监控后的内容。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="refreshLogBtn">刷新全部</button><button class="button btn-log" type="button" id="openLogDirBtn">打开日志目录</button></div></section><section class="card" style="display:block;"><div class="log-panel"><h3>JSON 分析日志</h3><p>结构化分析记录，默认保存：{esc(MONITOR_JSON_LOG_FILE)}</p><textarea class="log-window" id="logWindow" readonly>正在加载日志...</textarea><div class="toolbar-card" style="margin:12px 0 0;box-shadow:none;"><div><p class="section-sub" id="saveLogHint">可另存为 .jsonl 文件，便于回放与统计。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveLogBtn">另存为文件</button></div></div></div><div class="log-panel"><h3>控制台日志</h3><p>监控进程 print 输出与运行状态，默认保存：{esc(MONITOR_PROCESS_LOG_FILE)}</p><textarea class="log-window log-window-console" id="consoleLogWindow" readonly>正在加载控制台日志...</textarea><div class="toolbar-card" style="margin:12px 0 0;box-shadow:none;"><div><p class="section-sub" id="saveConsoleLogHint">可另存为 .log 文件，便于排查采集、AI、推送异常。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearConsoleLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveConsoleLogBtn">另存为文件</button></div></div></div></section></div>
-	<div class="page-panel" data-page="tests"><section class="card toolbar-card"><div><h2>连通性测试</h2><p class="section-sub">测试AI接口和微信推送（Server酱）配置是否可用。</p></div><div class="toolbar-right"><a class="button action-control btn-test" href="/test-ai#tests">测试AI</a><a class="button action-control btn-test" href="/test-push#tests">测试微信推送</a></div></section><section class="card accuracy-card"><h2>实时预测压测</h2><p class="section-sub">上方是累计可靠性压测指标；live 监控请选「本次启动后」，离线回放请选「回放会话」，两者数据源不同。走势图可导出/导入 JSON；导入后暂停自动刷新。</p><div class="accuracy-controls"><select id="accuracyInst"><option value="BTC-USDT-SWAP">BTC-USDT-SWAP</option><option value="ETH-USDT-SWAP">ETH-USDT-SWAP</option></select><select id="accuracyHorizon"><option value="5">下一轮约5秒</option><option value="15">15秒</option><option value="30">30秒</option><option value="60">60秒</option><option value="180">3分钟</option></select><select id="accuracyScope"><option value="session">本次启动后</option><option value="replay">回放会话</option><option value="all">全部历史日志</option></select><select id="accuracyRetentionHours" title="结合配置页轮询间隔计算图表最多保留多少点"><option value="1">保留1小时</option><option value="2">保留2小时</option><option value="4" selected>保留4小时</option><option value="8">保留8小时</option><option value="12">保留12小时</option><option value="24">保留24小时</option><option value="48">保留48小时</option></select><button class="btn-test" type="button" id="accuracyRefreshBtn">刷新压测</button><button class="btn-save" type="button" id="accuracyExportBtn">导出图表</button><button class="btn-save" type="button" id="accuracyImportBtn">导入图表</button><button class="btn-test" type="button" id="accuracyLiveBtn" style="display:none">返回实时</button><input type="file" id="accuracyImportInput" accept=".json,application/json" hidden></div><div class="accuracy-summary" id="accuracySummary"><div><span>可靠性等级</span><b>--</b></div><div><span>已验证/日志</span><b>--</b></div><div><span>决策合理率</span><b>--</b></div><div><span>相对观望基准</span><b>--</b></div></div><div class="accuracy-canvas-wrap"><canvas id="accuracyChart"></canvas></div><p class="accuracy-note" id="accuracyNote">交易信号按做多/做空方向验证；观望按后续波动是否不足以形成可交易机会验证；系统需要长期跑赢“永远观望”基准才算有可靠性。</p></section><section class="card"><h2>离线回放压测</h2><p class="section-sub">配置页勾选「录制回放数据集」并运行监控，每轮原始输入写入 {esc(REPLAY_DATASET_FILE)}；停止监控后在此子进程回放，分析结果写入 {esc(REPLAY_ANALYSIS_LOG_FILE)}。压测范围选「回放会话」查看曲线。</p><div class="replay-status" id="replayDatasetInfo">正在加载数据集状态...</div><div class="field"><label>回放间隔(秒)</label><div><input type="number" id="replayInterval" value="0" min="0" max="120" step="0.1"><p>0 表示尽快跑完；大于 0 可在回放过程中观察压测曲线刷新。</p></div></div><div class="field"><label>控制</label><div><div class="toolbar-right" style="justify-content:flex-start;gap:8px;"><button class="btn-test" type="button" id="replayStartBtn">开始回放</button><button class="btn-danger action-control" type="button" id="replayStopBtn">停止回放</button><button class="button btn-log" type="button" id="replayRefreshBtn">刷新状态</button></div><p id="replayStatusText">等待加载...</p></div></div></section><section class="card"><h2>近期历史回放测试</h2><div class="field"><label>币种</label><div><select id="historyInst"><option value="BTC-USDT-SWAP">BTC-USDT-SWAP</option><option value="ETH-USDT-SWAP">ETH-USDT-SWAP</option></select><p>建议选择已经在监控页启用并运行过的币种。</p></div></div><div class="field"><label>历史时间</label><div><input type="datetime-local" id="historyTime"><p>请选择当前时间前5到90分钟内的时间点，推荐15到30分钟前。</p></div></div><div class="field"><label>执行</label><div><button class="btn-test" type="button" id="historyTestBtn">运行回放</button><p>优先使用当时监控日志；没有日志时用近期K线重建，盘口/OI等会降级。</p></div></div><div class="history-result" id="historyResult">等待运行近期历史回放测试。</div></section></div>
-	<div class="page-panel" data-page="help"><section class="card toolbar-card"><div><h2>帮助</h2><p class="section-sub">指标采集、计算逻辑、评分体系、界面字段和推送内容说明。</p></div></section><div class="help-panel">
+	<div class="page-panel" data-page="logs"><section class="card toolbar-card"><div><h2>实时日志</h2><p class="section-sub">默认关闭写入以节省资源。打开「写入分析日志」后，监控进程才会输出 JSON 与控制台摘要；下方窗口仅显示本次启动后的内容。</p></div><div class="toolbar-right"><label class="switch" title="写入分析日志"><input type="checkbox" id="analysisLogSwitch" {"checked" if config.get("analysis_log_enabled") else ""}><span></span></label><span class="section-sub" id="analysisLogSwitchHint" style="margin:0;">{"已开启" if config.get("analysis_log_enabled") else "已关闭"} · 保存后需重启监控</span><button class="button btn-log" type="button" id="refreshLogBtn">刷新全部</button><button class="button btn-log" type="button" id="openLogDirBtn">打开日志目录</button></div></section><section class="card" style="display:block;"><div class="log-panel"><h3>JSON 分析日志</h3><p>Web 图表/压测依赖的完整分析记录，默认保存：{esc(MONITOR_JSON_LOG_FILE)}</p><textarea class="log-window" id="logWindow" readonly>正在加载日志...</textarea><div class="toolbar-card" style="margin:12px 0 0;box-shadow:none;"><div><p class="section-sub" id="saveLogHint">可另存为 .jsonl 文件，便于回放与统计。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveLogBtn">另存为文件</button></div></div></div><div class="log-panel"><h3>控制台日志</h3><p>监控进程精简调试输出（信号摘要、推送结果、错误）；详细重试日志需设置 CONSOLE_VERBOSE=1，默认保存：{esc(MONITOR_PROCESS_LOG_FILE)}</p><textarea class="log-window log-window-console" id="consoleLogWindow" readonly>正在加载控制台日志...</textarea><div class="toolbar-card" style="margin:12px 0 0;box-shadow:none;"><div><p class="section-sub" id="saveConsoleLogHint">可另存为 .log 文件，便于快速排查信号与推送。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearConsoleLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveConsoleLogBtn">另存为文件</button></div></div></div></section></div>
+	<div class="page-panel" data-page="tests"><section class="card toolbar-card"><div><h2>连通性测试</h2><p class="section-sub">测试AI接口和微信推送（Server酱）配置是否可用。</p></div><div class="toolbar-right"><a class="button action-control btn-test" href="/test-ai#tests">测试AI</a><a class="button action-control btn-test" href="/test-push#tests">测试微信推送</a></div></section><section class="card accuracy-card"><h2>实时预测压测</h2><p class="section-sub">指标按<strong>观望</strong>与<strong>交易</strong>分层统计。短线策略建议验证窗选 15–20 分钟；live 监控选「本次启动后」，回放需先点下方「开始回放」再选「回放会话」。</p><div class="accuracy-controls"><select id="accuracyInst"><option value="BTC-USDT-SWAP">BTC-USDT-SWAP</option><option value="ETH-USDT-SWAP">ETH-USDT-SWAP</option></select><select id="accuracyHorizon"><option value="5">5秒 · 轮询级</option><option value="15">15秒</option><option value="30">30秒</option><option value="60">1分钟</option><option value="180">3分钟</option><option value="300">5分钟</option><option value="900">15分钟 · 短线推荐</option><option value="1200">20分钟 · 短线结构</option></select><select id="accuracyScope"><option value="session">本次启动后</option><option value="replay">回放会话</option><option value="all">全部历史日志</option></select><select id="accuracyRetentionHours" title="结合配置页轮询间隔计算图表最多保留多少点"><option value="1">保留1小时</option><option value="2">保留2小时</option><option value="4">保留4小时</option><option value="8">保留8小时</option><option value="12" selected>保留12小时</option><option value="24">保留24小时</option><option value="48">保留48小时</option></select><button class="btn-test" type="button" id="accuracyRefreshBtn">刷新压测</button><button class="btn-save" type="button" id="accuracyExportBtn">导出图表</button><button class="btn-save" type="button" id="accuracyImportBtn">导入图表</button><button class="btn-test" type="button" id="accuracyLiveBtn" style="display:none">返回实时</button><input type="file" id="accuracyImportInput" accept=".json,application/json" hidden></div><div class="accuracy-summary" id="accuracySummary"><div><span>可靠性等级</span><b>--</b></div><div><span>已验证/日志</span><b>--</b></div><div><span>决策合理率</span><b>--</b></div><div><span>相对观望基准</span><b>--</b></div></div><div class="accuracy-canvas-wrap"><canvas id="accuracyChart"></canvas><div class="accuracy-point-panel" id="accuracyPointPanel" hidden></div></div><p class="accuracy-note" id="accuracyNote">观望：后续波动未超阈值即合理（错失机会记红点）。交易：验证窗内价格朝做多/做空方向走即方向命中；入场/止盈/止损仅在较长验证窗下有参考价值。</p></section><section class="card"><h2>离线回放压测</h2><p class="section-sub">配置页勾选「录制回放数据集」并运行监控，每轮原始输入写入 {esc(REPLAY_DATASET_FILE)}；停止监控后点击下方「开始回放」启动子进程，结果写入 {esc(REPLAY_ANALYSIS_LOG_FILE)}，再选上方「回放会话」查看压测曲线。</p><div class="replay-status" id="replayDatasetInfo">正在加载数据集状态...</div><div class="field"><label>回放间隔(秒)</label><div><input type="number" id="replayInterval" value="0" min="0" max="120" step="0.1"><p>0 表示尽快跑完；大于 0 可在回放过程中观察压测曲线刷新。</p></div></div><div class="field"><label>控制</label><div><div class="toolbar-right" style="justify-content:flex-start;gap:8px;"><button class="btn-test" type="button" id="replayStartBtn">开始回放</button><button class="btn-danger action-control" type="button" id="replayStopBtn">停止回放</button><button class="button btn-log" type="button" id="replayRefreshBtn">刷新状态</button></div><p id="replayStatusText">等待加载...</p></div></div></section></div>
+	<div class="page-panel" data-page="help"><section class="card toolbar-card"><div><h2>帮助</h2><p class="section-sub">系统架构、指标含义、界面字段、推送规则与压测说明。详细流程见「流程设计」页。</p></div><div class="toolbar-right"><a class="button btn-view" href="#design">查看流程设计</a></div></section><div class="help-panel">
+	<section class="card help-card"><h2>系统架构与决策边界</h2>
+	<p>每轮监控按「采集 → 检测 → 本地评分 → AI 触发 →（可选）AI 分析 → merge → 跟踪 → 推送 → 写日志」执行。三层职责如下：</p>
+	<table class="help-table"><thead><tr><th>层级</th><th>做什么</th><th>看什么字段</th></tr></thead><tbody>
+	<tr><td>本地规则</td><td>发现异常信号、给出参考方向/分数/价位、决定是否调用 AI（L0–L3）</td><td><code>signals</code>、<code>score</code>、<code>local_trigger</code></td></tr>
+	<tr><td>AI</td><td>L2/L3 被触发时做深分析；本地分仅作参考</td><td><code>analysis</code></td></tr>
+	<tr><td>最终结论</td><td>推送、Web 图表、压测、信号跟踪的统一依据</td><td><code>final_decision</code></td></tr>
+	</tbody></table>
+	<ul class="help-list"><li>L0/L1 不调 AI；L1 最多推 watch，不推 trade。</li><li>AI 返回有效 JSON 时，<code>decision_source=ai</code>；已调 AI 但失败时为 <code>local_fallback</code>。</li><li>推送读 <code>final_decision.push_recommendation</code> + <code>confidence</code>；trade/watch/spike 通道默认全开，Web 只需配 push_score 与是否启用推送。</li></ul>
+	<div class="help-note">监控页 Snapshot 与压测曲线已通过 <code>final_decision</code> 展示方向与置信度；日志里仍保留 <code>score</code> 便于对比 AI 与本地差异。</div>
+	</section>
 	<section class="card help-card"><h2>采集参数、计算指标与评分产出</h2>
 	<h3>采集的数据</h3><div class="help-grid">
 	<div class="help-item"><strong>行情与K线</strong><p>只监控 BTC-USDT-SWAP、ETH-USDT-SWAP。每轮采集 ticker、买卖一档、1m/3m/5m/15m/1H/4H K线；每个周期请求最近 <code>200</code> 根，字段包括时间、开高低收、成交量、是否收盘。</p></div>
@@ -1958,34 +2019,68 @@ button,.button{{border:0;border-radius:12px;padding:11px 16px;background:#f1f3f8
 	<tr><td>合约资金</td><td>OI 15m变化、资金费率、资金费率变化、多空比</td><td>判断新增仓、平仓、拥挤、过热和反身性风险。</td></tr>
 	<tr><td>数据质量</td><td>确认K线数量、EMA120/MACD/ADX/RSI ready</td><td>用于判断当前周期指标是否足够可靠；15m确认K线少于35根会降低趋势和动量评分。</td></tr>
 	</tbody></table>
-	<h3>评分体系</h3><p>系统先由市场状态生成 <code>raw_direction</code>，再根据入场质量和风险降级为 <code>final_direction</code>。分数分为综合分、观察分和交易分：观察分用于判断市场是否值得关注，交易分用于判断是否适合执行；最终观望时交易分为0。</p>
+	<h3>评分体系（本地参考分 score）</h3><p>按配置页<strong>策略周期</strong>走 <code>_raw_direction_for_mode</code>，再经 guard、入场质量降级，最后由<strong>当前策略的 strategy_view</strong> 覆盖 <code>final_direction</code>（无 direction_guard 时）。观察分 <code>raw_total_score</code> 按 strategy_mode 的 score_weights 加权；交易分仅在最终方向为做多/做空时有值。推送以 merge 后的 <code>final_decision</code> 为准。</p>
 	<ul class="help-list"><li><code>market_regime_score</code>：趋势、震荡、挤压、高波动等市场状态。</li><li><code>trend_score</code>：EMA/ADX/结构突破/多周期一致性。</li><li><code>momentum_score</code>：RSI、MACD、KDJ、背离和动能。</li><li><code>volume_price_score</code>：放量、量价方向、突破量能确认。</li><li><code>derivatives_score</code>：OI+价格组合、资金费率、多空拥挤。</li><li><code>orderbook_score</code>：top5/top20盘口支持和价差风险。</li><li><code>entry_quality_score</code>：价格距离EMA/ATR、入场区和等待确认。</li><li><code>risk_control_score</code>：资金费率、拥挤、高波动、背离、数据质量等风险控制。</li></ul>
-	<div class="help-note">可靠性判断：指标越多不是越可靠，关键看数据质量、周期共振、量价确认、资金数据是否同向，以及是否触达入场区。系统给出的是观察和风险提示，不是自动交易指令；OI/资金费率刚启动不足15分钟时会降低变化类信号权重。</div>
+	<div class="help-note">可靠性判断：指标越多不是越可靠，关键看数据质量、周期共振、量价确认、资金数据是否同向，以及是否触达入场区。系统给出的是观察和风险提示，不是自动交易指令；OI/资金费率刚启动不足15分钟时会降低变化类信号权重。<strong>15m 方向以 trend_profiles 为准</strong>，急涨时 profile 转 <code>up</code> 往往晚于 1m/5m。</div>
 	</section>
-	<section class="card help-card"><h2>界面字段与推送内容解读</h2>
-	<h3>走势图 Snapshot</h3><table class="help-table"><thead><tr><th>字段</th><th>含义</th><th>解读方式</th></tr></thead><tbody>
-	<tr><td>分数</td><td><code>total_score / raw_total_score / final_trade_score</code></td><td>综合分是兼容展示；观察分高说明市场值得关注；交易分为0通常表示最终观望，等待入场条件或风险降低。</td></tr>
-	<tr><td>方向</td><td><code>raw_direction → final_direction</code></td><td>原始方向来自市场偏向；最终方向会被入场质量、风险和等待确认降级。</td></tr>
-	<tr><td>市场/策略</td><td><code>market_regime / strategy_template</code></td><td>先识别趋势、震荡、挤压或高波动，再匹配趋势回踩、区间边缘、等待突破、降低仓位等策略模板。</td></tr>
-	<tr><td>风险/动作</td><td><code>market_risk_level / trade_action_level</code></td><td>市场风险描述行情是否过热、拥挤、背离或冲突；交易动作描述当前是否适合执行。高风险不等于一定反向。</td></tr>
-	<tr><td>入场质量</td><td><code>entry_plan.quality / entry_quality_score</code></td><td>表示入场区是否有效，例如突破有效、等待确认、不可交易；价格离EMA20过远、高波动或震荡会降低质量。</td></tr>
-	<tr><td>数据质量</td><td>15m确认K线数量和ready状态</td><td>确认K线越少，EMA/MACD/ADX/RSI越不稳定；数据不足时系统会偏向观望。</td></tr>
-	<tr><td>预热</td><td><code>oi_warmup_ready / funding_warmup_ready</code></td><td>OI和资金费率变化类指标需要完整15分钟观察窗口；未预热完成时不应过度解读变化率。</td></tr>
-	<tr><td>OI / OI 15m</td><td>当前持仓量和15分钟变化</td><td>价格上涨+OI上涨偏新增仓推动；价格上涨+OI下降偏空头回补，追多质量下降。下跌同理反向理解。</td></tr>
-	<tr><td>资金费率</td><td>永续合约资金费率</td><td>绝对值过高说明单边拥挤，追单风险升高。</td></tr>
-	<tr><td>多头/空头</td><td>账户多空比例换算</td><td>极端比例代表拥挤风险，不直接代表马上反转。</td></tr>
-	<tr><td>放量</td><td>已收盘1m成交量 / 前20根均量 / 动态阈值</td><td>放量表示活跃度提高，必须结合方向、结构、OI和盘口判断；动态阈值来自近3小时约1分钟采样的分位数。</td></tr>
-	<tr><td>ATR 15m</td><td>15m ATR百分比和波动状态</td><td>用于判断高波动、低波动、止损宽度和是否容易追在尾端。</td></tr>
-	<tr><td>盘口</td><td>top20/top5不平衡与价差</td><td>正值偏买盘支撑，负值偏卖盘压力；盘口变化快，只作为小权重确认。</td></tr>
-	<tr><td>分层</td><td>八层评分摘要</td><td>展示状态、趋势、动量、量价、合约、盘口、入场、风控各层得分，便于定位分数来源。</td></tr>
+	<section class="card help-card"><h2>策略周期与确认严格度（配置页）</h2>
+	<p>两项配置正交：<strong>策略周期</strong>决定看哪些 K 线、如何给方向；<strong>确认严格度</strong>决定动量阈值高低、降级分数门槛与部分 guard 规则。日志里三种 <code>strategy_views</code> 每轮都会算，但只有当前选中的 mode 会覆盖 <code>final_direction</code>。</p>
+	<h3>策略周期</h3><table class="help-table"><thead><tr><th>模式</th><th>时间尺度</th><th>给做多的典型条件（概要）</th></tr></thead><tbody>
+	<tr><td>超短线 scalp</td><td>5–10 分钟 / 持仓 3–15 分钟</td><td>5m 或 10m 脉冲；1m/3m/5m 投票；15m profile 强反向时不追小脉冲</td></tr>
+	<tr><td>短线 short（推荐）</td><td>20 分钟结构 / 持仓 15 分钟–数小时</td><td>5m+15m profile 均 up；或 20m 延伸且 15m 已 up；标准模式不靠单 pressure</td></tr>
+	<tr><td>中线 swing</td><td>30–60 分钟+ / 持仓数小时–数天</td><td>1H+4H 同向；或 1H+15m 转多且 4H 不空；30–60m 动量（15m 可 mixed）</td></tr>
 	</tbody></table>
-	<h3>推送类型</h3><div class="help-grid"><div class="help-item"><strong>trade</strong><p>最终方向为做多或做空，且交易分达到推送阈值。重点看入场区、止损、止盈、失效条件。</p></div><div class="help-item"><strong>watch</strong><p>最终可能仍是观望，但观察分高且出现风险或异常信号，例如资金费率过热、RSI极端、布林挤压、多空拥挤。</p></div></div>
-	<h3>入场、止损、止盈与追踪</h3><ul class="help-list"><li>入场区由ATR、结构位、EMA/VWAP近似锚点生成，不是固定百分比。</li><li>止损优先参考结构失效位，并加ATR缓冲。</li><li>止盈按风险距离生成两档，偏向1R/2R思路。</li><li>在线追踪先等待价格触达入场区；触达判断优先使用最新1m K线 high/low。</li><li>追踪成交价是保守估算：做多按入场区上沿，做空按入场区下沿，并记录 <code>fill_assumption</code>。</li><li>近期历史回放优先使用本地 <code>build/runtime_logs/okx_signal_analysis.jsonl</code> 的后续1m K线；没有日志时才用OKX历史K线兜底。</li></ul>
-	<h3>回放测试解读</h3><ul class="help-list"><li><code>来源</code> 表示评分快照来自监控日志或K线重建；日志偏差越小越接近所选时间。</li><li><code>后续数据</code> 表示验证后续走势的数据来源，优先为 <code>signal-monitor-log</code>。</li><li><code>后续K线点数</code> 为0时不具备验证意义，通常说明所选时间之后没有持续监控日志，或OKX兜底数据未取到。</li><li><code>MFE/MAE</code> 表示入场后最大顺向/逆向波动；未触达入场区时只是观察方向的价格波动。</li><li><code>5m/15m/20m</code> 用目标时间后的收盘价计算方向表现，适合验证观察方向，不等于真实成交收益。</li></ul>
-	<h3>离线回放压测（live 录一次）</h3><ul class="help-list"><li>配置页勾选「录制回放数据集」，启动监控后每轮把 ticker、全周期 K 线、OI、资金费率、多空比、盘口写入 <code>build/runtime_logs/replay_dataset.jsonl</code>。</li><li>停止监控后在测试页「离线回放压测」启动独立子进程；回放仍走 <code>collect_snapshot → detect → score → tracking → analyze → log</code>，时间轴用帧内 <code>time</code>，不访问 OKX，不推送。</li><li>压测范围选「回放会话」读取 <code>replay_analysis.jsonl</code>；成熟样本可在一次回放内快速结算，无需再等真实时间。</li><li>正式监控与离线回放互斥；重新启动监控且仍勾选录制时会清空旧数据集，避免混 session。</li></ul>
-	<h3>本地文件位置</h3><ul class="help-list"><li>运行日志保存在 <code>build/runtime_logs</code>，默认配置模板保存在 <code>config</code>，本机密钥和登录认证保存在 <code>local_state</code>。</li><li><code>build</code> 是运行时产物目录，<code>local_state</code> 保存本机私密状态，均不应提交。</li><li>页面资源保留在 <code>web_assets</code>，源码入口是 <code>web_control_panel.py</code> 和 <code>okx_signal_monitor.py</code>。</li></ul>
-	<h3>常见误读</h3><ul class="help-list"><li>观察分高不代表必须交易，可能只是风险异常值得关注。</li><li>市场风险低不代表一定盈利，只代表当前拥挤/过热/冲突较少。</li><li>盘口不平衡可能是假挂单，当前只作为小权重确认。</li><li>最终方向为观望时，入场/止损/止盈为 <code>-</code> 是正常结果。</li><li>AI分析会审计本地规则，但数据不足、预热不足或信号冲突时应优先观望。</li></ul>
+	<h3>确认严格度</h3><table class="help-table"><thead><tr><th>档位</th><th>适用场景</th><th>要点</th></tr></thead><tbody>
+	<tr><td>保守</td><td>宁可错过、少假信号</td><td>动量阈值 ×1.15；保留方向需更高分；短线 neutral 要 5m+15m 双票</td></tr>
+	<tr><td>标准</td><td>默认平衡</td><td>短线 wait_confirmation 约 ≥60 分可保留方向；neutral 要 1 票</td></tr>
+	<tr><td>激进</td><td>更早给方向</td><td>阈值更低；短线可凭短窗 pressure 给方向；scalp guard 最松</td></tr>
+	</tbody></table>
+	<div class="help-note">急拉行情：15m profile 未转 <code>up</code> 时，短线与中线都会长时间观望——这是结构确认设计，不是 bug。要吃 5–10 分钟脉冲请选<strong>超短线</strong>作主策略。</div>
+	</section>
+	<section class="card help-card"><h2>压测图表说明（测试页）</h2>
+	<ul class="help-list">
+	<li><strong>综合预测准确度</strong>：观望 + 交易方向命中加权；图表绿/红点与此一致。</li>
+	<li><strong>观望准确度</strong>：预测观望时，后续波动未超阈值即合理；<strong>观望错失率</strong>为其反面（图表红点常见于此）。</li>
+	<li><strong>交易方向命中</strong>：做多/做空后，验证窗内价格是否朝预测方向走（与策略周期匹配，建议 15–20 分钟）。</li>
+	<li><strong>交易执行合理率</strong>：入场触达、止盈/止损等计划层验证；短窗下样本少时可忽略。</li>
+	<li><strong>蓝线</strong>价格、<strong>黄线</strong>预测方向累计；长时段顶部显示抽稀信息。</li>
+	</ul>
+	</section>
+	<section class="card help-card"><h2>界面字段、推送与日志解读</h2>
+	<h3>走势图 Snapshot（读 final_decision）</h3><table class="help-table"><thead><tr><th>字段</th><th>含义</th><th>解读方式</th></tr></thead><tbody>
+	<tr><td>方向</td><td><code>final_decision.direction</code></td><td>权威结论；本地 <code>raw_direction → final_direction</code> 仅作对比参考。</td></tr>
+	<tr><td>分数/置信度</td><td><code>final_decision.confidence</code></td><td>推送与压测用的置信度；本地 raw/final_trade_score 在 JSON 的 score 字段中。</td></tr>
+	<tr><td>决策来源</td><td><code>decision_source</code></td><td><code>ai</code> / <code>local</code> / <code>local_fallback</code>，表示 final_decision 如何产生。</td></tr>
+	<tr><td>触发等级</td><td><code>trigger_level</code>（L0–L3）</td><td>本轮 AI 触发级别；L2/L3 才可能调用 AI。</td></tr>
+	<tr><td>市场/策略</td><td><code>market_regime / strategy_template</code></td><td>识别趋势、震荡、挤压或高波动，匹配策略模板。</td></tr>
+	<tr><td>风险/动作</td><td><code>risk_level / trade_action_level</code></td><td>风险描述与是否适合执行；高风险不等于一定反向。</td></tr>
+	<tr><td>入场质量</td><td><code>entry_plan.quality / entry_quality_score</code></td><td>入场区是否有效；震荡、高波动、离 EMA 过远会降低质量。</td></tr>
+	<tr><td>数据质量</td><td>15m 确认 K 线数量与 ready 状态</td><td>指标不足时系统偏向观望。</td></tr>
+	<tr><td>预热</td><td><code>oi_warmup_ready / funding_warmup_ready</code></td><td>OI/资金费率变化需满 15 分钟窗口。</td></tr>
+	<tr><td>OI / 资金费率 / 多空比</td><td>合约资金数据</td><td>判断新增仓、平仓、拥挤与过热；需结合价格方向理解。</td></tr>
+	<tr><td>放量 / ATR / 盘口</td><td>量价与波动确认</td><td>辅助确认，不单独定方向；动态阈值来自近 3 小时采样分位数。</td></tr>
+	<tr><td>分层</td><td>八层评分摘要</td><td>定位本地 score 来源；AI 决策时仅作参考。</td></tr>
+	</tbody></table>
+	<h3>推送类型（读 final_decision.push_recommendation）</h3><div class="help-grid">
+	<div class="help-item"><strong>trade</strong><p>方向为做多/做空且 confidence ≥ push_score。正文含入场、止损、止盈。</p></div>
+	<div class="help-item"><strong>watch</strong><p>风险提示型推送；门槛与 trade 相同（默认同 push_score）。</p></div>
+	<div class="help-item"><strong>spike</strong><p>L3 急速异动；通道默认开启，由 final_decision 决定是否推送。</p></div>
+	</div>
+	<p>三类推送通道默认全开；实际是否发出取决于 final_decision、push_score、冷却期，以及是否启用微信推送。</p>
+	<h3>日志字段</h3><ul class="help-list">
+	<li><strong>JSON 分析日志</strong>（<code>okx_signal_analysis.jsonl</code>）：完整结构化数据，含 score、local_trigger、analysis、final_decision。需在配置页或日志页开启「写入分析日志」并重启监控。</li>
+	<li><strong>控制台日志</strong>（<code>signal_monitor_console.log</code>）：每行以 <code>【AI分析】/【本地规则】/【本地兜底】</code> 开头，含 AI 触发原因、AI 结论或本地结论、推送结果；设 <code>CONSOLE_VERBOSE=1</code> 可看重试/冷却等 debug。</li>
+	</ul>
+	<h3>入场、止损、止盈与追踪</h3><ul class="help-list"><li>入场区由 ATR、结构位、EMA/VWAP 锚点生成。</li><li>止损参考结构失效位 + ATR 缓冲；止盈按风险距离生成两档（约 1R/2R）。</li><li>跟踪基于 final_decision：先等触达入场区，再统计 MFE/MAE，结算写入 signal_performance.jsonl。</li><li>追踪成交价保守估算：做多按入场区上沿，做空按下沿。</li></ul>
+	<h3>测试与压测</h3><ul class="help-list">
+	<li><strong>实时预测压测</strong>（测试页）：按 final_decision 方向验证后续短窗价格表现；范围可选「本次启动后 / 全部历史日志」。</li>
+	<li><strong>离线回放压测</strong>：配置页勾选「录制回放数据集」→ 监控运行写入 <code>replay_dataset.jsonl</code> → 停止后在测试页启动回放子进程，走完整 <code>_process_inst</code> 链路（不访问 OKX、不推送），结果写入 <code>replay_analysis.jsonl</code>；压测范围选「回放会话」。</li>
+	<li>监控与离线回放互斥；重新启动监控且仍勾选录制时会清空旧数据集。</li>
+	</ul>
+	<h3>本地文件位置</h3><ul class="help-list"><li>运行日志：<code>build/runtime_logs</code>；默认配置模板：<code>config</code>；本机密钥与登录：<code>local_state</code>。</li><li><code>build</code> 与 <code>local_state</code> 为运行时/私密目录，不应提交版本库。</li></ul>
+	<h3>常见误读</h3><ul class="help-list"><li>本地观察分高 ≠ 一定推送；最终以 final_decision.push_recommendation 为准。</li><li>L1 弱信号不调 AI，也不会推 trade。</li><li>AI 与本地方向不一致时，以 final_decision 为准（AI 有效时 decision_source=ai）。</li><li>观望时 entry/stop/TP 为 <code>-</code> 是正常结果。</li><li>压测图<strong>红点</strong>在观望+大涨时只表示「观望错失机会」，不是做空信号。</li><li><code>score.trends["15m"]</code> 与 <code>trend_profiles["15m"].trend</code> 可能不一致；策略方向以后者为准。</li><li>日志里 scalp 视图做多但 final 仍观望：主策略不是超短线时，scalp 仅参考不覆盖。</li><li>盘口、OI、资金费率需结合价格与多周期结构理解，不宜单指标下结论。</li></ul>
 	</section></div></div>
+	{pipeline_design_html()}
 	</main></div></div>
 <script>
 function currentPage() {{
@@ -2008,8 +2103,10 @@ function showPage(page) {{
   if (page === 'logs') {{ refreshLogs(false); refreshConsoleLogs(false); }}
   if (page === 'monitor') fetchMonitor(false);
   if (page === 'tests') {{
-    fetchAccuracy({{ resetView: true }});
-    refreshReplayInfo();
+    refreshReplayInfo({{ lite: false }}).then(function(info) {{
+      fetchAccuracy({{ resetView: true }});
+      if (info && info.replay_running) startReplayProgress();
+    }});
   }}
 }}
 function encodeForm(form) {{
@@ -2044,7 +2141,11 @@ if (configForm) {{
     clearTimeout(autoSaveTimer);
     autoSaveTimer = setTimeout(function() {{ autoSaveConfig().catch(function() {{}}); }}, 450);
   }});
-  configForm.addEventListener('change', function() {{
+  configForm.addEventListener('change', function(event) {{
+    if (event.target && event.target.name === 'analysis_log_enabled') {{
+      analysisLogEnabled = !!event.target.checked;
+      syncAnalysisLogUi();
+    }}
     clearTimeout(autoSaveTimer);
     autoSaveTimer = setTimeout(function() {{ autoSaveConfig().catch(function() {{}}); }}, 120);
   }});
@@ -2127,26 +2228,29 @@ const importConfigBtn = document.getElementById('importConfigBtn');
     }}
 	  }});
 	}}
-	const historyTimeInput=document.getElementById('historyTime');
-	if(historyTimeInput&&!historyTimeInput.value){{const d=new Date(Date.now()-20*60*1000),p=n=>String(n).padStart(2,'0');historyTimeInput.value=d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes());}}
-	const historyTestBtn=document.getElementById('historyTestBtn');
-	if(historyTestBtn){{historyTestBtn.addEventListener('click',async function(){{const box=document.getElementById('historyResult'),inst=document.getElementById('historyInst').value,at=document.getElementById('historyTime').value;if(box)box.textContent='正在回放 '+inst+' @ '+at+' ...';historyTestBtn.disabled=true;try{{const response=await fetch('/api/history-test',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{inst_id:inst,time:at}}),cache:'no-store'}}),payload=await response.json();if(!response.ok||payload.ok===false)throw new Error(payload.error||'回放失败');const s=payload.score||{{}},o=payload.outcome||{{}},v=payload.verdict||{{}},src=payload.source||{{}};if(box)box.textContent=['来源: '+(src.source||'--')+(src.nearest_log_delta_seconds!=null?' / 日志偏差 '+src.nearest_log_delta_seconds+'s':''),'后续数据: '+(o.future_source||'--'),'方向: '+(s.raw_direction||'--')+' -> '+(s.final_direction||s.direction||'--'),'观察/交易分: '+(s.raw_total_score??'--')+' / '+(s.final_trade_score??'--'),'市场风险/交易动作: '+(s.market_risk_level||s.risk_level||'--')+' / '+(s.trade_action_level||'--'),'入场: '+(s.entry||'-'),'止损: '+(s.stop_loss||'-'),'止盈: '+(s.take_profit||'-'),'后续K线点数: '+(o.future_points??0),'入场触达: '+(o.entry_touched?'是':'否')+' / 假设成交价 '+(o.entry_price_assumed||'--'),'止损触发: '+(o.stop_hit?'是':'否'),'止盈命中: '+JSON.stringify(o.take_profit_hits||[]),'MFE/MAE: '+fmt(o.mfe_pct,3)+'% / '+fmt(o.mae_pct,3)+'%','5m/15m/20m: '+JSON.stringify(o.returns||{{}}),'结论: '+(v.direction_result||'--')+'，'+(v.entry_result||'--')+'，'+(v.risk_result||'--'),'备注: '+((v.notes||[]).join('；')||'无')].join('\\n');}}catch(error){{if(box)box.textContent='回放失败：'+error;}}finally{{historyTestBtn.disabled=false;}}}});}}
-	function renderReplayDatasetInfo(info){{const box=document.getElementById('replayDatasetInfo');if(!box)return;const lines=[];lines.push('数据集: '+(info.exists?info.frame_count+' 帧 · '+((info.inst_ids||[]).join(', ')||'--'):'尚未录制'));if(info.exists){{lines.push('路径: '+(info.path||'--'));if(info.recorded_at)lines.push('录制 meta: '+info.recorded_at);if(info.interval_seconds)lines.push('录制间隔: '+info.interval_seconds+' 秒');}}if(info.analysis_log_lines)lines.push('上次回放分析日志: '+info.analysis_log_lines+' 行');lines.push('录制开关: '+(info.record_enabled?'已勾选':'未勾选')+' · 监控: '+(info.monitor_running?'运行中':'未运行'));box.textContent=lines.join('\\n');}}
-	function renderReplayStatus(info){{const text=document.getElementById('replayStatusText');if(!text)return;const st=info&&info.replay_status?info.replay_status:{{}};let msg=(st.text||'--')+(st.started_at?' · 开始 '+st.started_at:'')+(st.elapsed_seconds!=null?' · 已运行 '+st.elapsed_seconds+' 秒':'');if(!info.replay_running&&info.analysis_log_lines)msg+=' · 分析日志 '+info.analysis_log_lines+' 行（压测选「回放会话」）';text.textContent=msg;}}
-	async function refreshReplayInfo(){{try{{const r=await fetch('/api/replay-dataset',{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'加载失败');renderReplayDatasetInfo(p);renderReplayStatus(p);return p;}}catch(e){{const box=document.getElementById('replayDatasetInfo');if(box)box.textContent='加载回放状态失败：'+e;renderReplayStatus({{replay_status:{{text:String(e)}}}});return null;}}}}
-	async function waitReplayFinished(maxMs){{const deadline=Date.now()+(maxMs||3600000);while(Date.now()<deadline){{const p=await refreshReplayInfo();if(p&&!p.replay_running)return p;await new Promise(r=>setTimeout(r,400));}}return null;}}
-	async function startReplayRun(){{const btn=document.getElementById('replayStartBtn'),intervalEl=document.getElementById('replayInterval'),interval=Number(intervalEl&&intervalEl.value),statusEl=document.getElementById('replayStatusText');if(btn)btn.disabled=true;try{{const r=await fetch('/api/replay-start',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{interval:Number.isFinite(interval)?interval:0}}),cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||p.message||'启动失败');const scopeEl=document.getElementById('accuracyScope');if(scopeEl)scopeEl.value='replay';if(statusEl)statusEl.textContent='回放进行中...';await waitReplayFinished();await fetchAccuracy({{resetView:true}});const info=await refreshReplayInfo();const lines=info&&info.analysis_log_lines!=null?info.analysis_log_lines:'--';alert('回放完成 · 分析日志 '+lines+' 行 · 上方压测已切到「回放会话」，可查看曲线');}}catch(e){{alert('启动回放失败：'+e);}}finally{{if(btn)btn.disabled=false;}}}}
-	async function stopReplayRun(){{const btn=document.getElementById('replayStopBtn');if(btn)btn.disabled=true;try{{const r=await fetch('/api/replay-stop',{{method:'POST',cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||p.message||'停止失败');await refreshReplayInfo();fetchAccuracy({{resetView:false}});alert(p.message||'回放已停止');}}catch(e){{alert('停止回放失败：'+e);}}finally{{if(btn)btn.disabled=false;}}}}
+	function renderReplayDatasetInfo(info){{const box=document.getElementById('replayDatasetInfo');if(!box)return;const lines=[];lines.push('数据集: '+(info.exists?info.frame_count+' 帧 · '+((info.inst_ids||[]).join(', ')||'--'):'尚未录制'));if(info.exists){{lines.push('路径: '+(info.path||'--'));if(info.recorded_at)lines.push('录制 meta: '+info.recorded_at);if(info.interval_seconds)lines.push('录制间隔: '+info.interval_seconds+' 秒');}}if(info.replay_running&&info.analysis_log_bytes)lines.push('回放日志: 约 '+Math.max(1,Math.round(info.analysis_log_bytes/1024))+' KB');else if(info.analysis_log_lines)lines.push('上次回放分析日志: '+info.analysis_log_lines+' 行');lines.push('录制开关: '+(info.record_enabled?'已勾选':'未勾选')+' · 监控: '+(info.monitor_running?'运行中':'未运行'));box.textContent=lines.join('\\n');}}
+	function renderReplayStatus(info){{const text=document.getElementById('replayStatusText');if(!text)return;const st=info&&info.replay_status?info.replay_status:{{}};let msg=(st.text||'--')+(st.started_at?' · 开始 '+st.started_at:'')+(st.elapsed_seconds!=null?' · 已运行 '+st.elapsed_seconds+' 秒':'');if(info&&info.replay_running&&info.analysis_log_bytes)msg+=' · 日志约 '+Math.max(1,Math.round(info.analysis_log_bytes/1024))+' KB';else if(!info.replay_running&&info.analysis_log_lines)msg+=' · 分析日志 '+info.analysis_log_lines+' 行';text.textContent=msg;}}
+	function setReplayStartButtonState(mode){{const btn=document.getElementById('replayStartBtn');if(!btn)return;if(mode==='running'){{btn.disabled=false;btn.textContent='回放中...';btn.classList.add('is-starting');}}else if(mode==='starting'){{btn.disabled=true;btn.textContent='启动中...';btn.classList.add('is-starting');}}else{{btn.disabled=false;btn.textContent='开始回放';btn.classList.remove('is-starting');}}}}
+	async function refreshReplayInfo(options){{options=options||{{}};const lite=options.lite!==false;try{{const url='/api/replay-dataset'+(lite?'?lite=1':'');const r=await fetch(url,{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'加载失败');renderReplayDatasetInfo(p);renderReplayStatus(p);if(!lite&&syncAccuracyScopeWithReplay(p))fetchAccuracy({{resetView:true}});if(!lite&&p.replay_running)startReplayProgress();return p;}}catch(e){{const box=document.getElementById('replayDatasetInfo');if(box)box.textContent='加载回放状态失败：'+e;renderReplayStatus({{replay_status:{{text:String(e)}}}});return null;}}}}
+	let replayProgressTimer=null,replayFinishedNotified=false,fetchAccuracyInFlight=null;
+	function stopReplayProgress(){{stopReplayAccuracyPoll();if(replayProgressTimer){{clearInterval(replayProgressTimer);replayProgressTimer=null;}}}}
+	function startReplayProgress(){{stopReplayProgress();replayFinishedNotified=false;switchAccuracyToReplaySession();replayProgressTimer=setInterval(async function(){{if(currentPage()!=='tests')return;const info=await refreshReplayInfo({{lite:true}});if(!info)return;setReplayStartButtonState(info.replay_running?'running':'idle');if(info.replay_running){{fetchAccuracy({{resetView:false}});return;}}stopReplayProgress();fetchAccuracy({{resetView:false}});if(!replayFinishedNotified){{replayFinishedNotified=true;const lines=info.analysis_log_lines!=null?info.analysis_log_lines:'--';alert('回放完成 · 分析日志 '+lines+' 行 · 上方压测已切到「回放会话」');}}}},2500);}}
+	async function startReplayRun(){{const intervalEl=document.getElementById('replayInterval'),interval=Number(intervalEl&&intervalEl.value),statusEl=document.getElementById('replayStatusText');setReplayStartButtonState('starting');if(statusEl)statusEl.textContent='正在启动回放，请稍候...';try{{const r=await fetch('/api/replay-start',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{interval:Number.isFinite(interval)?interval:0}}),cache:'no-store'}});let p=null;const ct=(r.headers.get('content-type')||'').toLowerCase();if(ct.includes('application/json')){{p=await r.json();}}else{{throw new Error('服务器返回异常页面（HTTP '+r.status+'），请刷新并重新登录后再试');}}if(!r.ok||p.ok===false)throw new Error(p.error||p.message||'启动失败');renderReplayDatasetInfo(p);renderReplayStatus(p);if(statusEl)statusEl.textContent=p.message||'回放已启动';setReplayStartButtonState('running');fetchAccuracy({{resetView:true}});startReplayProgress();}}catch(e){{setReplayStartButtonState('idle');if(statusEl)statusEl.textContent='启动失败：'+e;alert('启动回放失败：'+e);}}}}
+	async function stopReplayRun(){{const btn=document.getElementById('replayStopBtn');if(btn)btn.disabled=true;try{{const r=await fetch('/api/replay-stop',{{method:'POST',cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||p.message||'停止失败');stopReplayProgress();setReplayStartButtonState('idle');await refreshReplayInfo({{lite:false}});fetchAccuracy({{resetView:false}});alert(p.message||'回放已停止');}}catch(e){{alert('停止回放失败：'+e);}}finally{{if(btn)btn.disabled=false;}}}}
 	const replayStartBtn=document.getElementById('replayStartBtn'),replayStopBtn=document.getElementById('replayStopBtn'),replayRefreshBtn=document.getElementById('replayRefreshBtn');
 	if(replayStartBtn)replayStartBtn.addEventListener('click',startReplayRun);
 	if(replayStopBtn)replayStopBtn.addEventListener('click',stopReplayRun);
 	if(replayRefreshBtn)replayRefreshBtn.addEventListener('click',refreshReplayInfo);
 	const accuracyRefreshBtn=document.getElementById('accuracyRefreshBtn');
 	let monitorIntervalSeconds={int(config.get("interval", 5))};
-	const accuracyView={{points:[],start:0,end:1,yZoom:1,yPan:0,drag:null,followLatest:true}};
-	let accuracyQueryKey='',accuracyLivePayload=null,accuracyImportedMode=false,accuracyImportedLabel='',accuracyScopeSyncing=false;
+	const accuracyView={{points:[],start:0,end:1,yZoom:1,yPan:0,priceRg:1,drag:null,followLatest:true,selectedKey:''}};
+	let accuracyPlotPoints=[];
+	let accuracyQueryKey='',accuracyLivePayload=null,accuracyImportedMode=false,accuracyImportedLabel='',accuracyScopeSyncing=false,replayAccuracyPollTimer=null;
+	function stopReplayAccuracyPoll(){{if(replayAccuracyPollTimer){{clearInterval(replayAccuracyPollTimer);replayAccuracyPollTimer=null;}}}}
+	async function isReplayRunning(){{try{{const p=await fetch('/api/replay-status',{{cache:'no-store'}}).then(r=>r.json());return!!(p&&p.replay_running);}}catch(e){{return false;}}}}
+	function syncReplayAccuracyPoll(){{const scopeEl=document.getElementById('accuracyScope');if(!scopeEl||scopeEl.value!=='replay'||currentPage()!=='tests'){{stopReplayProgress();return;}}isReplayRunning().then(function(running){{if(running)startReplayProgress();else stopReplayProgress();}});}}
 	function configuredMonitorInterval(){{const field=document.querySelector('input[name="interval"]');const n=Number(field&&field.value);return Number.isFinite(n)&&n>=1?n:monitorIntervalSeconds;}}
-	function accuracyRetentionHours(){{const n=Number((document.getElementById('accuracyRetentionHours')||{{}}).value);return Number.isFinite(n)&&n>0?n:4;}}
+	function accuracyRetentionHours(){{const n=Number((document.getElementById('accuracyRetentionHours')||{{}}).value);return Number.isFinite(n)&&n>0?n:12;}}
 	function accuracyQuerySignature(){{return [(document.getElementById('accuracyInst')||{{}}).value||'BTC-USDT-SWAP',(document.getElementById('accuracyHorizon')||{{}}).value||'5',(document.getElementById('accuracyScope')||{{}}).value||'session',accuracyRetentionHours(),configuredMonitorInterval()].join('|');}}
 	function setAccuracyImportedMode(active,label){{accuracyImportedMode=!!active;accuracyImportedLabel=label||'';const liveBtn=document.getElementById('accuracyLiveBtn');if(liveBtn)liveBtn.style.display=active?'inline-flex':'none';}}
 	function normalizeAccuracyBundle(raw){{if(!raw||typeof raw!=='object')throw new Error('无效JSON文件');const points=Array.isArray(raw.points)?raw.points:[];const clean=points.filter(o=>Number.isFinite(Number(o&&o.price)));if(!clean.length)throw new Error('文件中没有可用的图表点位');return{{name:raw.name||'OKX_Accuracy_Chart',version:raw.version||'1.0',exported_at:raw.exported_at||'',inst_id:raw.inst_id||'',horizon_seconds:Number(raw.horizon_seconds)||5,scope:raw.scope||'imported',retention_hours:Number(raw.retention_hours)||accuracyRetentionHours(),interval_seconds:Number(raw.interval_seconds)||configuredMonitorInterval(),max_points:Number(raw.max_points)||clean.length,start_at:raw.start_at||'',summary:(raw.summary&&typeof raw.summary==='object')?raw.summary:{{}},points:clean}};}}
@@ -2160,13 +2264,26 @@ const importConfigBtn = document.getElementById('importConfigBtn');
 	function exitAccuracyImportedMode(){{setAccuracyImportedMode(false,'');fetchAccuracy({{resetView:true}});}}
 	function clamp(v,a,b){{return Math.max(a,Math.min(b,v));}}
 	function accuracyDirectionValue(o){{const v=String((o&&o.direction)||'');if(v==='\\u505a\\u591a')return 1;if(v==='\\u505a\\u7a7a')return -1;return 0;}}
-	function resetAccuracyView(){{accuracyView.start=0;accuracyView.end=1;accuracyView.yZoom=1;accuracyView.yPan=0;accuracyView.followLatest=true;}}
-	function visibleAccuracyPoints(){{const pts=accuracyView.points||[];if(pts.length<=2)return pts;const n=pts.length,span=Math.max(0.001,accuracyView.end-accuracyView.start),a=Math.floor(accuracyView.start*(n-1)),b=Math.min(n,Math.max(a+2,Math.ceil((accuracyView.start+span)*(n-1))+1));return pts.slice(a,b);}}
+	function resetAccuracyView(){{accuracyView.start=0;accuracyView.end=1;accuracyView.yZoom=1;accuracyView.yPan=0;accuracyView.priceRg=1;accuracyView.followLatest=true;accuracyView.selectedKey='';updateAccuracyPointPanel(null);}}
+	function accuracyPointHtml(o){{if(!o)return '';const hit=o.hit?'合理':'不合理',dir=o.direction||'--',actual=o.actual_direction||'--',ret=o.return_pct!=null?fmt(o.return_pct,3)+'%':'--',outcome=o.outcome_type||'--';return '<strong>选中压测点</strong><div class="snapshot-grid"><span>时间</span><b>'+escHtml(o.time||'--')+'</b><span>价格</span><b>'+fmt(o.price,2)+'</b><span>预测</span><b>'+dir+'</b><span>实际</span><b>'+actual+'</b><span>后续价</span><b>'+(o.future_price!=null?fmt(o.future_price,2):'--')+'</b><span>涨跌</span><b>'+ret+'</b><span>判定</span><b>'+hit+'</b><span>类型</span><b>'+escHtml(outcome)+'</b><span>累计准确</span><b>'+(o.accuracy_pct!=null?fmt(o.accuracy_pct,1)+'%':'--')+'</b></div>';}}
+	function escHtml(v){{return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}}
+	function updateAccuracyPointPanel(point){{const panel=document.getElementById('accuracyPointPanel');if(!panel)return;if(!point){{panel.hidden=true;panel.innerHTML='';return;}}panel.hidden=false;panel.innerHTML=accuracyPointHtml(point);}}
+	function drawAccuracyLeftAxis(ctx,pad,W,H,mn,mx){{ctx.fillStyle='rgba(226,232,240,.82)';ctx.font='12px Segoe UI, Microsoft YaHei';ctx.textAlign='right';ctx.textBaseline='middle';const ch=H-pad.t-pad.b;for(let i=0;i<=4;i++){{const value=mx-(mx-mn)*i/4,y=pad.t+ch*i/4;ctx.fillText(fmt(value,2),pad.l-8,y);}}}}
+	function drawAccuracyRightAxis(ctx,pad,W,H,mn,mx){{ctx.fillStyle='rgba(251,191,36,.82)';ctx.font='12px Segoe UI, Microsoft YaHei';ctx.textAlign='left';ctx.textBaseline='middle';const ch=H-pad.t-pad.b;for(let i=0;i<=4;i++){{const value=mx-(mx-mn)*i/4,y=pad.t+ch*i/4;ctx.fillText(fmt(value,0),W-pad.r+6,y);}}}}
+	function drawAccuracyCrosshair(ctx,pad,W,H,plot){{const pt=plot.point||{{}};ctx.save();ctx.strokeStyle='rgba(226,232,240,.72)';ctx.setLineDash([5,5]);ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(plot.x,pad.t);ctx.lineTo(plot.x,H-pad.b);ctx.stroke();ctx.beginPath();ctx.moveTo(pad.l,plot.yPrice);ctx.lineTo(W-pad.r,plot.yPrice);ctx.stroke();ctx.strokeStyle='rgba(251,191,36,.55)';ctx.beginPath();ctx.moveTo(pad.l,plot.yPred);ctx.lineTo(W-pad.r,plot.yPred);ctx.stroke();ctx.setLineDash([]);ctx.font='12px Segoe UI, Microsoft YaHei';ctx.fillStyle='rgba(96,165,250,.95)';ctx.textAlign='right';ctx.textBaseline='middle';ctx.fillText(fmt(pt.price,2),pad.l-8,plot.yPrice);ctx.fillStyle='rgba(251,191,36,.95)';ctx.textAlign='left';ctx.fillText(fmt(plot.predVal!=null?plot.predVal:accuracyDirectionValue(pt),0),W-pad.r+6,plot.yPred);ctx.fillStyle='rgba(229,231,235,.95)';ctx.textAlign='center';ctx.textBaseline='top';ctx.fillText(shortTime(pt.time||''),plot.x,H-pad.b+4);ctx.fillStyle='#60a5fa';ctx.beginPath();ctx.arc(plot.x,plot.yPrice,5,0,Math.PI*2);ctx.fill();ctx.fillStyle='#fbbf24';ctx.beginPath();ctx.arc(plot.x,plot.yPred,4.5,0,Math.PI*2);ctx.fill();ctx.restore();}}
+	function selectAccuracyPoint(event,strict){{const c=document.getElementById('accuracyChart');if(!c||!accuracyPlotPoints.length)return;const rect=c.getBoundingClientRect(),x=event.clientX-rect.left,y=event.clientY-rect.top;let best=null,bestDist=Infinity;accuracyPlotPoints.forEach(o=>{{const dPrice=Math.hypot(o.x-x,o.yPrice-y),dPred=Math.hypot(o.x-x,o.yPred-y),dist=Math.min(dPrice,dPred);if(dist<bestDist){{best=o;bestDist=dist;}}}});const limit=strict?36:30;if(best&&bestDist<limit){{accuracyView.selectedKey=best.point.time||'';updateAccuracyPointPanel(best.point);drawAccuracyChart();}}else if(!strict){{accuracyView.selectedKey='';updateAccuracyPointPanel(null);drawAccuracyChart();}}}}
+	function visibleAccuracyPoints(){{const pts=accuracyView.points||[];if(pts.length<=1)return pts;const n=pts.length,span=Math.max(0.001,accuracyView.end-accuracyView.start),a=Math.floor(accuracyView.start*(n-1)),b=Math.min(n,Math.max(a+2,Math.ceil((accuracyView.start+span)*(n-1))+1));return pts.slice(a,b);}}
+	function accuracyLinePointBudget(cw,count){{if(count<=96)return count;const cap=Math.max(80,Math.floor(cw*0.55));return Math.min(count,cap);}}
+	function accuracyShowPointMarkers(cw,count){{if(count<=80)return true;const budget=accuracyLinePointBudget(cw,count);return count<=Math.min(100,budget);}}
+	function decimateAccuracySeries(points,predVals,maxPoints){{if(points.length<=maxPoints)return{{points:points,predVals:predVals}};const idx=new Set([0,points.length-1]);const buckets=Math.max(1,Math.floor((maxPoints-2)/2));for(let b=0;b<buckets;b++){{const start=Math.floor(b*(points.length-1)/buckets),end=Math.min(points.length-1,Math.floor((b+1)*(points.length-1)/buckets));if(start>=end){{idx.add(start);continue;}}let minI=start,maxI=start;for(let i=start;i<=end;i++){{const p=Number(points[i].price);if(p<Number(points[minI].price))minI=i;if(p>Number(points[maxI].price))maxI=i;}}idx.add(minI);idx.add(maxI);}}let order=Array.from(idx).sort((a,b)=>a-b);if(order.length>maxPoints){{const slim=[];for(let i=0;i<maxPoints;i++)slim.push(order[Math.round(i*(order.length-1)/(maxPoints-1))]);order=slim;}}return{{points:order.map(i=>points[i]),predVals:order.map(i=>predVals[i])}};}}
+	function accuracyMinTimeSpan(){{const n=(accuracyView.points||[]).length;return n<=1?1:Math.max(0.06,Math.min(1,24/Math.max(24,n)));}}
 	function syncAccuracyPoints(points,options){{const opts=options||{{}},clean=(points||[]).filter(o=>Number.isFinite(Number(o&&o.price)));if(opts.resetView){{accuracyView.points=clean;resetAccuracyView();return;}}const followLatest=accuracyView.followLatest!==false&&accuracyView.end>=0.995;accuracyView.points=clean;if(followLatest&&clean.length>2){{const span=Math.max(0.001,accuracyView.end-accuracyView.start);accuracyView.end=1;accuracyView.start=Math.max(0,1-span);}}}}
 	function redrawAccuracyChart(){{drawAccuracyChart();}}
-	async function fetchAccuracy(options){{options=options||{{}};const canvas=document.getElementById('accuracyChart');if(!canvas)return;const resetView=!!options.resetView||accuracyQuerySignature()!==accuracyQueryKey;if(accuracyImportedMode&&!options.resetView)return;if(options.resetView)setAccuracyImportedMode(false,'');const inst=(document.getElementById('accuracyInst')||{{}}).value||'BTC-USDT-SWAP',h=(document.getElementById('accuracyHorizon')||{{}}).value||'5',scope=(document.getElementById('accuracyScope')||{{}}).value||'session',retention=accuracyRetentionHours(),interval=configuredMonitorInterval(),note=document.getElementById('accuracyNote');const queryKey=accuracyQuerySignature();accuracyQueryKey=queryKey;try{{if(note&&resetView)note.textContent='正在统计实时预测压测...';const qs='inst_id='+encodeURIComponent(inst)+'&horizon='+encodeURIComponent(h)+'&scope='+encodeURIComponent(scope)+'&retention_hours='+encodeURIComponent(retention)+'&interval_seconds='+encodeURIComponent(interval);const r=await fetch('/api/accuracy-data?'+qs,{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'统计失败');accuracyLivePayload=p;const s=p.summary||{{}};updateAccuracySummary(s);syncAccuracyPoints(p.points||[],{{resetView:resetView}});redrawAccuracyChart();const maxPts=p.max_points||0,intervalSec=p.interval_seconds||interval,retainH=p.retention_hours||retention;let noteExtra='';if(p.scope==='session'&&(s.total??0)===0&&((s.raw_log_total??0)>0||(s.pending_total??0)>0))noteExtra=' · 监控日志已有数据，验证窗口成熟后曲线才会加点';else if(p.scope==='session'&&(s.raw_log_total??0)===0)noteExtra=' · 监控刚启动，请等待几轮轮询';if(note)note.textContent=(p.scope==='replay'?'回放会话':p.scope==='session'?'本次启动后':'全部历史')+' · 等级 '+(s.reliability_level||'--')+' · 分数 '+fmt(s.reliability_score,1)+' · 已验证/日志 '+(s.total??0)+'/'+(s.raw_log_total??s.total??0)+' · 图表保留 '+retainH+' 小时 / 轮询 '+intervalSec+' 秒 / 最多 '+maxPts+' 点 · 窗口 '+(p.horizon_seconds||h)+' 秒 · 双击图表重置缩放'+noteExtra;}}catch(e){{updateAccuracySummary({{}});syncAccuracyPoints([],{{resetView:true}});redrawAccuracyChart();if(note)note.textContent='预测压测统计失败：'+e;}}}}
+	async function fetchAccuracy(options){{options=options||{{}};if(fetchAccuracyInFlight&&!options.force)return fetchAccuracyInFlight;const run=async()=>{{const canvas=document.getElementById('accuracyChart');if(!canvas)return;const resetView=!!options.resetView||accuracyQuerySignature()!==accuracyQueryKey;if(accuracyImportedMode&&!options.resetView)return;if(options.resetView)setAccuracyImportedMode(false,'');const inst=(document.getElementById('accuracyInst')||{{}}).value||'BTC-USDT-SWAP',h=(document.getElementById('accuracyHorizon')||{{}}).value||'5',scope=(document.getElementById('accuracyScope')||{{}}).value||'session',retention=accuracyRetentionHours(),interval=configuredMonitorInterval(),note=document.getElementById('accuracyNote');const queryKey=accuracyQuerySignature();accuracyQueryKey=queryKey;try{{if(note&&resetView)note.textContent='正在统计实时预测压测...';const qs='inst_id='+encodeURIComponent(inst)+'&horizon='+encodeURIComponent(h)+'&scope='+encodeURIComponent(scope)+'&retention_hours='+encodeURIComponent(retention)+'&interval_seconds='+encodeURIComponent(interval);const r=await fetch('/api/accuracy-data?'+qs,{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'统计失败');accuracyLivePayload=p;const s=p.summary||{{}};updateAccuracySummary(s);syncAccuracyPoints(p.points||[],{{resetView:resetView}});redrawAccuracyChart();if(p.replay_pending){{if(note)note.textContent=p.hint||'请先点击下方「开始回放」；切换「回放会话」不会自动启动回放。';return;}}const maxPts=p.max_points||0,intervalSec=p.interval_seconds||interval,retainH=p.retention_hours||retention;let noteExtra='';if(p.scope==='replay'&&(s.total??0)===0&&((s.raw_log_total??0)>0||(s.pending_total??0)>0))noteExtra=' · 回放日志已有数据，验证窗口成熟后曲线才会加点';else if(p.scope==='replay'&&(s.raw_log_total??0)===0)noteExtra=' · 回放进行中，请稍候';else if(p.scope==='session'&&(s.total??0)===0&&((s.raw_log_total??0)>0||(s.pending_total??0)>0))noteExtra=' · 监控日志已有数据，验证窗口成熟后曲线才会加点';else if(p.scope==='session'&&(s.raw_log_total??0)===0)noteExtra=' · 监控刚启动，请等待几轮轮询';if(note)note.textContent=(p.scope==='replay'?'回放会话':p.scope==='session'?'本次启动后':'全部历史')+' · 综合 '+fmt(s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,1)+'% · 观望 '+fmt(s.watch_reasonable_pct,1)+'%('+((s.watch_total??0))+') · 交易方向 '+fmt(s.trade_direction_accuracy_pct,1)+'%('+((s.trade_signal_total??0))+') · 窗口 '+formatHorizonLabel(p.horizon_seconds||h)+' · 双击重置缩放'+noteExtra;}}catch(e){{updateAccuracySummary({{}});syncAccuracyPoints([],{{resetView:true}});redrawAccuracyChart();if(note)note.textContent='预测压测统计失败：'+e;}}}};fetchAccuracyInFlight=run();try{{await fetchAccuracyInFlight;}}finally{{fetchAccuracyInFlight=null;}}}}
 	function switchAccuracyToLiveSession(){{const scopeEl=document.getElementById('accuracyScope');if(scopeEl&&scopeEl.value!=='session'){{accuracyScopeSyncing=true;scopeEl.value='session';accuracyScopeSyncing=false;}}setAccuracyImportedMode(false,'');accuracyQueryKey='';fetchAccuracy({{resetView:true}});}}
-	async function onAccuracyScopeChange(){{if(accuracyScopeSyncing)return;const scopeEl=document.getElementById('accuracyScope');if(scopeEl&&scopeEl.value==='replay'){{let monitorRunning=false;try{{const st=await fetch('/api/status',{{cache:'no-store'}}).then(r=>r.json());monitorRunning=!!(st&&st.running);}}catch(e){{}}if(monitorRunning){{alert('监控运行中无法查看回放压测，请先停止监控');accuracyScopeSyncing=true;scopeEl.value='session';accuracyScopeSyncing=false;}}}}fetchAccuracy({{resetView:true}});}}
+	function switchAccuracyToReplaySession(){{const scopeEl=document.getElementById('accuracyScope');if(scopeEl&&scopeEl.value!=='replay'){{accuracyScopeSyncing=true;scopeEl.value='replay';accuracyScopeSyncing=false;}}setAccuracyImportedMode(false,'');accuracyQueryKey='';}}
+	function syncAccuracyScopeWithReplay(info){{if(!info||!info.replay_running)return false;const scopeEl=document.getElementById('accuracyScope');if(!scopeEl||scopeEl.value==='replay')return false;switchAccuracyToReplaySession();return true;}}
+	async function onAccuracyScopeChange(){{if(accuracyScopeSyncing)return;const scopeEl=document.getElementById('accuracyScope');if(scopeEl&&scopeEl.value!=='replay')stopReplayAccuracyPoll();if(scopeEl&&scopeEl.value==='replay'){{let monitorRunning=false;try{{const st=await fetch('/api/status',{{cache:'no-store'}}).then(r=>r.json());monitorRunning=!!(st&&st.running);}}catch(e){{}}if(monitorRunning){{alert('监控运行中无法查看回放压测，请先停止监控');accuracyScopeSyncing=true;scopeEl.value='session';accuracyScopeSyncing=false;}}}}await fetchAccuracy({{resetView:true}});syncReplayAccuracyPoll();}}
 	if(accuracyRefreshBtn){{accuracyRefreshBtn.addEventListener('click',()=>fetchAccuracy({{resetView:true}}));}}
 	const accuracyExportBtn=document.getElementById('accuracyExportBtn'),accuracyImportBtn=document.getElementById('accuracyImportBtn'),accuracyLiveBtn=document.getElementById('accuracyLiveBtn');
 	if(accuracyExportBtn)accuracyExportBtn.addEventListener('click',exportAccuracyChart);
@@ -2174,9 +2291,10 @@ const importConfigBtn = document.getElementById('importConfigBtn');
 	if(accuracyLiveBtn)accuracyLiveBtn.addEventListener('click',exitAccuracyImportedMode);
 	['accuracyInst','accuracyHorizon','accuracyRetentionHours'].forEach(id=>{{const el=document.getElementById(id);if(el)el.addEventListener('change',()=>fetchAccuracy({{resetView:true}}));}});
 	const accuracyScopeEl=document.getElementById('accuracyScope');if(accuracyScopeEl)accuracyScopeEl.addEventListener('change',onAccuracyScopeChange);
-	function updateAccuracySummary(s){{const box=document.getElementById('accuracySummary');if(!box)return;const edge=s.model_edge_pct;const edgeText=edge!=null?(edge>=0?'+':'')+fmt(edge,1)+'pct':'--';const vals=[['可靠性等级',(s.reliability_level||'--')+' / '+(s.reliability_score!=null?fmt(s.reliability_score,1):'--')],['已验证/日志',(s.total??0)+' / '+(s.raw_log_total??s.total??0)],['待验证/成熟率',(s.pending_total??0)+' / '+(s.mature_rate_pct!=null?fmt(s.mature_rate_pct,1)+'%':'--')],['决策合理率',s.decision_accuracy_pct!=null?fmt(s.decision_accuracy_pct,1)+'% / '+(s.decision_total??0):'--'],['相对观望基准',edgeText+' / 基准 '+(s.baseline_watch_pct!=null?fmt(s.baseline_watch_pct,1)+'%':'--')],['观望区间可靠率',s.watch_reasonable_pct!=null?fmt(s.watch_reasonable_pct,1)+'% / '+(s.watch_total??0):'--'],['交易建议合理率',s.trade_signal_accuracy_pct!=null?fmt(s.trade_signal_accuracy_pct,1)+'% / '+(s.trade_signal_total??0):'--'],['入场触达/未成交',fmt(s.entry_touch_pct,1)+'% / '+fmt(s.no_fill_pct,1)+'%'],['止盈/止损',fmt(s.take_profit_pct,1)+'% / '+fmt(s.stop_hit_pct,1)+'%'],['交易胜率',fmt(s.trade_win_rate_pct,1)+'% / '+(s.trade_resolved_total??0)],['MFE/MAE均值',fmt(s.avg_mfe_pct,3)+'% / '+fmt(s.avg_mae_pct,3)+'%'],['趋势倾向命中率',s.trend_bias_accuracy_pct!=null?fmt(s.trend_bias_accuracy_pct,1)+'% / '+(s.trend_bias_total??0):'--']];box.innerHTML=vals.map(v=>'<div><span>'+v[0]+'</span><b>'+v[1]+'</b></div>').join('');}}
-	function drawAccuracyChart(points){{if(Array.isArray(points))syncAccuracyPoints(points,{{resetView:true}});const c=document.getElementById('accuracyChart');if(!c)return;const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=Math.max(1,r.width*d);c.height=Math.max(1,r.height*d);const x=c.getContext('2d');x.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,p={{l:58,r:46,t:24,b:40}},cw=W-p.l-p.r,ch=H-p.t-p.b;x.clearRect(0,0,W,H);x.fillStyle='#0f172a';x.fillRect(0,0,W,H);x.strokeStyle='rgba(148,163,184,.22)';x.lineWidth=1;for(let i=0;i<=4;i++){{const y=p.t+ch*i/4;x.beginPath();x.moveTo(p.l,y);x.lineTo(W-p.r,y);x.stroke();}}const clean=visibleAccuracyPoints();if(!clean.length){{x.fillStyle='rgba(203,213,225,.82)';x.textAlign='center';x.textBaseline='middle';x.font='13px Segoe UI, Microsoft YaHei';x.fillText('暂无可验证样本：启动监控后等待下一轮价格日志即可出现',W/2,H/2);return;}}const priceVals=clean.map(o=>Number(o.price)),mn=Math.min(...priceVals),mx=Math.max(...priceVals),priceRange=Math.max(0.000001,mx-mn);let pred=0;const predVals=clean.map(o=>{{pred+=accuracyDirectionValue(o);return pred;}}),pmn=Math.min(...predVals),pmx=Math.max(...predVals),predRange=Math.max(1,pmx-pmn),step=cw/Math.max(1,clean.length-1),xAt=i=>p.l+step*i,yFromNorm=n=>p.t+ch*(0.5-(n-(0.5+accuracyView.yPan))*accuracyView.yZoom),priceY=o=>yFromNorm((Number(o.price)-mn)/priceRange),predY=i=>yFromNorm((predVals[i]-pmn)/predRange);function line(color,width,yFn){{x.beginPath();clean.forEach((o,i)=>{{const px=xAt(i),py=yFn(o,i);if(i===0)x.moveTo(px,py);else x.lineTo(px,py);}});x.strokeStyle=color;x.lineWidth=width;x.stroke();}}line('#60a5fa',2.2,priceY);line('#fbbf24',2.2,(o,i)=>predY(i));clean.forEach((o,i)=>{{const px=xAt(i),py=priceY(o);x.fillStyle=o.hit?'#22d3ee':'#fb7185';x.beginPath();x.arc(px,py,2.8,0,Math.PI*2);x.fill();}});x.fillStyle='rgba(226,232,240,.92)';x.font='12px Segoe UI, Microsoft YaHei';x.textAlign='left';x.textBaseline='top';x.fillText('蓝线：价格曲线',p.l,p.t+4);x.fillStyle='#fbbf24';x.fillText('黄线：预测方向曲线（做多↑ 观望→ 做空↓）',p.l+96,p.t+4);x.fillStyle='rgba(226,232,240,.78)';x.textAlign='right';x.textBaseline='middle';x.fillText(fmt(mx,2),p.l-8,p.t);x.fillText(fmt((mx+mn)/2,2),p.l-8,p.t+ch/2);x.fillText(fmt(mn,2),p.l-8,p.t+ch);x.textAlign='left';x.fillText('pred +',W-p.r+6,p.t);x.fillText('pred -',W-p.r+6,p.t+ch);x.textAlign='center';x.textBaseline='top';for(let i=0;i<clean.length;i+=Math.max(1,Math.floor(clean.length/5))){{x.fillStyle='rgba(203,213,225,.78)';x.fillText(compactTime(clean[i].time),xAt(i),H-26);}}x.textAlign='right';x.fillStyle='rgba(203,213,225,.68)';x.fillText('可见 '+clean.length+' / 总计 '+accuracyView.points.length+' 点',W-p.r,H-26);}}
-	function setupAccuracyChartInteractions(){{const c=document.getElementById('accuracyChart');if(!c||c.dataset.panZoomBound)return;c.dataset.panZoomBound='1';c.addEventListener('wheel',e=>{{if(!accuracyView.points.length)return;e.preventDefault();const rect=c.getBoundingClientRect(),mx=(e.clientX-rect.left)/Math.max(1,rect.width),factor=e.deltaY>0?1.18:0.85;if(e.shiftKey){{accuracyView.yZoom=clamp(accuracyView.yZoom/factor,0.35,12);}}else{{const span=accuracyView.end-accuracyView.start,newSpan=clamp(span*factor,Math.min(1,30/Math.max(30,accuracyView.points.length)),1),anchor=accuracyView.start+span*mx;accuracyView.start=clamp(anchor-newSpan*mx,0,1-newSpan);accuracyView.end=accuracyView.start+newSpan;}}accuracyView.followLatest=accuracyView.end>=0.995;drawAccuracyChart();}},{{passive:false}});c.addEventListener('mousedown',e=>{{accuracyView.drag={{x:e.clientX,y:e.clientY,start:accuracyView.start,end:accuracyView.end,yPan:accuracyView.yPan}};c.classList.add('dragging');}});window.addEventListener('mousemove',e=>{{const g=accuracyView.drag;if(!g)return;const rect=c.getBoundingClientRect(),dx=(e.clientX-g.x)/Math.max(1,rect.width),dy=(e.clientY-g.y)/Math.max(1,rect.height),span=g.end-g.start;accuracyView.start=clamp(g.start-dx*span,0,1-span);accuracyView.end=accuracyView.start+span;accuracyView.yPan=clamp(g.yPan+dy/Math.max(0.35,accuracyView.yZoom),-2,2);accuracyView.followLatest=accuracyView.end>=0.995;drawAccuracyChart();}});window.addEventListener('mouseup',()=>{{accuracyView.drag=null;c.classList.remove('dragging');}});c.addEventListener('dblclick',()=>{{resetAccuracyView();drawAccuracyChart();}});}}
+	function formatHorizonLabel(sec){{const n=Number(sec)||0;if(n>=60&&n%60===0)return (n/60)+'分钟';return n+'秒';}}
+	function updateAccuracySummary(s){{const box=document.getElementById('accuracySummary');if(!box)return;s=s||{{}};const pred=s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,tradeTotal=s.trade_signal_total??0,tradeDir=s.trade_direction_accuracy_pct,tradePlan=s.trade_signal_accuracy_pct,watchTotal=s.watch_total??0,watchPct=s.watch_reasonable_pct,watchMiss=s.watch_missed_pct,resolved=s.trade_resolved_total??0,execLine=tradeTotal>=5?(fmt(s.entry_touch_pct,1)+'% / '+fmt(s.no_fill_pct,1)+'%'):'样本不足';const vals=[['综合预测准确度',pred!=null?fmt(pred,1)+'% / '+(s.decision_total??s.total??0):'--',true],['可靠性等级',(s.reliability_level||'--')+' / '+(s.reliability_score!=null?fmt(s.reliability_score,1):'--')],['已验证/日志',(s.total??0)+' / '+(s.raw_log_total??s.total??0)],['观望准确度',watchPct!=null?fmt(watchPct,1)+'% / '+watchTotal:'--'],['观望错失率',watchMiss!=null?fmt(watchMiss,1)+'% / '+watchTotal:'--'],['交易方向命中',tradeDir!=null?fmt(tradeDir,1)+'% / '+tradeTotal:'--'],['交易执行合理率',tradePlan!=null?fmt(tradePlan,1)+'% / '+tradeTotal:'--'],['验证窗口',formatHorizonLabel(s.horizon_seconds)+' · 阈值 '+fmt(s.threshold_pct,3)+'%'],['入场触达/未成交',execLine]];if(resolved>=3)vals.push(['止盈/止损/胜率',fmt(s.take_profit_pct,1)+'% / '+fmt(s.stop_hit_pct,1)+'% / '+fmt(s.trade_win_rate_pct,1)+'% ('+resolved+')']);box.innerHTML=vals.map(v=>'<div'+(v[2]?' class="accuracy-primary"':'')+'><span>'+v[0]+'</span><b>'+v[1]+'</b></div>').join('');}}
+	function drawAccuracyChart(points){{if(Array.isArray(points))syncAccuracyPoints(points,{{resetView:true}});const c=document.getElementById('accuracyChart');if(!c)return;accuracyPlotPoints=[];const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=Math.max(1,r.width*d);c.height=Math.max(1,r.height*d);const ctx=c.getContext('2d');ctx.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,pad={{l:58,r:52,t:24,b:40}},cw=W-pad.l-pad.r,ch=H-pad.t-pad.b;ctx.clearRect(0,0,W,H);ctx.fillStyle='#0f172a';ctx.fillRect(0,0,W,H);let clean=visibleAccuracyPoints();if(!clean.length){{updateAccuracyPointPanel(null);ctx.fillStyle='rgba(203,213,225,.82)';ctx.textAlign='center';ctx.textBaseline='middle';ctx.font='13px Segoe UI, Microsoft YaHei';const scopeNow=(document.getElementById('accuracyScope')||{{}}).value||'session',emptyMsg=scopeNow==='replay'?'回放会话暂无数据：请先点击下方「开始回放」，切换范围不会自动启动回放':(scopeNow==='all'?'全部历史暂无已验证点：请确认日志中有该币种数据':'暂无可验证样本：live 监控请启动后选「本次启动后」；离线回放请点「开始回放」后选「回放会话」');ctx.fillText(emptyMsg,W/2,H/2);return;}}const visibleCount=clean.length,totalCount=(accuracyView.points||[]).length;if(clean.length===1)clean=[clean[0],Object.assign({{}},clean[0])];const priceVals=clean.map(o=>Number(o.price)),mn=Math.min(...priceVals),mx=Math.max(...priceVals),basePriceRg=Math.max((mx||1)*0.001,(mx-mn)*1.16,0.01);let pred=0;const predVals=clean.map(o=>{{pred+=accuracyDirectionValue(o);return pred;}}),pmn=Math.min(...predVals),pmx=Math.max(...predVals),basePredRg=Math.max(1,(pmx-pmn)*1.16,1);const yZoom=Math.max(0.35,accuracyView.yZoom||1),yPan=accuracyView.yPan||0,normTop=0.5+yPan+0.5/yZoom,normBottom=0.5+yPan-0.5/yZoom,priceSpan=Math.max(0.000001,basePriceRg),predSpan=Math.max(0.000001,basePredRg),priceAxisBottom=mn+normBottom*priceSpan,priceAxisTop=mn+normTop*priceSpan,predAxisBottom=pmn+normBottom*predSpan,predAxisTop=pmn+normTop*predSpan;accuracyView.priceRg=priceSpan/yZoom;const pricePlotRg=Math.max(0.000001,priceAxisTop-priceAxisBottom),predPlotRg=Math.max(0.000001,predAxisTop-predAxisBottom),priceFlat=Math.abs(mx-mn)<1e-9,predFlat=Math.abs(pmx-pmn)<1e-9,bothFlat=priceFlat&&predFlat,priceY=o=>{{let norm=priceFlat?0.5:(Number(o.price)-priceAxisBottom)/pricePlotRg;return pad.t+ch-norm*ch-(bothFlat?16:0);}},predValY=val=>{{let norm=predFlat?0.5:(val-predAxisBottom)/predPlotRg;return pad.t+ch-norm*ch+(bothFlat?16:0);}},stepFull=cw/Math.max(1,clean.length-1),xAtFull=i=>pad.l+stepFull*i;const drawBudget=accuracyLinePointBudget(cw,clean.length),showMarkers=accuracyShowPointMarkers(cw,clean.length),decimated=decimateAccuracySeries(clean,predVals,drawBudget),drawPts=decimated.points,drawPred=decimated.predVals,stepDraw=cw/Math.max(1,drawPts.length-1),xAtDraw=i=>pad.l+stepDraw*i,denseMode=drawPts.length<clean.length,priceLineWidth=denseMode?1.5:2.6,predLineWidth=denseMode?1.1:2;ctx.strokeStyle='rgba(148,163,184,.22)';ctx.lineWidth=1;for(let i=0;i<=4;i++){{const y=pad.t+ch*i/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke();}}drawAccuracyLeftAxis(ctx,pad,W,H,priceAxisBottom,priceAxisTop);drawAccuracyRightAxis(ctx,pad,W,H,predAxisBottom,predAxisTop);drawTimeAxis(ctx,W,H,pad,clean,cw);ctx.beginPath();drawPts.forEach((o,i)=>{{const px=xAtDraw(i),py=predValY(drawPred[i]);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);}});ctx.strokeStyle='rgba(251,191,36,.92)';ctx.lineWidth=predLineWidth;ctx.stroke();ctx.beginPath();drawPts.forEach((o,i)=>{{const px=xAtDraw(i),py=priceY(o);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);}});ctx.strokeStyle='rgba(96,165,250,.95)';ctx.lineWidth=priceLineWidth;ctx.stroke();const markerPriceRadius=showMarkers?(visibleCount>160?1.6:2.8):0,markerPredRadius=showMarkers?(visibleCount>160?1.4:2.4):0;clean.forEach((o,i)=>{{const px=xAtFull(i),pyPrice=priceY(o),pyPred=predValY(predVals[i]),selected=(o.time||'')===accuracyView.selectedKey;accuracyPlotPoints.push({{x:px,yPrice:pyPrice,yPred:pyPred,predVal:predVals[i],point:o}});if(!showMarkers&&!selected)return;const pr=selected?4.2:(markerPriceRadius||2.8),qr=selected?3.8:(markerPredRadius||2.4);ctx.lineWidth=selected?1.5:1;ctx.strokeStyle='rgba(15,23,42,.85)';ctx.fillStyle=selected?'#22d3ee':(o.hit?'#34d399':'#fb7185');ctx.beginPath();ctx.arc(px,pyPrice,pr,0,Math.PI*2);ctx.fill();ctx.stroke();ctx.strokeStyle='rgba(15,23,42,.85)';ctx.fillStyle=selected?'#fde047':'#fbbf24';ctx.beginPath();ctx.arc(px,pyPred,qr,0,Math.PI*2);ctx.fill();ctx.stroke();}});let selectedPlot=null;if(accuracyView.selectedKey){{selectedPlot=accuracyPlotPoints.find(o=>(o.point.time||'')===accuracyView.selectedKey)||null;if(selectedPlot){{drawAccuracyCrosshair(ctx,pad,W,H,selectedPlot);updateAccuracyPointPanel(selectedPlot.point);}}else{{accuracyView.selectedKey='';updateAccuracyPointPanel(null);}}}}else{{updateAccuracyPointPanel(null);}}ctx.fillStyle='rgba(226,232,240,.92)';ctx.font='12px Segoe UI, Microsoft YaHei';ctx.textAlign='left';ctx.textBaseline='top';ctx.fillText('蓝线：价格',pad.l,pad.t+4);ctx.fillStyle='#fbbf24';ctx.fillText('黄线：预测方向',pad.l+72,pad.t+4);ctx.fillStyle=denseMode?'#fcd34d':'rgba(203,213,225,.72)';ctx.fillText(' · 绘制 '+drawPts.length+'/'+visibleCount+(denseMode?' 已抽稀':' 全量'),pad.l+248,pad.t+4);ctx.textAlign='right';ctx.fillStyle='rgba(203,213,225,.68)';ctx.textBaseline='top';ctx.fillText('总计 '+totalCount+' 点 · 滚轮缩放 · 拖动平移 · 点击选点',W-pad.r,H-26);}}
+	function setupAccuracyChartInteractions(){{const c=document.getElementById('accuracyChart');if(!c||c.dataset.panZoomBound)return;c.dataset.panZoomBound='1';c.addEventListener('wheel',e=>{{if(!accuracyView.points.length)return;e.preventDefault();const rect=c.getBoundingClientRect(),mx=(e.clientX-rect.left)/Math.max(1,rect.width),factor=e.deltaY>0?1.18:0.85,n=accuracyView.points.length;if(e.shiftKey||n<=2){{accuracyView.yZoom=clamp(accuracyView.yZoom/factor,0.35,12);}}else{{const span=accuracyView.end-accuracyView.start,newSpan=clamp(span*factor,accuracyMinTimeSpan(),1),anchor=accuracyView.start+span*mx;accuracyView.start=clamp(anchor-newSpan*mx,0,1-newSpan);accuracyView.end=accuracyView.start+newSpan;}}accuracyView.followLatest=accuracyView.end>=0.995;drawAccuracyChart();}},{{passive:false}});c.addEventListener('mousedown',e=>{{accuracyView.drag={{x:e.clientX,y:e.clientY,start:accuracyView.start,end:accuracyView.end,yPan:accuracyView.yPan,moved:false}};c.classList.add('dragging');}});window.addEventListener('mousemove',e=>{{const g=accuracyView.drag;if(!g)return;const rect=c.getBoundingClientRect(),dx=(e.clientX-g.x)/Math.max(1,rect.width),dy=(e.clientY-g.y)/Math.max(1,rect.height),span=g.end-g.start;if(Math.abs(e.clientX-g.x)>3||Math.abs(e.clientY-g.y)>3)g.moved=true;let ns=clamp(g.start-dx*span,0,1-span),ne=ns+span;accuracyView.start=ns;accuracyView.end=ne;accuracyView.yPan=clamp(g.yPan+dy*1.35,-3,3);accuracyView.followLatest=accuracyView.end>=0.995;drawAccuracyChart();}});window.addEventListener('mouseup',()=>{{if(accuracyView.drag){{setTimeout(function(){{accuracyView.drag=null;}},0);}}c.classList.remove('dragging');}});c.addEventListener('click',e=>{{if(accuracyView.drag&&accuracyView.drag.moved)return;selectAccuracyPoint(e,false);}});c.addEventListener('dblclick',e=>{{if(accuracyView.drag&&accuracyView.drag.moved)return;resetAccuracyView();drawAccuracyChart();}});}}
 	setupAccuracyChartInteractions();
 	let virtualTick=0;
 let configuredMonitorInsts={json.dumps(selected_instruments, ensure_ascii=False)};
@@ -2232,8 +2350,14 @@ bindMonitorTabs();
 const monitorToggleBtn=document.getElementById('monitorToggleBtn');
 if(monitorToggleBtn){{monitorToggleBtn.addEventListener('click',async()=>{{const status=await syncMonitorStatus();if(status&&status.running){{setMonitorButtonState('stopping','正在停止监控进程...');try{{await fetch('/stop#monitor',{{cache:'no-store'}});}}catch(e){{}}await syncMonitorStatus();monitorLiveMode=false;monitorViewStart=0;monitorViewEnd=1;monitorYZoom=1;monitorYPan=0;monitorSeriesByInst[monitorInst]=[];setMonitorButtonState('stopped','监控已停止，当前显示虚拟行情');drawVirtualMonitor();return;}}if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}setMonitorButtonState('starting','正在保存配置并启动监控...');monitorYPan=0;showRealtimeWaiting(true);try{{await autoSaveConfig();await fetch('/start#monitor',{{cache:'no-store'}});await syncMonitorStatus();switchAccuracyToLiveSession();bootstrapMonitorChart();}}catch(e){{setMonitorButtonState('stopped','启动监控失败');const l=document.getElementById('monitorLoading');if(l)l.textContent='启动监控失败：'+e;}}}});}}
 let logCleared=false,consoleLogCleared=false;
-async function refreshLogs(force){{const box=document.getElementById('logWindow');if(!box)return;if(logCleared&&!force)return;try{{const r=await fetch('/api/logs',{{cache:'no-store'}}),p=await r.json();logCleared=false;box.value=p.text||'暂无日志。';box.scrollTop=box.scrollHeight;}}catch(e){{box.value='日志读取失败：'+e;}}}}
-async function refreshConsoleLogs(force){{const box=document.getElementById('consoleLogWindow');if(!box)return;if(consoleLogCleared&&!force)return;try{{const r=await fetch('/api/console-logs',{{cache:'no-store'}}),p=await r.json();consoleLogCleared=false;box.value=p.text||'暂无控制台日志。';box.scrollTop=box.scrollHeight;}}catch(e){{box.value='控制台日志读取失败：'+e;}}}}
+let analysisLogEnabled={json.dumps(bool(config.get("analysis_log_enabled")))};
+function syncAnalysisLogUi(){{const sw=document.getElementById('analysisLogSwitch'),hint=document.getElementById('analysisLogSwitchHint'),cfg=document.querySelector('.config-form input[name="analysis_log_enabled"]');if(sw)sw.checked=!!analysisLogEnabled;if(cfg)cfg.checked=!!analysisLogEnabled;if(hint)hint.textContent=(analysisLogEnabled?'已开启':'已关闭')+' · 保存后需重启监控';}}
+async function setAnalysisLogEnabled(enabled){{analysisLogEnabled=!!enabled;syncAnalysisLogUi();try{{await autoSaveConfig();refreshLogs(true);refreshConsoleLogs(true);}}catch(e){{analysisLogEnabled=!enabled;syncAnalysisLogUi();alert('保存日志开关失败：'+e);}}}}
+async function refreshLogs(force){{const box=document.getElementById('logWindow');if(!box)return;if(logCleared&&!force)return;try{{const r=await fetch('/api/logs',{{cache:'no-store'}}),p=await r.json();if(typeof p.enabled==='boolean'){{analysisLogEnabled=p.enabled;syncAnalysisLogUi();}}logCleared=false;box.value=p.text||'暂无日志。';box.scrollTop=box.scrollHeight;}}catch(e){{box.value='日志读取失败：'+e;}}}}
+async function refreshConsoleLogs(force){{const box=document.getElementById('consoleLogWindow');if(!box)return;if(consoleLogCleared&&!force)return;try{{const r=await fetch('/api/console-logs',{{cache:'no-store'}}),p=await r.json();if(typeof p.enabled==='boolean'){{analysisLogEnabled=p.enabled;syncAnalysisLogUi();}}consoleLogCleared=false;box.value=p.text||'暂无控制台日志。';box.scrollTop=box.scrollHeight;}}catch(e){{box.value='控制台日志读取失败：'+e;}}}}
+const analysisLogSwitch=document.getElementById('analysisLogSwitch');
+if(analysisLogSwitch){{analysisLogSwitch.addEventListener('change',function(){{setAnalysisLogEnabled(analysisLogSwitch.checked);}});}}
+syncAnalysisLogUi();
 const refreshLogBtn = document.getElementById('refreshLogBtn');
 if (refreshLogBtn) refreshLogBtn.addEventListener('click', function() {{ refreshLogs(true); refreshConsoleLogs(true); }});
 const clearLogBtn = document.getElementById('clearLogBtn');
@@ -2289,8 +2413,8 @@ const monitorCanvas=document.getElementById('monitorChart');
 if(monitorCanvas){{monitorCanvas.addEventListener('wheel',function(event){{event.preventDefault();const rect=monitorCanvas.getBoundingClientRect(),focus=Math.min(1,Math.max(0,(event.clientX-rect.left)/Math.max(1,rect.width))),span=monitorViewEnd-monitorViewStart,zoom=(event.deltaY<0?0.82:1.22),newSpan=Math.min(1,Math.max(.06,span*zoom)),center=monitorViewStart+span*focus;let ns=center-newSpan*focus,ne=ns+newSpan;if(ns<0){{ne-=ns;ns=0;}}if(ne>1){{ns-=ne-1;ne=1;}}monitorViewStart=Math.max(0,ns);monitorViewEnd=Math.min(1,ne);monitorYZoom=Math.max(.45,Math.min(10,monitorYZoom*(event.deltaY<0?1.14:.88)));redrawMonitorCached();}},{{passive:false}});monitorCanvas.addEventListener('mousedown',function(event){{monitorDrag={{x:event.clientX,y:event.clientY,start:monitorViewStart,end:monitorViewEnd,yPan:monitorYPan,yRange:monitorYRange,moved:false}};monitorCanvas.classList.add('dragging');}});window.addEventListener('mousemove',function(event){{if(!monitorDrag)return;const rect=monitorCanvas.getBoundingClientRect(),span=monitorDrag.end-monitorDrag.start,dx=(event.clientX-monitorDrag.x)/Math.max(1,rect.width),dy=(event.clientY-monitorDrag.y)/Math.max(1,rect.height);if(Math.abs(event.clientX-monitorDrag.x)>3||Math.abs(event.clientY-monitorDrag.y)>3)monitorDrag.moved=true;let ns=monitorDrag.start-dx*span,ne=monitorDrag.end-dx*span;if(ns<0){{ne-=ns;ns=0;}}if(ne>1){{ns-=ne-1;ne=1;}}monitorViewStart=Math.max(0,ns);monitorViewEnd=Math.min(1,ne);monitorYPan=monitorDrag.yPan+dy*Math.max(.01,monitorDrag.yRange||monitorYRange);redrawMonitorCached();}});window.addEventListener('mouseup',function(){{if(monitorDrag){{setTimeout(function(){{monitorDrag=null;}},0);}}monitorCanvas.classList.remove('dragging');}});function selectNearestPoint(event,strict){{if(!monitorPlotPoints.length)return;const rect=monitorCanvas.getBoundingClientRect(),x=event.clientX-rect.left,y=event.clientY-rect.top;let best=null,bestDist=Infinity;monitorPlotPoints.forEach(o=>{{const dx=o.x-x,dy=o.y-y,dist=Math.sqrt(dx*dx+dy*dy);if(dist<bestDist){{best=o;bestDist=dist;}}}});if(best&&bestDist<(strict?42:34)){{monitorSelectedKey=best.point.time||'';updateSnapshotPanel(best.point,'选中点');redrawMonitorCached();}}else if(!strict){{monitorSelectedKey='';updateSnapshotPanel(monitorLatestPoint,'最新快照');redrawMonitorCached();}}}}monitorCanvas.addEventListener('click',function(event){{if(monitorDrag&&monitorDrag.moved)return;selectNearestPoint(event,false);}});monitorCanvas.addEventListener('dblclick',function(event){{selectNearestPoint(event,true);}});}}
 window.addEventListener('resize',()=>{{if(currentPage()==='monitor')redrawMonitorCached();else if(currentPage()==='tests')redrawAccuracyChart();}});
 setInterval(async()=>{{if(currentPage()!=='monitor')return;const status=await syncMonitorStatus();if(status&&status.running){{monitorLiveMode=true;const now=Date.now();if(now-monitorLastTickerAt>=5000){{monitorLastTickerAt=now;fetchMonitor();}}}}else{{monitorLiveMode=false;drawVirtualMonitor();}}}},1000);
-setInterval(()=>{{if(currentPage()==='tests'){{fetchAccuracy({{resetView:false}});refreshReplayInfo();}}}},3000);
-setInterval(()=>{{if(currentPage()==='logs'){{refreshLogs(false);refreshConsoleLogs(false);}}}},3000);window.addEventListener('hashchange',()=>showPage(currentPage()));syncMonitorStatus();showPage(currentPage());
+setInterval(()=>{{if(currentPage()==='tests'){{refreshReplayInfo().then(function(){{fetchAccuracy({{resetView:false}});}});}}}},3000);
+setInterval(()=>{{if(currentPage()==='logs'&&analysisLogEnabled){{refreshLogs(false);refreshConsoleLogs(false);}}}},3000);window.addEventListener('hashchange',()=>showPage(currentPage()));syncMonitorStatus();showPage(currentPage());
 </script></body></html>"""
     return body.encode("utf-8")
 
@@ -2323,6 +2447,15 @@ class Handler(BaseHTTPRequestHandler):
         if cookie:
             self.send_header("Set-Cookie", cookie)
         self.end_headers()
+
+    def require_auth(self, path: str) -> bool:
+        if self.is_authenticated():
+            return True
+        if path.startswith("/api/"):
+            self.send_json({"ok": False, "error": "登录已失效，请刷新页面重新登录。"}, status=401)
+        else:
+            self.redirect("/login")
+        return False
 
     def send_asset(self, request_path: str) -> None:
         name = urllib.parse.unquote(request_path.removeprefix("/web-assets/"))
@@ -2360,8 +2493,7 @@ class Handler(BaseHTTPRequestHandler):
                 SESSIONS.remove(token)
             self.redirect("/login", "okx_ai_session=; Path=/; Max-Age=0; HttpOnly")
             return
-        if not self.is_authenticated():
-            self.redirect("/login")
+        if not self.require_auth(path):
             return
         if path == "/":
             self.send_html(render_page())
@@ -2387,24 +2519,38 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=502)
         elif path == "/api/logs":
-            self.send_json({"text": monitor_log_text(), "running": bool(monitor_status()["running"]), "default_path": str(MONITOR_JSON_LOG_FILE), "start_at": MONITOR_LOG_START_AT})
+            self.send_json({
+                "text": monitor_log_text(),
+                "running": bool(monitor_status()["running"]),
+                "enabled": analysis_log_enabled(),
+                "default_path": str(MONITOR_JSON_LOG_FILE),
+                "start_at": MONITOR_LOG_START_AT,
+            })
         elif path == "/api/console-logs":
             self.send_json({
                 "text": monitor_console_log_text(),
                 "running": bool(monitor_status()["running"]),
+                "enabled": analysis_log_enabled(),
                 "default_path": str(MONITOR_PROCESS_LOG_FILE),
                 "start_at": MONITOR_LOG_START_AT,
             })
         elif path == "/api/replay-dataset":
-            self.send_json({"ok": True, **replay_dataset_info()})
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            lite = params.get("lite", ["0"])[0] in ("1", "true", "yes")
+            self.send_json({"ok": True, **replay_dataset_info(lite=lite)})
         elif path == "/api/replay-status":
-            self.send_json({"ok": True, **replay_status()})
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            lite = params.get("lite", ["1"])[0] in ("1", "true", "yes")
+            if lite:
+                self.send_json({"ok": True, **replay_dataset_info(lite=True)})
+            else:
+                self.send_json({"ok": True, **replay_status()})
         elif path == "/api/accuracy-data":
             params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             inst_id = params.get("inst_id", ["BTC-USDT-SWAP"])[0]
             horizon = int(params.get("horizon", ["5"])[0])
             scope = params.get("scope", ["session"])[0]
-            retention_hours = float(params.get("retention_hours", ["4"])[0])
+            retention_hours = float(params.get("retention_hours", ["12"])[0])
             interval_seconds = int(params.get("interval_seconds", [str(load_config().get("interval", 5))])[0])
             max_points = accuracy_chart_max_points(retention_hours, interval_seconds)
             if "max_points" in params:
@@ -2446,8 +2592,7 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length).decode("utf-8")
         if path == "/api/config/import":
-            if not self.is_authenticated():
-                self.send_json({"ok": False, "error": "未登录"}, status=401)
+            if not self.require_auth(path):
                 return
             try:
                 import_config_bundle(json.loads(raw or "{}"))
@@ -2465,7 +2610,10 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_html(render_login("用户名或密码错误。"))
             return
-        if not self.is_authenticated():
+        if path.startswith("/api/"):
+            if not self.require_auth(path):
+                return
+        elif not self.is_authenticated():
             self.redirect("/login")
             return
         if path == "/api/config/export":
@@ -2482,22 +2630,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=400)
             return
-        if path == "/api/history-test":
-            try:
-                payload = json.loads(raw or "{}")
-                inst_id = str(payload.get("inst_id", "BTC-USDT-SWAP")).strip() or "BTC-USDT-SWAP"
-                at_time = str(payload.get("time", "")).strip()
-                self.send_json(run_history_test(inst_id, at_time))
-            except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, status=400)
-            return
         if path == "/api/replay-start":
             try:
                 payload = json.loads(raw or "{}")
                 replay_interval = float(payload.get("interval", 0))
                 message = start_replay(replay_interval)
                 ok = "已启动" in message
-                body = {"ok": ok, "message": message, **replay_dataset_info()}
+                body = {"ok": ok, "message": message, **replay_dataset_info(lite=True)}
                 if not ok:
                     body["error"] = message
                 self.send_json(body, status=200 if ok else 400)
@@ -2508,7 +2647,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 message = stop_replay()
                 ok = "已停止" in message or "未运行" in message
-                self.send_json({"ok": ok, "message": message, **replay_dataset_info()}, status=200 if ok else 400)
+                self.send_json({"ok": ok, "message": message, **replay_dataset_info(lite=True)}, status=200 if ok else 400)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=400)
             return
