@@ -7,16 +7,21 @@ Windows deployment can start the UI without installing a web framework.
 """
 
 import html
+import io
 import json
 import mimetypes
 import os
+import re
 import secrets
+import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
 import webbrowser
+import zipfile
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -62,13 +67,44 @@ try:
     REPLAY_LOG_FILE = _monitor_boot.REPLAY_LOG_FILE
     replay_dataset_stats = _monitor_boot.replay_dataset_stats
     DEFAULT_LOG_MAX_BYTES = int(_monitor_boot.DEFAULT_LOG_MAX_BYTES)
+    DEFAULT_LOG_TOTAL_MAX_BYTES = int(_monitor_boot.DEFAULT_LOG_TOTAL_MAX_BYTES)
+    MIN_LOG_MAX_BYTES = int(_monitor_boot.MIN_LOG_MAX_BYTES)
+    tail_analysis_log_text = _monitor_boot.tail_analysis_log_text
+    iter_analysis_log_lines = _monitor_boot.iter_analysis_log_lines
+    analysis_log_total_bytes = _monitor_boot.analysis_log_total_bytes
+    list_analysis_log_segments = _monitor_boot.list_analysis_log_segments
+    AI_TOKEN_STATS_FILE = _monitor_boot.AI_TOKEN_STATS_FILE
+    load_ai_token_stats = _monitor_boot.load_ai_token_stats
+    reset_ai_token_stats = _monitor_boot.reset_ai_token_stats
 except Exception:
     REPLAY_DATASET_FILE = LOG_DIR / "replay_dataset.jsonl"
     REPLAY_LOG_FILE = LOG_DIR / "replay_analysis.jsonl"
     DEFAULT_LOG_MAX_BYTES = 500 * 1024 * 1024
+    DEFAULT_LOG_TOTAL_MAX_BYTES = 1500 * 1024 * 1024
+    MIN_LOG_MAX_BYTES = 50 * 1024 * 1024
 
     def replay_dataset_stats(path):  # type: ignore
         return {"exists": False, "lines": 0, "bytes": 0}
+
+    def tail_analysis_log_text(path, max_bytes):  # type: ignore
+        return tail_text(path, max_bytes)
+
+    def iter_analysis_log_lines(path, *, read_full=False, max_tail_bytes=None):  # type: ignore
+        yield from iter_json_log_lines(path, read_full=read_full, max_tail_bytes=max_tail_bytes)
+
+    def analysis_log_total_bytes(path):  # type: ignore
+        return path.stat().st_size if path.exists() else 0
+
+    def list_analysis_log_segments(path):  # type: ignore
+        return [path] if path.exists() else []
+
+    AI_TOKEN_STATS_FILE = LOG_DIR / "ai_session_tokens.json"
+
+    def load_ai_token_stats(path=AI_TOKEN_STATS_FILE):  # type: ignore
+        return {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0, "calls": 0}
+
+    def reset_ai_token_stats(path=AI_TOKEN_STATS_FILE, started_at=""):  # type: ignore
+        return load_ai_token_stats(path)
 
 DEFAULT_CONFIG_FILE = CONFIG_DIR / "trading_assistant_config.json"
 DEFAULT_AUTH_FILE = CONFIG_DIR / "web_console_auth.default.json"
@@ -90,18 +126,57 @@ REPLAY_ANALYSIS_LOG_FILE = REPLAY_LOG_FILE
 REPLAY_PROCESS_LOG_FILE = LOG_DIR / "replay_console.log"
 HOST = os.getenv("WEB_CONTROL_PANEL_HOST", "127.0.0.1")
 PORT = int(os.getenv("WEB_CONTROL_PANEL_PORT", "8765"))
-SUPPORTED_INSTRUMENTS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
+APP_VERSION = "1.2.0"
+APP_NAME = "OKX AI Assistant"
+PRESET_INSTRUMENTS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
+SUPPORTED_INSTRUMENTS = PRESET_INSTRUMENTS
+MONITOR_BAR_CHANNELS = ("1m", "3m", "5m", "15m", "1H", "4H")
 OKX_BASE_URL = "https://www.okx.com"
+INST_ID_PATTERN = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+-SWAP$")
+_INST_VALIDATION_CACHE: Dict[str, Tuple[float, bool]] = {}
+INST_VALIDATION_CACHE_TTL = 300.0
 
-SESSIONS = set()
+SESSIONS: Dict[str, float] = {}
+SESSION_CREATED: Dict[str, float] = {}
+SESSION_TTL_SECONDS = float(os.getenv("WEB_SESSION_TTL_SECONDS", str(7 * 24 * 3600)))
+SESSION_ABSOLUTE_TTL_SECONDS = float(os.getenv("WEB_SESSION_ABSOLUTE_TTL_SECONDS", str(30 * 24 * 3600)))
+REALTIME_LOG_TAIL_BYTES = int(os.getenv("WEB_REALTIME_LOG_TAIL_BYTES", str(16 * 1024 * 1024)))
+ACCURACY_LOG_TAIL_BYTES = int(os.getenv("WEB_ACCURACY_LOG_TAIL_BYTES", str(32 * 1024 * 1024)))
+LOG_DISPLAY_MAX_LINES = max(500, int(os.getenv("WEB_LOG_DISPLAY_MAX_LINES", "2000")))
+CONSOLE_LOG_MAX_BYTES = int(os.getenv("WEB_CONSOLE_LOG_MAX_BYTES", str(100 * 1024 * 1024)))
+CONSOLE_LOG_TOTAL_MAX_BYTES = int(os.getenv("WEB_CONSOLE_LOG_TOTAL_MAX_BYTES", str(300 * 1024 * 1024)))
+API_RESPONSE_CACHE_TTL_SECONDS = float(os.getenv("WEB_API_CACHE_TTL_SECONDS", "3"))
+WEB_CANDLE_CACHE_TTL_SECONDS = float(os.getenv("WEB_CANDLE_CACHE_TTL_SECONDS", "45"))
+WEB_MAX_CONCURRENT_REQUESTS = max(8, int(os.getenv("WEB_MAX_CONCURRENT_REQUESTS", "48")))
+WEB_MONITOR_AUTO_RESTART = os.getenv("WEB_MONITOR_AUTO_RESTART", "1").strip().lower() in ("1", "true", "yes")
+DIAG_EXPORT_MAX_FILE_BYTES = int(os.getenv("WEB_DIAG_EXPORT_MAX_FILE_BYTES", str(32 * 1024 * 1024)))
+DIAG_EXPORT_MAX_ZIP_BYTES = int(os.getenv("WEB_DIAG_EXPORT_MAX_ZIP_BYTES", str(150 * 1024 * 1024)))
+DIAG_EXPORT_REPLAY_DATASET_TAIL_BYTES = int(os.getenv("WEB_DIAG_EXPORT_REPLAY_DATASET_TAIL_BYTES", str(4 * 1024 * 1024)))
+DIAG_EXPORT_ACCURACY_HORIZONS = (900, 300)
+SECRET_ENV_KEYS = frozenset({"OPENAI_API_KEY", "WECHAT_SEND_KEY"})
+WEB_MONITOR_MAX_AUTO_RESTARTS = max(0, int(os.getenv("WEB_MONITOR_MAX_AUTO_RESTARTS", "5")))
+WEB_MONITOR_AUTO_RESTART_WINDOW_SECONDS = max(60, int(os.getenv("WEB_MONITOR_AUTO_RESTART_WINDOW_SECONDS", "3600")))
+WEB_MONITOR_CRASH_ALERT = os.getenv("WEB_MONITOR_CRASH_ALERT", "1").strip().lower() not in ("0", "false", "no")
+MONITOR_PID_FILE = PORTABLE_STATE_DIR / "monitor.pid"
+REPLAY_PID_FILE = PORTABLE_STATE_DIR / "replay.pid"
+WEB_RESTART_SESSIONS_FILE = PORTABLE_STATE_DIR / "web_restart_sessions.json"
+_API_RESPONSE_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_CANDLE_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+_MONITOR_AUTO_RESTART_AT: List[float] = []
+WEB_SERVER: Optional[ThreadingHTTPServer] = None
+WEB_POWER_SHUTDOWN = False
+WEB_POWER_RESTART = False
 MONITOR_PROCESS: subprocess.Popen = None
 MONITOR_STARTED_AT = ""
 MONITOR_LOG_START_AT = ""
 MONITOR_STOPPED_AT = ""
+MONITOR_STOP_REQUESTED = False
+MONITOR_LAST_EXIT_UNEXPECTED = False
 REPLAY_PROCESS: subprocess.Popen = None
 REPLAY_STARTED_AT = ""
 REPLAY_LOG_START_AT = ""
 REPLAY_STOPPED_AT = ""
+REPLAY_STOP_REQUESTED = False
 _DATASET_STATS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _LOG_LINE_COUNT_CACHE: Dict[str, Tuple[float, int]] = {}
 
@@ -111,9 +186,9 @@ LEGACY_CONFIG_KEYS = ("runtime", "flag")
 
 
 SUGGESTED_PUSH_SCORES = {
-    "conservative": {"push_score": 80, "watch_push_score": 72, "spike_push_score": 68},
-    "standard": {"push_score": 75, "watch_push_score": 65, "spike_push_score": 62},
-    "aggressive": {"push_score": 70, "watch_push_score": 62, "spike_push_score": 58},
+    "conservative": {"push_score": 80, "short_push_score": 74, "watch_push_score": 72, "spike_push_score": 68},
+    "standard": {"push_score": 75, "short_push_score": 70, "watch_push_score": 65, "spike_push_score": 62},
+    "aggressive": {"push_score": 70, "short_push_score": 65, "watch_push_score": 62, "spike_push_score": 58},
 }
 
 RISK_PREFERENCE_LABELS = {
@@ -124,13 +199,15 @@ RISK_PREFERENCE_LABELS = {
 
 CONFIG_FIELDS = [
     ("基础运行", "interval", "number", "轮询间隔(秒)", "默认5秒执行一轮监控。"),
-    ("基础运行", "analysis_log_enabled", "checkbox", "写入分析日志", "开启后每轮写入 JSON 分析日志与控制台摘要；关闭可减磁盘与 Web 轮询开销。监控指标叠加与 live 压测依赖此项。"),
+    ("基础运行", "log_max_mb", "number", "单文件日志上限(MB)", "当前分卷达到此大小后轮转；默认500MB，适合约12小时写入量。"),
+    ("基础运行", "log_total_max_mb", "number", "日志总容量上限(MB)", "所有分卷合计超过此值时自动删除最旧分卷；默认1500MB（约3卷）。监控图表与压测依赖分析日志，建议保持开启。"),
     ("基础运行", "record_replay_enabled", "checkbox", "录制回放数据集", "监控运行时把每轮 collect_snapshot 原始输入写入 replay_dataset.jsonl，供离线回放压测。"),
     ("策略", "strategy_mode", "strategy_choice", "策略周期", "超短线抓5-10分钟脉冲；短线需5m+15m profile 同向或20分钟延伸；中线看1H/15m/4H结构。会切换本地主路径与 final_direction。"),
     ("策略", "risk_preference", "risk_choice", "确认严格度", "保守：更高动量阈值与确认分(88)；标准：默认；激进：更低阈值(65)且短线可凭短窗压力给方向。变更后可在下方推送说明中一键填入建议分数。"),
     ("AI与推送", "ai_enabled", "checkbox", "启用AI分析", "L2/L3 触发后调用 AI 做主决策。"),
     ("AI与推送", "push_enabled", "checkbox", "启用微信推送", "final_decision 过门槛后通过 Server酱 推送。"),
-    ("AI与推送", "push_score", "number", "交易推送门槛(trade)", "direction 为做多/做空且 confidence ≥ 此值时可推 trade。建议见下方「推送分数建议」。"),
+    ("AI与推送", "push_score", "number", "做多推送门槛(trade)", "direction 为做多且 confidence ≥ 此值时可推 trade。建议见下方「推送分数建议」。"),
+    ("AI与推送", "short_push_score", "number", "做空推送门槛(trade)", "direction 为做空且 confidence ≥ 此值时可推 trade；通常略低于做多门槛。"),
     ("AI与推送", "watch_push_score", "number", "观察推送门槛(watch)", "观望或风险提示类 watch 推送。建议见下方「推送分数建议」。"),
     ("AI与推送", "spike_push_score", "number", "异动推送门槛(spike)", "超短线急速异动 L3 / spike 推送。建议见下方「推送分数建议」。"),
 ]
@@ -151,8 +228,12 @@ ENV_FIELDS = [
 def default_config() -> Dict[str, Any]:
     return {
         "inst_ids": ["BTC-USDT-SWAP", "ETH-USDT-SWAP"],
+        "custom_inst_ids": [],
+        "removed_inst_ids": [],
         "interval": 5,
-        "analysis_log_enabled": False,
+        "log_max_mb": DEFAULT_LOG_MAX_BYTES // (1024 * 1024),
+        "log_total_max_mb": DEFAULT_LOG_TOTAL_MAX_BYTES // (1024 * 1024),
+        "analysis_log_enabled": True,
         "record_replay_enabled": False,
         "strategy_mode": "short",
         "risk_preference": "standard",
@@ -169,6 +250,7 @@ def default_config() -> Dict[str, Any]:
         "dry_run_ai": False,
         "push_enabled": False,
         "push_score": 75,
+        "short_push_score": 70,
         "watch_push_score": 65,
         "spike_push_score": 62,
         "volume_multiplier": 2.0,
@@ -180,6 +262,7 @@ def default_config() -> Dict[str, Any]:
         "retry_backoff": 1.5,
         "push_cooldown_seconds": 900,
         "log_max_bytes": DEFAULT_LOG_MAX_BYTES,
+        "log_total_max_bytes": DEFAULT_LOG_TOTAL_MAX_BYTES,
     }
 
 
@@ -217,7 +300,7 @@ def load_json(path: Path, default: Any) -> Any:
 
 
 def visible_config_keys() -> set:
-    keys = {"inst_ids"}
+    keys = {"inst_ids", "custom_inst_ids", "removed_inst_ids"}
     for _, key, _, _, _ in CONFIG_FIELDS:
         keys.add(key)
     return keys
@@ -234,9 +317,9 @@ def push_score_guide_text(risk_preference: str, ai_enabled: bool = False) -> str
     label = RISK_PREFERENCE_LABELS.get(risk, risk)
     ai_note = "已启用 AI：trade 建议可贴近下表。" if ai_enabled else "未启用 AI：建议 trade 取偏保守一档（如标准 75→78~80）。"
     return (
-        f"当前严格度「{label}」建议 trade {suggested['push_score']} · "
+        f"当前严格度「{label}」建议 做多 {suggested['push_score']} · 做空 {suggested['short_push_score']} · "
         f"watch {suggested['watch_push_score']} · spike {suggested['spike_push_score']}。"
-        f"{ai_note} watch/spike 应低于 trade，避免噪音推送。"
+        f"{ai_note} watch/spike 应低于 trade，做空可略低于做多。"
     )
 
 
@@ -248,6 +331,195 @@ def derive_ai_output_style(config: Dict[str, Any]) -> str:
     if mode == "swing":
         return "trend"
     return "steady"
+
+
+def normalize_log_size_config(merged: Dict[str, Any], loaded: Dict[str, Any]) -> None:
+    default_single_mb = DEFAULT_LOG_MAX_BYTES // (1024 * 1024)
+    default_total_mb = DEFAULT_LOG_TOTAL_MAX_BYTES // (1024 * 1024)
+    if "log_max_mb" in loaded:
+        single_mb = int(loaded["log_max_mb"])
+    elif "log_max_bytes" in loaded:
+        single_mb = max(1, int(loaded["log_max_bytes"]) // (1024 * 1024))
+    else:
+        single_mb = default_single_mb
+    if "log_total_max_mb" in loaded:
+        total_mb = int(loaded["log_total_max_mb"])
+    elif "log_total_max_bytes" in loaded:
+        total_mb = max(1, int(loaded["log_total_max_bytes"]) // (1024 * 1024))
+    else:
+        total_mb = default_total_mb
+    single_mb = max(50, min(4096, single_mb))
+    total_mb = max(single_mb, min(16384, total_mb))
+    merged["log_max_mb"] = single_mb
+    merged["log_total_max_mb"] = total_mb
+    merged["log_max_bytes"] = single_mb * 1024 * 1024
+    merged["log_total_max_bytes"] = total_mb * 1024 * 1024
+    merged["analysis_log_enabled"] = True
+
+
+def normalize_inst_id(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def parse_inst_id_tokens(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        chunks = [str(item) for item in raw]
+    else:
+        chunks = re.split(r"[\s,;，；]+", str(raw))
+    seen = set()
+    ordered: List[str] = []
+    for chunk in chunks:
+        inst_id = normalize_inst_id(chunk)
+        if not inst_id or inst_id in seen:
+            continue
+        seen.add(inst_id)
+        ordered.append(inst_id)
+    return ordered
+
+
+def is_valid_inst_id_format(inst_id: str) -> bool:
+    return bool(INST_ID_PATTERN.match(normalize_inst_id(inst_id)))
+
+
+def order_configured_inst_ids(inst_ids: Any) -> List[str]:
+    normalized = parse_inst_id_tokens(inst_ids)
+    if not normalized:
+        return []
+    selected = set(normalized)
+    ordered = [inst for inst in PRESET_INSTRUMENTS if inst in selected]
+    for inst_id in normalized:
+        if inst_id not in ordered:
+            ordered.append(inst_id)
+    return ordered
+
+
+def okx_swap_instrument_exists(inst_id: str) -> bool:
+    inst_id = normalize_inst_id(inst_id)
+    if not is_valid_inst_id_format(inst_id):
+        return False
+    cached = _INST_VALIDATION_CACHE.get(inst_id)
+    now = time.time()
+    if cached and now - cached[0] < INST_VALIDATION_CACHE_TTL:
+        return cached[1]
+    query = urllib.parse.urlencode({"instType": "SWAP", "instId": inst_id})
+    request = urllib.request.Request(
+        f"{OKX_BASE_URL}/api/v5/public/instruments?{query}",
+        headers={"Accept": "application/json", "User-Agent": "okx-ai-assistant-web/1.0"},
+    )
+    exists = False
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+        if str(payload.get("code")) == "0":
+            rows = payload.get("data") or []
+            exists = any(str(row.get("instId", "")).upper() == inst_id for row in rows if isinstance(row, dict))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, TypeError, ValueError):
+        exists = False
+    _INST_VALIDATION_CACHE[inst_id] = (now, exists)
+    return exists
+
+
+def validate_inst_ids(inst_ids: Any) -> Tuple[List[str], List[str]]:
+    ordered = order_configured_inst_ids(inst_ids)
+    valid: List[str] = []
+    errors: List[str] = []
+    for inst_id in ordered:
+        if not is_valid_inst_id_format(inst_id):
+            errors.append(f"{inst_id}：格式无效，应为类似 SOL-USDT-SWAP 的 OKX 永续合约 ID。")
+            continue
+        if not okx_swap_instrument_exists(inst_id):
+            errors.append(f"{inst_id}：OKX 未找到该永续合约，请检查拼写或是否已下线。")
+            continue
+        valid.append(inst_id)
+    return valid, errors
+
+
+def format_inst_id_errors(errors: List[str]) -> str:
+    if not errors:
+        return ""
+    if len(errors) == 1:
+        return errors[0]
+    return "以下合约无效：\n" + "\n".join(f"- {item}" for item in errors)
+
+
+def parse_custom_inst_ids_from_form(form: Dict[str, Any]) -> List[str]:
+    raw = form.get("custom_inst_ids", [])
+    if isinstance(raw, str):
+        raw = [raw]
+    custom = order_configured_inst_ids(raw)
+    return [inst for inst in custom if inst not in PRESET_INSTRUMENTS]
+
+
+def parse_inst_ids_from_form(form: Dict[str, Any]) -> List[str]:
+    checked = form.get("inst_ids", [])
+    if isinstance(checked, str):
+        checked = [checked]
+    return order_configured_inst_ids(checked)
+
+
+def resolve_configured_inst_ids(form: Dict[str, Any]) -> List[str]:
+    candidate = parse_inst_ids_from_form(form)
+    if not candidate:
+        raise ValueError("至少选择一个监控币种。")
+    valid, errors = validate_inst_ids(candidate)
+    if errors:
+        raise ValueError(format_inst_id_errors(errors))
+    return valid
+
+
+def resolve_custom_inst_ids(form: Dict[str, Any]) -> List[str]:
+    candidate = parse_custom_inst_ids_from_form(form)
+    if not candidate:
+        return []
+    valid, errors = validate_inst_ids(candidate)
+    if errors:
+        raise ValueError(format_inst_id_errors(errors))
+    return valid
+
+
+def validate_single_inst_id(inst_id: str, *, known_inst_ids: Optional[List[str]] = None) -> str:
+    inst_id = normalize_inst_id(inst_id)
+    if not inst_id:
+        raise ValueError("请输入合约 ID，例如 SOL-USDT-SWAP。")
+    known = set(known_inst_ids or [])
+    if inst_id in known:
+        raise ValueError(f"{inst_id} 已在列表中，直接勾选即可。")
+    if inst_id in PRESET_INSTRUMENTS:
+        return inst_id
+    valid, errors = validate_inst_ids([inst_id])
+    if errors:
+        raise ValueError(errors[0])
+    return valid[0]
+
+
+def visible_inst_pool(config: Dict[str, Any]) -> List[str]:
+    removed = set(order_configured_inst_ids(config.get("removed_inst_ids", [])))
+    presets = [inst for inst in PRESET_INSTRUMENTS if inst not in removed]
+    custom = order_configured_inst_ids(config.get("custom_inst_ids", []))
+    custom = [inst for inst in custom if inst not in PRESET_INSTRUMENTS]
+    pool: List[str] = []
+    seen = set()
+    for inst in [*presets, *custom]:
+        if inst in seen:
+            continue
+        seen.add(inst)
+        pool.append(inst)
+    return pool
+
+
+def inst_tile_html(inst_id: str, *, checked: bool) -> str:
+    checked_attr = " checked" if checked else ""
+    is_preset = inst_id in PRESET_INSTRUMENTS
+    preset_flag = "1" if is_preset else "0"
+    hidden = "" if is_preset else f'<input type="hidden" name="custom_inst_ids" value="{esc(inst_id)}">'
+    return (
+        f'<div class="check-tile check-tile-custom" data-inst="{esc(inst_id)}" data-preset="{preset_flag}">'
+        f'<label><input type="checkbox" name="inst_ids" value="{esc(inst_id)}"{checked_attr}><span>{esc(inst_id)}</span></label>'
+        f'<button class="inst-remove-btn" type="button" data-remove-inst="{esc(inst_id)}" aria-label="删除 {esc(inst_id)}">删除</button>'
+        f"{hidden}</div>"
+    )
 
 
 def normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -270,10 +542,25 @@ def normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         merged["spike_push_score"] = suggested["spike_push_score"]
     if "push_score" not in loaded:
         merged["push_score"] = suggested["push_score"]
+    if "short_push_score" not in loaded:
+        merged["short_push_score"] = suggested.get("short_push_score", suggested["push_score"])
     merged["push_score"] = max(0, min(100, int(merged.get("push_score", suggested["push_score"]))))
+    merged["short_push_score"] = max(0, min(100, int(merged.get("short_push_score", suggested.get("short_push_score", merged["push_score"])))))
     merged["watch_push_score"] = max(0, min(100, int(merged.get("watch_push_score", suggested["watch_push_score"]))))
     merged["spike_push_score"] = max(0, min(100, int(merged.get("spike_push_score", suggested["spike_push_score"]))))
     merged["allow_scalp_trade"] = merged.get("strategy_mode") == "scalp" or bool(merged.get("allow_scalp_trade"))
+    normalize_log_size_config(merged, loaded)
+    inst_ids = order_configured_inst_ids(merged.get("inst_ids", [])) or list(PRESET_INSTRUMENTS)
+    custom = order_configured_inst_ids(merged.get("custom_inst_ids", []))
+    custom = [inst for inst in custom if inst not in PRESET_INSTRUMENTS]
+    for inst in inst_ids:
+        if inst not in PRESET_INSTRUMENTS and inst not in custom:
+            custom.append(inst)
+    removed = order_configured_inst_ids(merged.get("removed_inst_ids", []))
+    removed = [inst for inst in removed if inst in PRESET_INSTRUMENTS]
+    merged["inst_ids"] = inst_ids
+    merged["custom_inst_ids"] = custom
+    merged["removed_inst_ids"] = removed
     return strip_legacy_config_keys(merged)
 
 
@@ -291,14 +578,326 @@ def load_config() -> Dict[str, Any]:
 
 
 def configured_instruments() -> List[str]:
-    inst_ids = load_config().get("inst_ids", [])
-    if isinstance(inst_ids, str):
-        inst_ids = [inst_ids]
-    return [inst for inst in inst_ids if inst in SUPPORTED_INSTRUMENTS]
+    return order_configured_inst_ids(load_config().get("inst_ids", []))
 
 
 def analysis_log_enabled() -> bool:
-    return bool(load_config().get("analysis_log_enabled", False))
+    return True
+
+
+def log_size_limits() -> Tuple[int, int]:
+    config = load_config()
+    single = int(config.get("log_max_bytes", DEFAULT_LOG_MAX_BYTES))
+    total = int(config.get("log_total_max_bytes", DEFAULT_LOG_TOTAL_MAX_BYTES))
+    return max(single, MIN_LOG_MAX_BYTES), max(total, single)
+
+
+def realtime_log_tail_bytes() -> int:
+    _, total_limit = log_size_limits()
+    return min(max(REALTIME_LOG_TAIL_BYTES, MIN_LOG_MAX_BYTES), total_limit)
+
+
+def accuracy_log_tail_bytes() -> int:
+    _, total_limit = log_size_limits()
+    return min(max(ACCURACY_LOG_TAIL_BYTES, MIN_LOG_MAX_BYTES), total_limit)
+
+
+def console_log_backup_path(active_path: Path, index: int) -> Path:
+    return active_path.with_name(f"{active_path.name}.{index}")
+
+
+def list_console_log_segments(active_path: Path) -> List[Path]:
+    backups: List[Path] = []
+    index = 1
+    while True:
+        backup = console_log_backup_path(active_path, index)
+        if backup.exists():
+            backups.append(backup)
+            index += 1
+        else:
+            break
+    backups.reverse()
+    if active_path.exists():
+        return backups + [active_path]
+    return backups
+
+
+def console_log_total_bytes(active_path: Path) -> int:
+    total = 0
+    for path in list_console_log_segments(active_path):
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _shift_console_log_backups(active_path: Path) -> None:
+    index = 1
+    while console_log_backup_path(active_path, index).exists():
+        index += 1
+    for slot in range(index - 1, 0, -1):
+        src = console_log_backup_path(active_path, slot)
+        dst = console_log_backup_path(active_path, slot + 1)
+        if dst.exists():
+            dst.unlink()
+        src.replace(dst)
+
+
+def rotate_console_log_if_needed(
+    active_path: Path,
+    max_bytes: int = CONSOLE_LOG_MAX_BYTES,
+    total_max_bytes: int = CONSOLE_LOG_TOTAL_MAX_BYTES,
+) -> None:
+    max_bytes = max(int(max_bytes), 1024 * 1024)
+    total_max_bytes = max(int(total_max_bytes), max_bytes)
+    try:
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        if active_path.exists() and active_path.stat().st_size >= max_bytes:
+            backup1 = console_log_backup_path(active_path, 1)
+            if backup1.exists():
+                _shift_console_log_backups(active_path)
+            active_path.replace(backup1)
+        while console_log_total_bytes(active_path) > total_max_bytes:
+            segments = list_console_log_segments(active_path)
+            if not segments:
+                return
+            oldest = segments[0]
+            if len(segments) == 1 and oldest.resolve() == active_path.resolve():
+                return
+            oldest.unlink()
+    except OSError:
+        pass
+
+
+def log_file_cache_token(path: Path) -> str:
+    try:
+        if not path.exists():
+            return "0:0"
+        stat = path.stat()
+        return f"{stat.st_mtime_ns}:{stat.st_size}"
+    except OSError:
+        return "0:0"
+
+
+def cached_api_response(cache_key: str, loader) -> Dict[str, Any]:
+    now = time.time()
+    cached = _API_RESPONSE_CACHE.get(cache_key)
+    if cached and now - cached[0] < API_RESPONSE_CACHE_TTL_SECONDS:
+        return cached[1]
+    payload = loader()
+    _API_RESPONSE_CACHE[cache_key] = (now, payload)
+    if len(_API_RESPONSE_CACHE) > 256:
+        stale_before = now - API_RESPONSE_CACHE_TTL_SECONDS * 4
+        for key, (saved_at, _) in list(_API_RESPONSE_CACHE.items()):
+            if saved_at < stale_before:
+                _API_RESPONSE_CACHE.pop(key, None)
+    return payload
+
+
+def session_expires_at(now: float = None) -> float:
+    return (now or time.time()) + SESSION_TTL_SECONDS
+
+
+def prune_expired_sessions(now: float = None) -> None:
+    now = now or time.time()
+    for token, expires in list(SESSIONS.items()):
+        created = SESSION_CREATED.get(token, 0.0)
+        if expires <= now or (created and now - created > SESSION_ABSOLUTE_TTL_SECONDS):
+            revoke_session(token)
+    prune_inst_validation_cache(now)
+
+
+def register_session(token: str) -> None:
+    prune_expired_sessions()
+    now = time.time()
+    SESSIONS[token] = session_expires_at(now)
+    SESSION_CREATED[token] = now
+
+
+def is_valid_session(token: Optional[str], *, refresh: bool = True) -> bool:
+    if not token:
+        return False
+    prune_expired_sessions()
+    expires = SESSIONS.get(token)
+    created = SESSION_CREATED.get(token, 0.0)
+    if expires is None or expires <= time.time():
+        revoke_session(token)
+        return False
+    if created and time.time() - created > SESSION_ABSOLUTE_TTL_SECONDS:
+        revoke_session(token)
+        return False
+    if refresh:
+        SESSIONS[token] = session_expires_at()
+    return True
+
+
+def revoke_session(token: Optional[str]) -> None:
+    if token:
+        SESSIONS.pop(token, None)
+        SESSION_CREATED.pop(token, None)
+
+
+def prune_inst_validation_cache(now: float = None) -> None:
+    now = now or time.time()
+    stale = [
+        inst_id
+        for inst_id, (saved_at, _) in _INST_VALIDATION_CACHE.items()
+        if now - saved_at >= INST_VALIDATION_CACHE_TTL
+    ]
+    for inst_id in stale:
+        _INST_VALIDATION_CACHE.pop(inst_id, None)
+
+
+def write_child_pid(path: Path, pid: int) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(int(pid)), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def clear_child_pid(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def read_child_pid(path: Path) -> Optional[int]:
+    try:
+        if not path.exists():
+            return None
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            output = (result.stdout or "").strip()
+            return str(pid) in output and "No tasks are running" not in output
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def terminate_pid(pid: int, *, fast: bool = False) -> None:
+    if not process_alive(pid):
+        return
+    if os.name == "nt":
+        args = ["taskkill", "/PID", str(pid), "/T"]
+        if fast:
+            args.append("/F")
+        try:
+            subprocess.run(args, capture_output=True, timeout=8, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    if fast:
+        time.sleep(0.5)
+        if process_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def cleanup_stale_child_processes() -> None:
+    """Remove pid files for dead child processes. Alive processes are left running (7x24 headless)."""
+    for pid_file in (MONITOR_PID_FILE, REPLAY_PID_FILE):
+        pid = read_child_pid(pid_file)
+        if pid is None:
+            continue
+        if process_alive(pid):
+            continue
+        clear_child_pid(pid_file)
+
+
+def maybe_send_monitor_crash_alert(message: str) -> None:
+    if not WEB_MONITOR_CRASH_ALERT:
+        return
+    send_key = build_child_env().get("WECHAT_SEND_KEY", "").strip()
+    if not send_key:
+        return
+    title = "[OKX AI助手] 监控进程异常退出"
+    try:
+        post_json(
+            f"https://sctapi.ftqq.com/{send_key}.send",
+            {"title": title, "desp": message},
+        )
+    except Exception:
+        pass
+
+
+def can_auto_restart_monitor() -> bool:
+    if not WEB_MONITOR_AUTO_RESTART:
+        return False
+    if WEB_MONITOR_MAX_AUTO_RESTARTS <= 0:
+        return False
+    now = time.time()
+    window_start = now - WEB_MONITOR_AUTO_RESTART_WINDOW_SECONDS
+    recent = [stamp for stamp in _MONITOR_AUTO_RESTART_AT if stamp >= window_start]
+    _MONITOR_AUTO_RESTART_AT[:] = recent
+    return len(recent) < WEB_MONITOR_MAX_AUTO_RESTARTS
+
+
+def handle_monitor_unexpected_exit(exit_code: int) -> bool:
+    global MONITOR_PROCESS, MONITOR_LAST_EXIT_UNEXPECTED
+    MONITOR_LAST_EXIT_UNEXPECTED = True
+    message = (
+        f"监控进程意外退出\n"
+        f"退出码: {exit_code}\n"
+        f"启动时间: {MONITOR_STARTED_AT or '-'}\n"
+        f"停止时间: {MONITOR_STOPPED_AT or '-'}\n"
+        f"日志: {MONITOR_PROCESS_LOG_FILE}"
+    )
+    try:
+        with MONITOR_PROCESS_LOG_FILE.open("a", encoding="utf-8") as log_file:
+            log_file.write(f"\n===== signal monitor crashed at {MONITOR_STOPPED_AT} exit_code={exit_code} =====\n")
+    except OSError:
+        pass
+    maybe_send_monitor_crash_alert(message)
+    MONITOR_PROCESS = None
+    clear_child_pid(MONITOR_PID_FILE)
+    if can_auto_restart_monitor():
+        _MONITOR_AUTO_RESTART_AT.append(time.time())
+        restarted = start_monitor()
+        try:
+            with MONITOR_PROCESS_LOG_FILE.open("a", encoding="utf-8") as log_file:
+                log_file.write(f"===== auto restart result: {restarted} =====\n")
+        except OSError:
+            pass
+        return True
+    return False
+
+
+def log_size_summary_text(config: Dict[str, Any] = None) -> str:
+    cfg = normalize_config(config or load_config())
+    segments = len(list_analysis_log_segments(MONITOR_JSON_LOG_FILE))
+    used_mb = analysis_log_total_bytes(MONITOR_JSON_LOG_FILE) / (1024 * 1024)
+    return (
+        f"单文件 {cfg.get('log_max_mb', 500)}MB · 总容量 {cfg.get('log_total_max_mb', 1500)}MB"
+        f" · 当前约 {used_mb:.0f}MB / {segments} 卷"
+    )
 
 
 def save_config(config: Dict[str, Any]) -> Path:
@@ -318,26 +917,218 @@ def save_config(config: Dict[str, Any]) -> Path:
         return USER_CONFIG_FILE
 
 
+def ensure_portable_auth_seed() -> None:
+    if PORTABLE_AUTH_FILE.exists():
+        return
+    if not DEFAULT_AUTH_FILE.exists():
+        return
+    try:
+        PORTABLE_AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PORTABLE_AUTH_FILE.write_text(DEFAULT_AUTH_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def load_auth() -> Dict[str, str]:
     migrate_legacy_build_state()
-    for path in (PORTABLE_AUTH_FILE, USER_AUTH_FILE, DEFAULT_AUTH_FILE):
+    ensure_portable_auth_seed()
+    defaults = {"username": "admin", "password": "admin123"}
+    for path in (PORTABLE_AUTH_FILE, DEFAULT_AUTH_FILE, USER_AUTH_FILE):
         if path.exists():
-            return load_json(path, {"username": "admin", "password": "admin123"})
-    save_auth("admin", "admin123")
-    return {"username": "admin", "password": "admin123"}
+            data = load_json(path, defaults)
+            if isinstance(data, dict):
+                return {
+                    "username": str(data.get("username") or defaults["username"]).strip() or defaults["username"],
+                    "password": str(data.get("password") or defaults["password"]),
+                }
+    return dict(defaults)
 
 
 def save_auth(username: str, password: str) -> Path:
-    data = {"username": username.strip() or "admin", "password": password.strip() or "admin123"}
+    data = {
+        "username": username.strip() or "admin",
+        "password": password if password is not None else "admin123",
+    }
+    if not str(data["password"]):
+        raise ValueError("密码不能为空")
     text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    saved_paths: List[Path] = []
+    for path in (PORTABLE_AUTH_FILE, USER_AUTH_FILE):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            saved_paths.append(path)
+        except OSError:
+            continue
+    if not saved_paths:
+        raise PermissionError("无法写入登录配置文件，请检查 local_state 目录权限。")
+    return saved_paths[0]
+
+
+def update_auth_from_form(form: Dict[str, Any]) -> Tuple[str, Path]:
+    auth = load_auth()
+    current_password = str(form.get("auth_current_password", "")).strip()
+    if not current_password:
+        raise ValueError("请先输入当前密码以确认身份。")
+    if current_password != auth.get("password"):
+        raise ValueError("当前密码不正确。")
+    username = str(form.get("auth_username", auth.get("username", "admin"))).strip() or "admin"
+    raw_new_password = str(form.get("auth_password", "")).strip()
+    password = auth.get("password", "admin123") if not raw_new_password else raw_new_password
+    if not str(password):
+        raise ValueError("新密码不能为空。")
+    saved_path = save_auth(username, password)
+    service_note = stop_all_background_services()
+    return (
+        f"登录账号已更新。{service_note} 请使用新凭据重新登录。",
+        saved_path,
+    )
+
+
+def stop_all_background_services(*, fast: bool = False) -> str:
+    notes = [stop_replay(fast=fast), stop_monitor(fast=fast)]
+    return " ".join(note for note in notes if note)
+
+
+WEB_RESTART_DELAY_SECONDS = 2.5
+WEB_SKIP_BROWSER_ENV = "OKX_WEB_SKIP_BROWSER"
+TRAY_LAUNCH_ENV = "OKX_LAUNCHED_BY_TRAY"
+EXIT_CODE_TRAY_SHUTDOWN = 100
+EXIT_CODE_TRAY_RESTART = 101
+
+
+def launched_by_tray() -> bool:
+    return os.getenv(TRAY_LAUNCH_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def should_auto_open_browser() -> bool:
+    return os.getenv(WEB_SKIP_BROWSER_ENV, "").strip().lower() not in ("1", "true", "yes")
+
+
+def stash_restart_sessions() -> None:
+    if not SESSIONS:
+        return
     try:
-        PORTABLE_AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
-        PORTABLE_AUTH_FILE.write_text(text, encoding="utf-8")
-        return PORTABLE_AUTH_FILE
-    except PermissionError:
-        USER_STATE_DIR.mkdir(parents=True, exist_ok=True)
-        USER_AUTH_FILE.write_text(text, encoding="utf-8")
-        return USER_AUTH_FILE
+        PORTABLE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        WEB_RESTART_SESSIONS_FILE.write_text(
+            json.dumps(sorted(SESSIONS.keys()), ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def restore_restart_sessions() -> None:
+    try:
+        if not WEB_RESTART_SESSIONS_FILE.exists():
+            return
+        payload = json.loads(WEB_RESTART_SESSIONS_FILE.read_text(encoding="utf-8"))
+        if isinstance(payload, list):
+            for token in payload:
+                if isinstance(token, str) and token:
+                    register_session(token)
+                    SESSION_CREATED[token] = time.time()
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    finally:
+        try:
+            WEB_RESTART_SESSIONS_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _spawn_in_new_console(command: str, *, cwd: Path) -> None:
+    subprocess.Popen(
+        command,
+        shell=True,
+        cwd=str(cwd),
+        close_fds=True,
+    )
+
+
+def spawn_web_control_panel_restart() -> None:
+    script = SCRIPT_DIR / "web_control_panel.py"
+    python_exe = sys.executable
+    start_bat = SCRIPT_DIR / "start_web_control_panel_windows.bat"
+    wait_ticks = max(3, int(WEB_RESTART_DELAY_SECONDS) + 2)
+
+    if os.name == "nt":
+        if start_bat.exists():
+            inner = (
+                f'set {WEB_SKIP_BROWSER_ENV}=1&& '
+                f'ping 127.0.0.1 -n {wait_ticks} >nul&& '
+                f'"{start_bat}"'
+            )
+            _spawn_in_new_console(
+                f'start "OKX AI Web" /D "{SCRIPT_DIR}" cmd /c "{inner}"',
+                cwd=SCRIPT_DIR,
+            )
+            return
+        inner = (
+            f'set {WEB_SKIP_BROWSER_ENV}=1&& '
+            f'ping 127.0.0.1 -n {wait_ticks} >nul&& '
+            f'"{python_exe}" "{script}"'
+        )
+        _spawn_in_new_console(
+            f'start "OKX AI Web" /D "{SCRIPT_DIR}" cmd /c "{inner}"',
+            cwd=SCRIPT_DIR,
+        )
+        return
+    env = os.environ.copy()
+    env[WEB_SKIP_BROWSER_ENV] = "1"
+    subprocess.Popen(
+        [python_exe, str(script)],
+        cwd=str(SCRIPT_DIR),
+        env=env,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
+def _power_action_worker(*, restart: bool) -> None:
+    global WEB_POWER_SHUTDOWN, WEB_POWER_RESTART
+    if restart:
+        WEB_POWER_RESTART = True
+        if not launched_by_tray():
+            try:
+                spawn_web_control_panel_restart()
+            except Exception:
+                pass
+        stash_restart_sessions()
+    else:
+        WEB_POWER_SHUTDOWN = True
+    time.sleep(0.4)
+    try:
+        stop_all_background_services(fast=True)
+    except Exception:
+        pass
+    server = WEB_SERVER
+    if server is not None:
+        server.shutdown()
+    elif not restart:
+        os._exit(0)
+
+
+def request_power_restart() -> Dict[str, Any]:
+    threading.Thread(target=_power_action_worker, kwargs={"restart": True}, daemon=True).start()
+    return {
+        "ok": True,
+        "action": "restart",
+        "message": "正在停止服务并重启 Web 控制台…",
+    }
+
+
+def request_power_shutdown() -> Dict[str, Any]:
+    threading.Thread(target=_power_action_worker, kwargs={"restart": False}, daemon=True).start()
+    return {
+        "ok": True,
+        "action": "shutdown",
+        "message": "正在停止服务并关闭 Web 控制台…",
+    }
+
+
+def clear_session_token(token: Optional[str]) -> None:
+    revoke_session(token)
 
 
 def load_env() -> Dict[str, str]:
@@ -391,15 +1182,19 @@ def parse_bool(form: Dict[str, Any], key: str) -> bool:
     return key in form
 
 
+def parse_removed_inst_ids_from_form(form: Dict[str, Any]) -> List[str]:
+    raw = form.get("removed_inst_ids", [])
+    if isinstance(raw, str):
+        raw = [raw]
+    return [inst for inst in order_configured_inst_ids(raw) if inst in PRESET_INSTRUMENTS]
+
+
 def update_from_form(form: Dict[str, Any]) -> Path:
     config = load_config()
     env = load_env()
-    inst_ids = form.get("inst_ids", [])
-    if isinstance(inst_ids, str):
-        inst_ids = [inst_ids]
-    config["inst_ids"] = [item for item in inst_ids if item in SUPPORTED_INSTRUMENTS]
-    if not config["inst_ids"]:
-        raise ValueError("至少选择一个监控币种")
+    config["inst_ids"] = resolve_configured_inst_ids(form)
+    config["custom_inst_ids"] = resolve_custom_inst_ids(form)
+    config["removed_inst_ids"] = parse_removed_inst_ids_from_form(form)
 
     for _, key, kind, _, _ in CONFIG_FIELDS:
         if kind == "checkbox":
@@ -461,6 +1256,8 @@ def build_monitor_args(config: Dict[str, Any]) -> List[str]:
         FIXED_OKX_FLAG,
         "--push-score",
         str(config.get("push_score", 80)),
+        "--short-push-score",
+        str(config.get("short_push_score", config.get("push_score", 80))),
         "--retry-times",
         str(config.get("retry_times", 3)),
         "--retry-backoff",
@@ -469,6 +1266,8 @@ def build_monitor_args(config: Dict[str, Any]) -> List[str]:
         str(config.get("push_cooldown_seconds", 900)),
         "--log-max-bytes",
         str(config.get("log_max_bytes", DEFAULT_LOG_MAX_BYTES)),
+        "--log-total-max-bytes",
+        str(config.get("log_total_max_bytes", DEFAULT_LOG_TOTAL_MAX_BYTES)),
         "--volume-multiplier",
         str(config.get("volume_multiplier", 2.0)),
         "--oi-change-pct-15m",
@@ -511,7 +1310,7 @@ def build_monitor_args(config: Dict[str, Any]) -> List[str]:
         args.append("--push")
     if config.get("record_replay_enabled"):
         args.extend(["--record-replay", "--record-replay-file", str(REPLAY_DATASET_FILE)])
-    args.append("--analysis-log" if config.get("analysis_log_enabled") else "--no-analysis-log")
+    args.append("--analysis-log")
     return args
 
 
@@ -568,6 +1367,7 @@ def start_replay(replay_interval: float = 0.5, dataset_path: Path = None) -> str
     REPLAY_LOG_START_AT = REPLAY_STARTED_AT
     REPLAY_STOPPED_AT = ""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    rotate_console_log_if_needed(REPLAY_PROCESS_LOG_FILE)
     if REPLAY_ANALYSIS_LOG_FILE.exists():
         REPLAY_ANALYSIS_LOG_FILE.unlink()
     _LOG_LINE_COUNT_CACHE.pop(str(REPLAY_ANALYSIS_LOG_FILE), None)
@@ -586,27 +1386,34 @@ def start_replay(replay_interval: float = 0.5, dataset_path: Path = None) -> str
         text=True,
         bufsize=1,
     )
+    log_file.close()
+    write_child_pid(REPLAY_PID_FILE, REPLAY_PROCESS.pid)
     return f"回放已启动，PID={REPLAY_PROCESS.pid}，数据集 {stats.get('frame_count')} 帧"
 
 
-def stop_replay() -> str:
-    global REPLAY_PROCESS, REPLAY_STOPPED_AT
+def stop_replay(*, fast: bool = False) -> str:
+    global REPLAY_PROCESS, REPLAY_STOPPED_AT, REPLAY_STOP_REQUESTED
     status = replay_status()
     if not status["running"]:
         return "回放未运行。"
+    REPLAY_STOP_REQUESTED = True
+    wait_timeout = 1.5 if fast else 8
+    kill_wait = 1.0 if fast else 5
     REPLAY_PROCESS.terminate()
     try:
-        REPLAY_PROCESS.wait(timeout=8)
+        REPLAY_PROCESS.wait(timeout=wait_timeout)
     except subprocess.TimeoutExpired:
         REPLAY_PROCESS.kill()
-        REPLAY_PROCESS.wait(timeout=5)
+        REPLAY_PROCESS.wait(timeout=kill_wait)
     REPLAY_STOPPED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
     REPLAY_PROCESS = None
+    clear_child_pid(REPLAY_PID_FILE)
     try:
         with REPLAY_PROCESS_LOG_FILE.open("a", encoding="utf-8") as log_file:
             log_file.write(f"\n===== replay stopped at {REPLAY_STOPPED_AT} =====\n")
     except OSError:
         pass
+    REPLAY_STOP_REQUESTED = False
     return "回放已停止。"
 
 
@@ -674,9 +1481,19 @@ def replay_dataset_info(*, lite: bool = False) -> Dict[str, Any]:
     }
 
 
+def monitor_status_text(running: bool, pid: Optional[int] = None, ai_total_tokens: int = 0) -> str:
+    if running and pid:
+        return f"运行中 PID={pid} · Token {ai_total_tokens:,}"
+    if ai_total_tokens > 0:
+        return f"已停止 · 本次 Token {ai_total_tokens:,}"
+    return "未启动"
+
+
 def monitor_status() -> Dict[str, Any]:
     global MONITOR_PROCESS, MONITOR_STOPPED_AT
     elapsed_seconds = 0
+    token_stats = load_ai_token_stats(AI_TOKEN_STATS_FILE)
+    ai_total_tokens = int(token_stats.get("total_tokens", 0))
     if MONITOR_STARTED_AT:
         try:
             start_time = datetime.strptime(MONITOR_STARTED_AT, "%Y-%m-%d %H:%M:%S")
@@ -685,28 +1502,62 @@ def monitor_status() -> Dict[str, Any]:
         except Exception:
             elapsed_seconds = 0
     if MONITOR_PROCESS is None:
-        return {"running": False, "text": "未启动", "started_at": "", "elapsed_seconds": 0, "analysis_log_enabled": analysis_log_enabled()}
+        return {
+            "running": False,
+            "text": monitor_status_text(False, ai_total_tokens=ai_total_tokens),
+            "started_at": MONITOR_STARTED_AT,
+            "stopped_at": MONITOR_STOPPED_AT,
+            "elapsed_seconds": elapsed_seconds if MONITOR_STOPPED_AT else 0,
+            "pid": None,
+            "ai_total_tokens": ai_total_tokens,
+            "analysis_log_enabled": analysis_log_enabled(),
+            "unexpected_exit": MONITOR_LAST_EXIT_UNEXPECTED,
+        }
     code = MONITOR_PROCESS.poll()
     if code is None:
+        rotate_console_log_if_needed(MONITOR_PROCESS_LOG_FILE)
+        pid = MONITOR_PROCESS.pid
         return {
             "running": True,
-            "text": f"运行中 PID={MONITOR_PROCESS.pid}",
+            "text": monitor_status_text(True, pid=pid, ai_total_tokens=ai_total_tokens),
             "started_at": MONITOR_STARTED_AT,
+            "stopped_at": "",
             "elapsed_seconds": elapsed_seconds,
+            "pid": pid,
+            "ai_total_tokens": ai_total_tokens,
             "analysis_log_enabled": analysis_log_enabled(),
+            "unexpected_exit": False,
         }
     if not MONITOR_STOPPED_AT:
         MONITOR_STOPPED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
+        restarted = False
+        if not MONITOR_STOP_REQUESTED:
+            restarted = handle_monitor_unexpected_exit(code)
+        if not restarted:
+            MONITOR_PROCESS = None
+            clear_child_pid(MONITOR_PID_FILE)
         return monitor_status()
-    return {"running": False, "text": f"已停止，退出码={code}", "started_at": MONITOR_STARTED_AT, "elapsed_seconds": elapsed_seconds, "analysis_log_enabled": analysis_log_enabled()}
+    MONITOR_PROCESS = None
+    clear_child_pid(MONITOR_PID_FILE)
+    return {
+        "running": False,
+        "text": f"已停止，退出码={code} · Token {ai_total_tokens:,}",
+        "started_at": MONITOR_STARTED_AT,
+        "stopped_at": MONITOR_STOPPED_AT,
+        "elapsed_seconds": elapsed_seconds,
+        "pid": None,
+        "ai_total_tokens": ai_total_tokens,
+        "analysis_log_enabled": analysis_log_enabled(),
+        "unexpected_exit": MONITOR_LAST_EXIT_UNEXPECTED,
+    }
 
 
 def analysis_log_disabled_message() -> str:
-    return "分析日志写入已关闭。请在配置页或本页打开「写入分析日志」开关，保存后重新启动监控才会输出。"
+    return "分析日志未就绪。请启动监控并确认配置页日志容量设置，保存后重新启动监控。"
 
 
 def start_monitor() -> str:
-    global MONITOR_PROCESS, MONITOR_STARTED_AT, MONITOR_LOG_START_AT, MONITOR_STOPPED_AT
+    global MONITOR_PROCESS, MONITOR_STARTED_AT, MONITOR_LOG_START_AT, MONITOR_STOPPED_AT, MONITOR_STOP_REQUESTED, MONITOR_LAST_EXIT_UNEXPECTED
     if replay_status()["running"]:
         return "请先停止离线回放，再启动正式监控。"
     status = monitor_status()
@@ -714,10 +1565,14 @@ def start_monitor() -> str:
         return status["text"]
     if not configured_instruments():
         return "请先在配置页至少选择一个监控币种。"
+    MONITOR_STOP_REQUESTED = False
+    MONITOR_LAST_EXIT_UNEXPECTED = False
     MONITOR_STARTED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
     MONITOR_LOG_START_AT = MONITOR_STARTED_AT
     MONITOR_STOPPED_AT = ""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    rotate_console_log_if_needed(MONITOR_PROCESS_LOG_FILE)
+    reset_ai_token_stats(AI_TOKEN_STATS_FILE, started_at=MONITOR_STARTED_AT)
     config = load_config()
     if config.get("record_replay_enabled") and REPLAY_DATASET_FILE.exists():
         REPLAY_DATASET_FILE.unlink()
@@ -734,26 +1589,35 @@ def start_monitor() -> str:
         bufsize=1,
         creationflags=0,
     )
-    return f"监控已启动，PID={MONITOR_PROCESS.pid}"
+    log_file.close()
+    write_child_pid(MONITOR_PID_FILE, MONITOR_PROCESS.pid)
+    return f"监控已启动，PID={MONITOR_PROCESS.pid} · Token 0"
 
 
-def stop_monitor() -> str:
-    global MONITOR_PROCESS, MONITOR_STOPPED_AT
+def stop_monitor(*, fast: bool = False) -> str:
+    global MONITOR_PROCESS, MONITOR_STOPPED_AT, MONITOR_STOP_REQUESTED, MONITOR_LAST_EXIT_UNEXPECTED
     status = monitor_status()
     if not status["running"]:
         return "监控未运行。"
+    MONITOR_STOP_REQUESTED = True
+    MONITOR_LAST_EXIT_UNEXPECTED = False
+    wait_timeout = 1.5 if fast else 8
+    kill_wait = 1.0 if fast else 5
     MONITOR_PROCESS.terminate()
     try:
-        MONITOR_PROCESS.wait(timeout=8)
+        MONITOR_PROCESS.wait(timeout=wait_timeout)
     except subprocess.TimeoutExpired:
         MONITOR_PROCESS.kill()
-        MONITOR_PROCESS.wait(timeout=5)
+        MONITOR_PROCESS.wait(timeout=kill_wait)
     MONITOR_STOPPED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
+    MONITOR_PROCESS = None
+    clear_child_pid(MONITOR_PID_FILE)
     try:
         with MONITOR_PROCESS_LOG_FILE.open("a", encoding="utf-8") as log_file:
             log_file.write(f"\n===== signal monitor stopped at {MONITOR_STOPPED_AT} =====\n")
     except OSError:
         pass
+    MONITOR_STOP_REQUESTED = False
     return "监控已停止。"
 
 
@@ -773,9 +1637,34 @@ def get_quick_ticker(inst_id: str) -> Dict[str, Any]:
     return payload
 
 
+def normalize_monitor_bar(bar: Any) -> str:
+    text = str(bar or "1m").strip()
+    aliases = {"1h": "1H", "4h": "4H"}
+    normalized = aliases.get(text.lower(), text)
+    if normalized not in MONITOR_BAR_CHANNELS:
+        raise ValueError(f"不支持的 K 线周期：{bar}，可选 {', '.join(MONITOR_BAR_CHANNELS)}")
+    return normalized
+
+
+def candle_fetch_limit(bar: str) -> int:
+    return {"1m": 120, "3m": 120, "5m": 120, "15m": 96, "1H": 96, "4H": 72}.get(bar, 120)
+
+
+def metrics_overlay_window_seconds(bar: str) -> int:
+    return {"1m": 180, "3m": 540, "5m": 900, "15m": 1800, "1H": 7200, "4H": 28800}.get(bar, 180)
+
+
 def get_history_candle_points(inst_id: str, bar: str = "1m", limit: int = 120) -> List[Dict[str, Any]]:
-    if inst_id not in SUPPORTED_INSTRUMENTS:
-        inst_id = "BTC-USDT-SWAP"
+    inst_id = normalize_inst_id(inst_id)
+    if inst_id not in configured_instruments():
+        return []
+    bar = normalize_monitor_bar(bar)
+    limit = max(10, min(300, int(limit or candle_fetch_limit(bar))))
+    cache_key = f"{inst_id}:{bar}:{limit}"
+    now = time.time()
+    cached = _CANDLE_CACHE.get(cache_key)
+    if cached and now - cached[0] < WEB_CANDLE_CACHE_TTL_SECONDS:
+        return cached[1]
     query = urllib.parse.urlencode({"instId": inst_id, "bar": bar, "limit": str(limit)})
     request = urllib.request.Request(
         f"{OKX_BASE_URL}/api/v5/market/candles?{query}",
@@ -794,6 +1683,7 @@ def get_history_candle_points(inst_id: str, bar: str = "1m", limit: int = 120) -
                 "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(row[0]) / 1000)),
                 "price": close,
                 "kind": "history",
+                "bar": bar,
                 "open": float(row[1]),
                 "high": float(row[2]),
                 "low": float(row[3]),
@@ -803,6 +1693,12 @@ def get_history_candle_points(inst_id: str, bar: str = "1m", limit: int = 120) -
             })
         except (TypeError, ValueError):
             continue
+    _CANDLE_CACHE[cache_key] = (now, points)
+    if len(_CANDLE_CACHE) > 128:
+        stale_before = now - WEB_CANDLE_CACHE_TTL_SECONDS * 4
+        for key, (saved_at, _) in list(_CANDLE_CACHE.items()):
+            if saved_at < stale_before:
+                _CANDLE_CACHE.pop(key, None)
     return points
 
 
@@ -893,8 +1789,10 @@ def effective_fields_from_log_item(item: Dict[str, Any]) -> Dict[str, Any]:
         return score
 
     direction = final_decision.get("direction", score.get("direction", "观望"))
-    confidence = final_decision.get("confidence", score.get("raw_total_score", 0))
-    final_trade_score = confidence if direction in ("做多", "做空") else 0
+    confidence = final_decision.get("confidence")
+    if confidence is None:
+        confidence = score.get("final_trade_score", 0) if direction in ("做多", "做空") else score.get("raw_total_score", 0)
+    local_final_trade_score = score.get("final_trade_score", 0)
     raw_total_score = score.get("raw_total_score", confidence)
     entry_plan = score.get("entry_plan") if isinstance(score.get("entry_plan"), dict) else {}
     merged = dict(score)
@@ -902,17 +1800,24 @@ def effective_fields_from_log_item(item: Dict[str, Any]) -> Dict[str, Any]:
         {
             "direction": direction,
             "final_direction": direction,
+            "confidence": max(0, min(100, int(confidence or 0))),
             "raw_total_score": raw_total_score,
-            "final_trade_score": final_trade_score,
-            "total_score": confidence if direction in ("做多", "做空") else raw_total_score,
+            "local_final_trade_score": local_final_trade_score,
+            "final_trade_score": max(0, min(100, int(confidence or 0))) if direction in ("做多", "做空") else 0,
+            "total_score": max(0, min(100, int(confidence or 0))) if direction in ("做多", "做空") else raw_total_score,
             "entry": final_decision.get("entry", score.get("entry")),
             "stop_loss": final_decision.get("stop_loss", score.get("stop_loss")),
             "take_profit": final_decision.get("take_profit", score.get("take_profit")),
             "risk_level": final_decision.get("risk_level", score.get("risk_level")),
+            "push_recommendation": final_decision.get("push_recommendation", score.get("trade_action_level", "none")),
             "trade_action_level": final_decision.get("push_recommendation", score.get("trade_action_level")),
             "decision_source": final_decision.get("decision_source"),
             "ai_called": final_decision.get("ai_called"),
             "trigger_level": final_decision.get("trigger_level"),
+            "local_hint_direction": final_decision.get("local_hint_direction", score.get("raw_direction")),
+            "market_regime": final_decision.get("market_regime", score.get("market_regime")),
+            "strategy_label": final_decision.get("strategy_label", score.get("strategy_label")),
+            "summary": final_decision.get("summary", ""),
         }
     )
     if not entry_plan:
@@ -931,6 +1836,8 @@ def point_from_log_item(item: Dict[str, Any], price: float) -> Dict[str, Any]:
     dynamic = item.get("dynamic_thresholds") if isinstance(item.get("dynamic_thresholds"), dict) else {}
     profiles = item.get("trend_profiles") if isinstance(item.get("trend_profiles"), dict) else {}
     data_quality = profiles.get("15m", {}).get("data_quality", {}) if isinstance(profiles.get("15m"), dict) else {}
+    profile_15m = profiles.get("15m", {}) if isinstance(profiles.get("15m"), dict) else {}
+    trends = score.get("trends") if isinstance(score.get("trends"), dict) else {}
     entry_plan = score.get("entry_plan") if isinstance(score.get("entry_plan"), dict) else {}
     layer_scores = score.get("layer_scores") if isinstance(score.get("layer_scores"), dict) else {}
     tracking = item.get("signal_tracking") if isinstance(item.get("signal_tracking"), dict) else {}
@@ -965,6 +1872,16 @@ def point_from_log_item(item: Dict[str, Any], price: float) -> Dict[str, Any]:
         "direction": final_direction,
         "raw_direction": score.get("raw_direction", final_direction),
         "final_direction": final_direction,
+        "confidence": score.get("confidence"),
+        "push_recommendation": score.get("push_recommendation"),
+        "local_final_trade_score": score.get("local_final_trade_score", final_trade_score),
+        "local_hint_direction": score.get("local_hint_direction"),
+        "decision_source": score.get("decision_source"),
+        "trigger_level": score.get("trigger_level"),
+        "summary": score.get("summary"),
+        "trend_profile_15m": profile_15m.get("trend"),
+        "trend_simple_15m": trends.get("15m"),
+        "strategy_label": score.get("strategy_label"),
         "risk_control_score": score.get("risk_control_score"),
         "entry_quality_score": score.get("entry_quality_score"),
         "entry_quality": entry_plan.get("quality"),
@@ -1023,20 +1940,330 @@ def parse_serverchan_response(raw: str) -> Tuple[bool, str]:
     return True, str(detail)[:160]
 
 
-def test_ai_connection() -> Dict[str, Any]:
+def extract_chat_completion_text(response: Any) -> str:
+    choices = getattr(response, "choices", None) or []
+    if choices:
+        message = getattr(choices[0], "message", None)
+        content = getattr(message, "content", None) if message else None
+        if content:
+            return str(content).strip()
+    output_text = getattr(response, "output_text", None)
+    if output_text:
+        return str(output_text).strip()
+    return str(response).strip()
+
+
+def call_ai_chat(user_message: str, history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
     env = build_child_env()
     api_key = env.get("OPENAI_API_KEY", "")
     base_url = env.get("AI_BASE_URL", ENV_DEFAULTS["AI_BASE_URL"]).strip()
     model = env.get("AI_MODEL", ENV_DEFAULTS["AI_MODEL"])
+    message = str(user_message or "").strip()
     if not api_key:
-        return {"ok": False, "message": "AI测试失败：AI API Key 未配置。请先在配置页填写并保存。"}
+        return {"ok": False, "error": "AI API Key 未配置。请先在配置页填写并保存。"}
+    if not message:
+        return {"ok": False, "error": "请输入消息内容。"}
+    if len(message) > 8000:
+        return {"ok": False, "error": "消息过长，请控制在 8000 字以内。"}
+
+    messages: List[Dict[str, str]] = []
+    for item in (history or [])[-20:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).strip()
+        content = str(item.get("content", "")).strip()
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": message})
+
     try:
         from openai import OpenAI
-        client = OpenAI(api_key=api_key, base_url=base_url)
-        response = client.responses.create(model=model, input="请回复：AI接口连通性测试成功。")
-        return {"ok": True, "message": f"AI测试成功：{getattr(response, 'output_text', response)}"}
+
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=120, max_retries=0)
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0.7,
+            max_tokens=2048,
+        )
+        reply = extract_chat_completion_text(response)
+        usage_obj = getattr(response, "usage", None)
+        usage = None
+        if usage_obj is not None:
+            usage = {
+                "prompt_tokens": getattr(usage_obj, "prompt_tokens", None),
+                "completion_tokens": getattr(usage_obj, "completion_tokens", None),
+                "total_tokens": getattr(usage_obj, "total_tokens", None),
+            }
+        return {"ok": True, "reply": reply, "model": model, "usage": usage}
     except Exception as exc:
-        return {"ok": False, "message": f"AI测试失败：{exc}"}
+        return {"ok": False, "error": str(exc)}
+
+
+def test_ai_connection() -> Dict[str, Any]:
+    result = call_ai_chat("请只回复：AI接口连通性测试成功。")
+    if result.get("ok"):
+        return {"ok": True, "message": f"AI测试成功：{result.get('reply', '')}"}
+    return {"ok": False, "message": f"AI测试失败：{result.get('error', '未知错误')}"}
+
+
+def redact_secrets_mapping(data: Dict[str, Any]) -> Dict[str, Any]:
+    redacted: Dict[str, Any] = {}
+    for key, value in data.items():
+        if key in SECRET_ENV_KEYS and str(value or "").strip():
+            redacted[key] = "***REDACTED***"
+        else:
+            redacted[key] = value
+    return redacted
+
+
+def export_file_bytes(path: Path, *, max_bytes: int, prefer_tail: bool = True) -> Tuple[Optional[bytes], Dict[str, Any]]:
+    meta: Dict[str, Any] = {"path": str(path), "included": False, "bytes": 0, "truncated": False}
+    if not path.exists() or not path.is_file():
+        meta["note"] = "file missing"
+        return None, meta
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        meta["note"] = f"stat failed: {exc}"
+        return None, meta
+    meta["size_bytes"] = size
+    if size <= max_bytes:
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            meta["note"] = f"read failed: {exc}"
+            return None, meta
+        meta["included"] = True
+        meta["bytes"] = len(content)
+        return content, meta
+    if prefer_tail:
+        text = tail_text(path, max_bytes)
+        content = text.encode("utf-8")
+        meta["included"] = True
+        meta["truncated"] = True
+        meta["bytes"] = len(content)
+        meta["note"] = f"tail only (max {max_bytes} bytes)"
+        return content, meta
+    meta["note"] = f"skipped (>{max_bytes} bytes)"
+    return None, meta
+
+
+def build_accuracy_export_bundle(
+    inst_id: str,
+    scope: str,
+    horizon_seconds: int,
+    *,
+    retention_hours: float = 12.0,
+    interval_seconds: Optional[int] = None,
+) -> Dict[str, Any]:
+    config = normalize_config(load_config())
+    interval = max(1, int(interval_seconds or config.get("interval", 5)))
+    retention = max(0.5, min(168.0, float(retention_hours or 12)))
+    horizon = max(5, min(3600, int(horizon_seconds or 900)))
+    try:
+        report = accuracy_report(
+            inst_id,
+            horizon_seconds=horizon,
+            scope=scope,
+            retention_hours=retention,
+            interval_seconds=interval,
+        )
+        return {
+            "name": "OKX_Accuracy_Chart",
+            "version": "1.0",
+            "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "inst_id": inst_id,
+            "horizon_seconds": horizon,
+            "scope": scope,
+            "retention_hours": retention,
+            "interval_seconds": interval,
+            "max_points": report.get("max_points"),
+            "start_at": report.get("start_at", ""),
+            "time_start": report.get("time_start", ""),
+            "time_end": report.get("time_end", ""),
+            "summary": report.get("summary") or {},
+            "points": report.get("points") or [],
+            "chart_points": report.get("chart_points"),
+            "replay_pending": report.get("replay_pending"),
+            "hint": report.get("hint"),
+        }
+    except Exception as exc:
+        return {
+            "name": "OKX_Accuracy_Chart",
+            "version": "1.0",
+            "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "inst_id": inst_id,
+            "horizon_seconds": horizon,
+            "scope": scope,
+            "error": str(exc),
+            "points": [],
+            "summary": {},
+        }
+
+
+def diagnostic_readme_text(manifest: Dict[str, Any]) -> str:
+    lines = [
+        "OKX AI Assistant 诊断包",
+        "=" * 40,
+        f"导出时间: {manifest.get('exported_at', '')}",
+        f"应用版本: {manifest.get('app_version', '')}",
+        "",
+        "目录说明:",
+        "- README.txt / manifest.json — 本说明与文件清单",
+        "- config/bundle.json — 配置与环境变量（API Key / SendKey 已打码）",
+        "- status/ — 监控、回放、Token 统计",
+        "- logs/ — JSON 分析、控制台、回放、信号表现等日志",
+        "- accuracy/ — 实时/回放压测图表数据（JSON，可导入测试页「导入图表」）",
+        "- client/ — 浏览器侧附加（AI 对话、当前压测 UI 快照，如有）",
+        "",
+        "注意:",
+        "- 超大文件仅包含尾部片段，详见 manifest.json 中 truncated 标记",
+        "- 请勿将未打码的密钥分享给他人",
+        "",
+        "文件清单:",
+    ]
+    for item in manifest.get("files", []):
+        flag = ""
+        if item.get("truncated"):
+            flag = " [tail]"
+        elif item.get("note"):
+            flag = f" [{item['note']}]"
+        lines.append(f"- {item.get('name')} ({item.get('bytes', 0)} bytes){flag}")
+    return "\n".join(lines) + "\n"
+
+
+def create_diagnostic_zip(extras: Optional[Dict[str, Any]] = None) -> Tuple[bytes, str, Dict[str, Any]]:
+    extras = extras or {}
+    config = normalize_config(load_config())
+    insts = configured_instruments()
+    interval = max(1, int(config.get("interval", 5)))
+    retention = 12.0
+    files_meta: List[Dict[str, Any]] = []
+    total_added = 0
+    buf = io.BytesIO()
+
+    def budget_left() -> int:
+        return max(0, DIAG_EXPORT_MAX_ZIP_BYTES - total_added)
+
+    def add_bytes(name: str, data: bytes, meta: Optional[Dict[str, Any]] = None) -> bool:
+        nonlocal total_added
+        if not data:
+            return False
+        if len(data) > budget_left():
+            files_meta.append({"name": name, "included": False, "bytes": 0, "note": "zip budget exceeded", **(meta or {})})
+            return False
+        zf.writestr(name, data)
+        total_added += len(data)
+        files_meta.append({"name": name, "included": True, "bytes": len(data), **(meta or {})})
+        return True
+
+    def add_json(name: str, payload: Any, meta: Optional[Dict[str, Any]] = None) -> bool:
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        return add_bytes(name, text.encode("utf-8"), meta)
+
+    def add_path(name: str, path: Path, *, max_bytes: int, prefer_tail: bool = True) -> None:
+        content, meta = export_file_bytes(path, max_bytes=max_bytes, prefer_tail=prefer_tail)
+        meta["archive_name"] = name
+        if content is not None:
+            add_bytes(name, content, meta)
+        else:
+            files_meta.append({"name": name, **meta})
+
+    exported_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"okx_diagnostic_{stamp}.zip"
+
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        config_bundle = export_config_bundle()
+        add_json(
+            "config/bundle.json",
+            {
+                "name": "OKX_AI_Diagnostic",
+                "version": "1.0",
+                "exported_at": exported_at,
+                "config": config_bundle.get("config", {}),
+                "env": redact_secrets_mapping(config_bundle.get("env", {})),
+            },
+        )
+        add_json("status/monitor.json", monitor_status())
+        add_json("status/replay.json", replay_dataset_info(lite=False))
+        add_json("status/tokens.json", load_ai_token_stats(AI_TOKEN_STATS_FILE))
+        add_json(
+            "status/runtime.json",
+            {
+                "app_version": APP_VERSION,
+                "log_dir": str(LOG_DIR),
+                "monitor_log_start_at": MONITOR_LOG_START_AT,
+                "monitor_started_at": MONITOR_STARTED_AT,
+                "monitor_stopped_at": MONITOR_STOPPED_AT,
+                "replay_started_at": REPLAY_STARTED_AT,
+                "replay_stopped_at": REPLAY_STOPPED_AT,
+                "log_size_summary": log_size_summary_text(config),
+            },
+        )
+
+        for seg in list_analysis_log_segments(MONITOR_JSON_LOG_FILE):
+            arc_name = f"logs/{seg.name}"
+            add_path(arc_name, seg, max_bytes=DIAG_EXPORT_MAX_FILE_BYTES, prefer_tail=True)
+        for path in (
+            MONITOR_PROCESS_LOG_FILE,
+            REPLAY_PROCESS_LOG_FILE,
+            REPLAY_ANALYSIS_LOG_FILE,
+            LOG_DIR / "signal_performance.jsonl",
+            PAPER_ACCOUNT_FILE,
+        ):
+            add_path(f"logs/{path.name}", path, max_bytes=DIAG_EXPORT_MAX_FILE_BYTES, prefer_tail=True)
+        add_path(
+            f"logs/{REPLAY_DATASET_FILE.name}",
+            REPLAY_DATASET_FILE,
+            max_bytes=DIAG_EXPORT_REPLAY_DATASET_TAIL_BYTES,
+            prefer_tail=True,
+        )
+
+        for inst in insts:
+            for horizon in DIAG_EXPORT_ACCURACY_HORIZONS:
+                bundle = build_accuracy_export_bundle(
+                    inst,
+                    "session",
+                    horizon,
+                    retention_hours=retention,
+                    interval_seconds=interval,
+                )
+                add_json(f"accuracy/session/{inst}_h{horizon}.json", bundle)
+        if replay_results_available():
+            for inst in insts:
+                for horizon in DIAG_EXPORT_ACCURACY_HORIZONS:
+                    bundle = build_accuracy_export_bundle(
+                        inst,
+                        "replay",
+                        horizon,
+                        retention_hours=retention,
+                        interval_seconds=interval,
+                    )
+                    add_json(f"accuracy/replay/{inst}_h{horizon}.json", bundle)
+
+        ai_chat = extras.get("ai_chat")
+        if isinstance(ai_chat, list) and ai_chat:
+            add_json("client/ai_chat.json", {"exported_at": exported_at, "messages": ai_chat})
+        accuracy_snapshot = extras.get("accuracy_snapshot")
+        if isinstance(accuracy_snapshot, dict) and accuracy_snapshot:
+            add_json("client/accuracy_ui_snapshot.json", accuracy_snapshot)
+
+        manifest = {
+            "name": "OKX_AI_Diagnostic",
+            "version": "1.0",
+            "exported_at": exported_at,
+            "app_version": APP_VERSION,
+            "zip_bytes": total_added,
+            "zip_budget_bytes": DIAG_EXPORT_MAX_ZIP_BYTES,
+            "inst_ids": insts,
+            "files": files_meta,
+        }
+        add_json("manifest.json", manifest)
+        add_bytes("README.txt", diagnostic_readme_text(manifest).encode("utf-8"))
+
+    return buf.getvalue(), filename, manifest
 
 
 def test_push_connection() -> Dict[str, Any]:
@@ -1095,26 +2322,28 @@ def iter_json_log_lines(path: Path, *, read_full: bool = False, max_tail_bytes: 
 
 
 def monitor_log_text() -> str:
-    if not analysis_log_enabled():
-        return analysis_log_disabled_message()
     if not MONITOR_LOG_START_AT:
         return "等待启动监控。本窗口只显示本次启动后的 JSON 分析日志，供图表与压测使用。"
+    tail_limit = realtime_log_tail_bytes()
     lines = []
-    for line in tail_text(MONITOR_JSON_LOG_FILE, DEFAULT_LOG_MAX_BYTES).splitlines():
+    for line in tail_analysis_log_text(MONITOR_JSON_LOG_FILE, tail_limit).splitlines():
         try:
             item = json.loads(line)
         except json.JSONDecodeError:
             continue
         if str(item.get("time", "")) >= MONITOR_LOG_START_AT:
             lines.append(line)
+    if len(lines) > LOG_DISPLAY_MAX_LINES:
+        lines = lines[-LOG_DISPLAY_MAX_LINES:]
+        header = f"... 仅显示最近 {LOG_DISPLAY_MAX_LINES} 行（共读取更多） ...\n"
+        return header + "\n".join(lines)
     return "\n".join(lines) or "暂无本次启动后的JSON分析日志。"
 
 
 def monitor_console_log_text() -> str:
-    if not analysis_log_enabled():
-        return analysis_log_disabled_message() + " 推送等关键事件仍可能写入进程控制台。"
     if not MONITOR_LOG_START_AT:
         return "等待启动监控。本窗口只显示本次启动后的控制台摘要，包含信号、推送与异常。"
+    rotate_console_log_if_needed(MONITOR_PROCESS_LOG_FILE)
     if not MONITOR_PROCESS_LOG_FILE.exists():
         return "暂无控制台日志文件。"
     marker = f"===== signal monitor started at {MONITOR_LOG_START_AT} ====="
@@ -1126,85 +2355,106 @@ def monitor_console_log_text() -> str:
     return text.strip() or "暂无本次启动后的控制台日志。"
 
 
-def read_monitor_points(inst_id: str, max_points: int = 20000) -> Dict[str, Any]:
-    realtime_points = []
-    log_chart_points = []
-    running = bool(monitor_status()["running"])
-    log_enabled = analysis_log_enabled()
-    if log_enabled:
-        for line in tail_text(MONITOR_JSON_LOG_FILE, DEFAULT_LOG_MAX_BYTES).splitlines():
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if item.get("inst_id") != inst_id:
-                continue
-            try:
-                price = float(item.get("price"))
-            except (TypeError, ValueError):
-                continue
-            if MONITOR_LOG_START_AT and str(item.get("time", "")) < MONITOR_LOG_START_AT:
-                continue
-            item_chart_points = chart_points_from_log_item(item)
-            if item_chart_points:
-                log_chart_points = item_chart_points
-            realtime_points.append(point_from_log_item(item, price))
-    realtime_points = realtime_points[-max_points:]
-    source = "signal-monitor-log"
-    points = realtime_points
-    web_chart_points = []
-    if running:
+def read_realtime_log_points(inst_id: str, max_points: int = 20000) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    realtime_points: List[Dict[str, Any]] = []
+    log_chart_points: List[Dict[str, Any]] = []
+    tail_limit = realtime_log_tail_bytes()
+    for line in tail_analysis_log_text(MONITOR_JSON_LOG_FILE, tail_limit).splitlines():
         try:
-            web_chart_points = get_history_candle_points(inst_id, "1m", 120)
-        except Exception:
-            web_chart_points = []
-    chart_points = web_chart_points or log_chart_points
-    if chart_points:
-        points = merge_price_points(chart_points, [], max_points)
-        latest_by_minute = {minute_bucket_key(point.get("time", "")): point for point in realtime_points}
-        for index, point in enumerate(points):
-            metrics = latest_by_minute.get(minute_bucket_key(point.get("time", "")))
-            if metrics:
-                enriched = {**metrics, **point}
-                enriched["price"] = point["price"]
-                enriched["kind"] = "history"
-                points[index] = enriched
-        if points and realtime_points and points[-1].get("raw_total_score") is None:
-            # Web画图会优先使用OKX最新1m K线；日志分析可能晚几秒或落在上一分钟。
-            # 如果两者时间相差不超过3分钟，只把“指标字段”贴到最新K线上展示，
-            # 价格、时间、K线高低点仍保留图表数据，避免用户看到最新快照指标突然全空。
-            latest_metrics = realtime_points[-1]
-            if seconds_between_time_text(points[-1].get("time"), latest_metrics.get("time")) <= 180:
-                points[-1] = {**latest_metrics, **points[-1], "price": points[-1]["price"], "kind": "history"}
-        source = "web-chart" if web_chart_points else "signal-monitor-chart"
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if item.get("inst_id") != inst_id:
+            continue
+        try:
+            price = float(item.get("price"))
+        except (TypeError, ValueError):
+            continue
+        if MONITOR_LOG_START_AT and str(item.get("time", "")) < MONITOR_LOG_START_AT:
+            continue
+        item_chart_points = chart_points_from_log_item(item)
+        if item_chart_points:
+            log_chart_points = item_chart_points
+        realtime_points.append(point_from_log_item(item, price))
+    return realtime_points[-max_points:], log_chart_points
+
+
+def read_monitor_candles(inst_id: str, bar: str = "1m", max_points: int = 200) -> Dict[str, Any]:
+    bar = normalize_monitor_bar(bar)
+    inst_id = normalize_inst_id(inst_id)
+    running = bool(monitor_status()["running"])
+    realtime_points, log_chart_points = read_realtime_log_points(inst_id)
+    latest_metrics = realtime_points[-1] if realtime_points else None
+    points: List[Dict[str, Any]] = []
+    source = "okx-candles"
+    try:
+        points = get_history_candle_points(inst_id, bar, candle_fetch_limit(bar))
+    except Exception:
+        points = []
+    if not points and bar == "1m" and log_chart_points:
+        points = log_chart_points
+        source = "signal-monitor-chart"
+    if points and latest_metrics and running:
+        if points[-1].get("raw_total_score") is None:
+            window = metrics_overlay_window_seconds(bar)
+            if seconds_between_time_text(points[-1].get("time"), latest_metrics.get("time")) <= window:
+                last = points[-1]
+                points[-1] = {
+                    **latest_metrics,
+                    **last,
+                    "price": last.get("close", last.get("price")),
+                    "kind": "history",
+                    "bar": bar,
+                }
+    if not points:
+        return {
+            "ok": True,
+            "inst_id": inst_id,
+            "bar": bar,
+            "running": running,
+            "points": [],
+            "price": 0,
+            "change": 0,
+            "change_pct": 0,
+            "source": source,
+            "latest_snapshot": latest_metrics,
+            "paper_account": read_paper_account(inst_id) if running else {},
+        }
     if len(points) == 1:
-        points.append({"time": points[0]["time"], "price": points[0]["price"]})
-    first = points[0]["price"] if points else 0
-    last = points[-1]["price"] if points else 0
-    change = last - first if points else 0
+        dup = dict(points[0])
+        points.append(dup)
+    first_close = float(points[0].get("close", points[0].get("price", 0)))
+    last_close = float(points[-1].get("close", points[-1].get("price", 0)))
+    change = last_close - first_close
     paper_account = read_paper_account(inst_id)
-    if not paper_account and realtime_points:
-        latest = realtime_points[-1]
-        if latest.get("paper_equity") is not None:
+    if not paper_account and latest_metrics:
+        if latest_metrics.get("paper_equity") is not None:
             paper_account = {
-                "equity": latest.get("paper_equity"),
-                "pnl_usd": latest.get("paper_pnl_usd"),
-                "pnl_pct": latest.get("paper_pnl_pct"),
-                "position_label": latest.get("paper_position"),
-                "trade_count": latest.get("paper_trade_count"),
-                "initial_capital": latest.get("paper_initial_capital"),
-                "direction": latest.get("final_direction"),
+                "equity": latest_metrics.get("paper_equity"),
+                "pnl_usd": latest_metrics.get("paper_pnl_usd"),
+                "pnl_pct": latest_metrics.get("paper_pnl_pct"),
+                "position_label": latest_metrics.get("paper_position"),
+                "trade_count": latest_metrics.get("paper_trade_count"),
+                "initial_capital": latest_metrics.get("paper_initial_capital"),
+                "direction": latest_metrics.get("final_direction"),
             }
     return {
+        "ok": True,
         "inst_id": inst_id,
+        "bar": bar,
         "running": running,
-        "points": points,
-        "price": last,
+        "points": points[-max(2, max_points) :],
+        "price": last_close,
         "change": change,
-        "change_pct": (change / first * 100) if first else 0,
+        "change_pct": (change / first_close * 100) if first_close else 0,
         "source": source,
+        "latest_snapshot": latest_metrics,
         "paper_account": paper_account,
     }
+
+
+def read_monitor_points(inst_id: str, max_points: int = 20000) -> Dict[str, Any]:
+    return read_monitor_candles(inst_id, "1m", max_points=min(max_points, 200))
 
 
 def parse_history_time(value: str) -> datetime:
@@ -1267,14 +2517,21 @@ def read_accuracy_items(
     retention_hours: float = None,
 ) -> Tuple[List[Dict[str, Any]], List[Tuple[datetime, float]]]:
     log_path = log_file or MONITOR_JSON_LOG_FILE
-    try:
-        log_size = log_path.stat().st_size if log_path.exists() else 0
-    except OSError:
-        log_size = 0
-    read_full = log_path.resolve() == REPLAY_ANALYSIS_LOG_FILE.resolve() or log_size <= DEFAULT_LOG_MAX_BYTES
+    tail_limit = accuracy_log_tail_bytes()
+    if log_path.resolve() == REPLAY_ANALYSIS_LOG_FILE.resolve():
+        try:
+            log_size = log_path.stat().st_size if log_path.exists() else 0
+        except OSError:
+            log_size = 0
+        read_full = log_size <= tail_limit
+        line_iter = iter_json_log_lines(log_path, read_full=read_full, max_tail_bytes=tail_limit)
+    else:
+        total_bytes = analysis_log_total_bytes(log_path)
+        read_full = total_bytes <= tail_limit
+        line_iter = iter_analysis_log_lines(log_path, read_full=read_full, max_tail_bytes=tail_limit)
     items = []
     price_by_time: Dict[str, Tuple[datetime, float]] = {}
-    for line in iter_json_log_lines(log_path, read_full=read_full):
+    for line in line_iter:
         try:
             item = json.loads(line)
             if item.get("inst_id") != inst_id:
@@ -1755,8 +3012,8 @@ def accuracy_report(
     retention_hours: float = 12.0,
     interval_seconds: int = 5,
 ) -> Dict[str, Any]:
-    if inst_id not in SUPPORTED_INSTRUMENTS:
-        raise ValueError("仅支持 BTC-USDT-SWAP 或 ETH-USDT-SWAP")
+    if inst_id not in configured_instruments():
+        raise ValueError(f"{inst_id} 未在配置中启用，不能统计压测。")
     horizon_seconds = max(5, min(3600, int(horizon_seconds or 5)))
     interval_seconds = max(1, int(interval_seconds or 5))
     retention_hours = max(0.5, min(168.0, float(retention_hours or 12)))
@@ -2109,8 +3366,12 @@ def masked_input_html(name: str, value: Any, masked: bool = True) -> str:
     return f'<input type="text" name="{safe_name}" value="{safe_value}">'
 
 
-def render_login(message: str = "") -> bytes:
-    notice = f'<div class="notice">{esc(message)}</div>' if message else ""
+def render_login(message: str = "", success: bool = False) -> bytes:
+    if message:
+        notice_class = "notice notice-success" if success else "notice"
+        notice = f'<div class="{notice_class}">{esc(message)}</div>'
+    else:
+        notice = ""
     body = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OKX AI Assistant Login</title>
@@ -2124,7 +3385,7 @@ def render_login(message: str = "") -> bytes:
 h1{{margin:0 0 8px;font-size:28px}} p{{margin:0 0 24px;color:#cbd5e1}} label{{display:block;margin:16px 0 8px;font-weight:750}}
 .password-wrap{{position:relative}} input{{width:100%;padding:13px 14px;border-radius:14px;border:1px solid rgba(148,163,184,.35);background:rgba(15,23,42,.78);color:#fff;font-size:15px;outline:none}} .password-wrap input{{padding-right:50px}} .eye-btn{{position:absolute;right:8px;top:50%;transform:translateY(-50%);width:36px;height:36px;margin:0;border:1px solid rgba(191,219,254,.42);border-radius:12px;background:rgba(30,41,59,.82);cursor:pointer;padding:0;box-shadow:0 4px 14px rgba(0,0,0,.24)}} .eye-btn::before{{content:"";position:absolute;left:8px;top:12px;width:18px;height:10px;border:2px solid #dbeafe;border-radius:18px 18px 12px 12px;transform:rotate(-6deg)}} .eye-btn::after{{content:"";position:absolute;left:15px;top:15px;width:6px;height:6px;border-radius:50%;background:#60a5fa;box-shadow:0 0 8px rgba(96,165,250,.75)}} .eye-btn.is-visible::before{{border-color:#38bdf8}} .eye-btn.is-visible::after{{left:9px;top:17px;width:20px;height:2px;border-radius:2px;background:#f8fafc;transform:rotate(-42deg);box-shadow:0 0 0 1px rgba(15,23,42,.45)}}
 button{{margin-top:22px;width:100%;border:0;border-radius:14px;padding:13px;background:linear-gradient(135deg,#60a5fa,#8b5cf6 58%,#14b8a6);color:white;font-weight:850;cursor:pointer}}
-.notice{{background:#fee2e2;color:#991b1b;border:1px solid #fecaca;padding:10px 12px;border-radius:12px;margin-bottom:14px}}
+.notice{{background:#fee2e2;color:#991b1b;border:1px solid #fecaca;padding:10px 12px;border-radius:12px;margin-bottom:14px}} .notice-success{{background:#ecfdf5;color:#065f46;border-color:#a7f3d0}}
 </style></head><body>
 <video class="earth-video" autoplay muted loop playsinline preload="auto"><source src="/web-assets/earth_rotation.webm" type="video/webm"></video>
 <div class="shade"></div><canvas id="login-bg"></canvas><div class="grid"></div>
@@ -2141,9 +3402,9 @@ addEventListener('resize',r);r();a();
     return body.encode("utf-8")
 
 
-def pipeline_design_html() -> str:
+def design_docs_html() -> str:
     return """
-	<div class="page-panel" data-page="design"><section class="card toolbar-card"><div><h2>流程设计</h2><p class="section-sub">本地触发 → AI 主决策 → final_decision 统一出口。与 okx_signal_monitor.py 中 <code>_process_inst</code> 实现一致。</p></div></section><div class="help-panel">
+	<div class="page-panel" data-page="design"><section class="card toolbar-card"><div><h2>设计</h2><p class="section-sub">技术文档：单轮处理流程、AI 熔断与异常告警、推送参数、JSON 字段、Web/托盘接口。监控实现见 <code>okx_signal_monitor.py</code> 的 <code>_process_inst</code>；Windows 托盘与电源行为见附录 D。</p></div><div class="toolbar-right"><a class="button btn-view" href="#help">返回操作手册</a></div></section><div class="help-panel doc-panel">
 	<section class="card help-card"><h2>架构原则</h2>
 	<table class="help-table"><thead><tr><th>层级</th><th>职责</th><th>写入字段</th><th>是否决定推送</th></tr></thead><tbody>
 	<tr><td>本地检测 + 评分</td><td>便宜预筛、方向/价位参考、AI 触发判定</td><td><code>signals</code>、<code>score</code>、<code>local_trigger</code></td><td>否（仅 L1 可走 local 的 watch）</td></tr>
@@ -2162,11 +3423,12 @@ def pipeline_design_html() -> str:
 	<li><code>analyze_with_ai</code> — 仅 L2/L3 且满足间隔/指纹时执行</li>
 	<li><code>merge_final_decision</code> — AI 有效 JSON → AI 结论；否则 local / local_fallback</li>
 	<li><code>update_signal_tracking</code> — 基于 final_decision 登记/结算样本</li>
-	<li><code>push_gate(final_decision)</code> + <code>push_if_needed</code> — 微信推送</li>
+	<li><code>push_gate(final_decision)</code> + <code>push_if_needed</code> — 交易信号微信推送</li>
+	<li><code>_maybe_push_ai_abnormal_alert</code> — AI 长时间异常运维告警（独立于信号推送）</li>
 	<li><code>log_result</code> — 写入 JSONL</li>
 	</ol>
 	<h3>流程图</h3>
-	<div class="flow-chain"><span>采集</span><span>检测</span><span>本地评分</span><span>AI触发</span><span>AI(可选)</span><span>merge</span><span>跟踪</span><span>推送</span><span>JSONL</span></div>
+	<div class="flow-chain"><span>采集</span><span>检测</span><span>本地评分</span><span>AI触发</span><span>AI(可选)</span><span>merge</span><span>跟踪</span><span>推送</span><span>AI告警</span><span>JSONL</span></div>
 	<h3>AI 触发等级 evaluate_ai_trigger</h3>
 	<table class="help-table"><thead><tr><th>等级</th><th>典型条件</th><th>调 AI</th><th>推送预期</th></tr></thead><tbody>
 	<tr><td>L0</td><td>无信号</td><td>否</td><td>不推</td></tr>
@@ -2214,7 +3476,9 @@ def pipeline_design_html() -> str:
 	<li><code>_apply_selected_strategy_view</code> — <strong>仅当前 strategy_mode</strong> 且无 guard 时，用对应视图覆盖 <code>final_direction</code>、价位与展示分</li>
 	</ol>
 	<div class="flow-chain"><span>raw_direction</span><span>guard</span><span>降级</span><span>三视图</span><span>选中视图覆盖</span><span>final_direction</span></div>
-	<p>七层评分加权 → <code>raw_total_score</code>（0–100）；权重随 strategy_mode 的 <code>score_weights</code> 变化。推送与压测读 merge 后的 <code>final_decision</code>，本地 <code>score</code> 供对比与 fallback。</p>
+	<p>七层评分加权 → <code>raw_total_score</code>（0–100）；权重随 strategy_mode 的 <code>score_weights</code> 变化。有方向时 <code>final_trade_score</code> 来自当前 strategy_view；推送与 merge 后的 <code>final_decision.confidence</code> 为准，本地 <code>score</code> 供对比与 fallback。</p>
+	<h3>做空分数为何常慢于做多</h3>
+	<p>短线策略对做空常需 5m+15m 同向、20m 跌幅延伸等结构确认，<code>final_trade_score</code> 从 70+ 爬到 trade 门槛可能晚于方向已判空。这是确认链设计，不是推送 bug。若希望更早收到做空 trade 推送，可在配置页将 <code>short_push_score</code> 设为低于 <code>push_score</code>（建议差 4–6 分）。</p>
 	<h3>15m 趋势标签（短线/中线共用瓶颈）</h3>
 	<p>策略判断用的是 <code>trend_profiles["15m"].trend</code>（EMA9/20/60 排列 + 近 4 根 15m 斜率），<strong>不是</strong>简单数几根阳线。日志里 <code>score.trends["15m"]</code> 仅为 5 根首尾对比，可能与 profile 不一致；<strong>以 profile 为准</strong>。急涨时 15m 常长期为 <code>mixed</code>，故短线/中线都会滞后。</p>
 	<h3>多策略视图 strategy_views（三选一覆盖 final）</h3><div class="help-grid">
@@ -2248,7 +3512,25 @@ def pipeline_design_html() -> str:
 	<tr><td>AI 熔断 open</td><td>探活失败则 local_fallback</td></tr>
 	<tr><td>以上通过</td><td>chat completion → 解析 JSON</td></tr>
 	</tbody></table>
-	<p>校验：<code>_validate_ai_result</code>。JSON 无效或缺字段 → 保留原文但 merge 为 local_fallback。</p>
+	<p>校验：<code>_validate_ai_result</code>。JSON 无效或缺字段 → 保留原文但 merge 为 local_fallback。AI payload 的 <code>analysis_config.push_thresholds</code> 含 <code>trade_long</code> / <code>trade_short</code>，与配置页做多/做空门槛一致。</p>
+	<h3>AI 熔断（circuit breaker）</h3>
+	<p>连续失败达到 <code>AI_CIRCUIT_FAIL_THRESHOLD</code>（默认 3）后进入 <strong>open</strong> 状态，暂停调用 API，改走 local_fallback；冷却 <code>AI_CIRCUIT_COOLDOWN_SECONDS</code>（默认 120s）后进入 <strong>half_open</strong>，按 <code>AI_PROBE_INTERVAL_SECONDS</code>（默认 60s）发轻量 ping 探活。探活成功 → 关闭熔断；失败 → 重新 open。</p>
+	<table class="help-table"><thead><tr><th>状态</th><th>行为</th></tr></thead><tbody>
+	<tr><td><code>closed</code></td><td>正常调用 AI</td></tr>
+	<tr><td><code>open</code></td><td>跳过 chat，本地兜底；周期性探活</td></tr>
+	<tr><td><code>half_open</code></td><td>冷却结束，等待下一次探活窗口</td></tr>
+	</tbody></table>
+	<p>不可重试错误（如 401 鉴权失败）会立即拉满失败计数并开熔断。请求层另有 <code>RETRY_TIMES</code> / <code>AI_REQUEST_TIMEOUT</code> 控制单次 chat 重试。</p>
+	<h3>AI 长时间异常微信告警</h3>
+	<p>每轮 <code>run_once</code> 结束时调用 <code>_maybe_push_ai_abnormal_alert</code>。当 <code>ai_enabled=true</code> 且异常持续 ≥ <code>AI_ABNORMAL_ALERT_SECONDS</code>（默认 300s）时，经 Server酱 发送<strong>运维告警</strong>（标题含异常类型，正文含<strong>失败原因</strong>、持续时长、熔断状态、连续失败次数、模型与接口地址）。</p>
+	<table class="help-table"><thead><tr><th>异常类型</th><th>典型原因</th></tr></thead><tbody>
+	<tr><td><code>request_failed</code></td><td>chat 重试耗尽：超时、连接失败、429 等</td></tr>
+	<tr><td><code>circuit_open</code></td><td>熔断中，探活尚未恢复</td></tr>
+	<tr><td><code>probe_failed</code></td><td>半开探活 ping 失败</td></tr>
+	<tr><td><code>config_missing</code></td><td>未配置 AI_API_KEY / OPENAI_API_KEY</td></tr>
+	<tr><td><code>package_missing</code></td><td>未安装 openai 包</td></tr>
+	</tbody></table>
+	<p>告警与<strong>交易信号推送</strong>独立：不依赖 <code>push_enabled</code>，仅需 <code>WECHAT_SEND_KEY</code>。同类告警最短间隔 <code>AI_ABNORMAL_ALERT_COOLDOWN_SECONDS</code>（默认 3600s）。AI 恢复后自动清除异常状态；回放模式不发告警。</p>
 	</section>
 	<section class="card help-card"><h2>第六阶段：合并 merge_final_decision</h2>
 	<table class="help-table"><thead><tr><th>decision_source</th><th>含义</th></tr></thead><tbody>
@@ -2258,32 +3540,284 @@ def pipeline_design_html() -> str:
 	</tbody></table>
 	<p><code>final_decision</code> 核心字段：<code>direction</code>、<code>confidence</code>、<code>push_recommendation</code>（none/watch/trade/spike）、<code>entry/stop_loss/take_profit</code>、<code>risk_level</code>、<code>reasons</code>、<code>rule_audit</code>、<code>trigger_level</code>。</p>
 	<p>AI 侧 <code>push_recommendation</code> 可由模型显式给出；否则由 direction、confidence、audit、trigger level 推导。audit 为「不可信」时 trade 会降级。</p>
+	<h3>trade 门槛：做多 / 做空分开</h3>
+	<table class="help-table"><thead><tr><th>配置项</th><th>用途</th><th>代码入口</th></tr></thead><tbody>
+	<tr><td><code>push_score</code></td><td>做多 trade 推送最低 confidence</td><td><code>trade_push_score("做多")</code></td></tr>
+	<tr><td><code>short_push_score</code></td><td>做空 trade 推送最低 confidence</td><td><code>trade_push_score("做空")</code></td></tr>
+	<tr><td><code>watch_push_score</code></td><td>watch 推送（方向无关）</td><td><code>push_gate</code> / watch 推导</td></tr>
+	<tr><td><code>spike_push_score</code></td><td>L3 急速异动 spike</td><td><code>push_gate</code> / scalp 视图</td></tr>
+	</tbody></table>
+	<p><code>_derive_push_recommendation</code>、<code>_push_kind</code>、<code>push_gate</code>、AI prompt 的 <code>push_thresholds.trade_long/trade_short</code> 均使用上述分工。模拟跟单与压测方向判定<strong>不读</strong> trade 门槛，只看 <code>final_direction</code>。</p>
 	</section>
 	<section class="card help-card"><h2>第七阶段：信号跟踪 update_signal_tracking</h2>
-	<ul class="help-list"><li>依据 <code>final_decision.direction</code> 与 <code>confidence</code> 登记样本</li><li>价格触达 entry → active_review，跟踪 MFE/MAE</li><li>到期结算 → <code>signal_performance.jsonl</code></li></ul>
-	<p>与推送无直接关系，供压测与复盘。</p>
+	<ul class="help-list"><li>依据 <code>final_decision.direction</code> 与 <code>confidence</code> 登记样本（trade/spike 且 confidence ≥ max(70, trade_push_score(direction)−10)）</li><li>价格触达 entry → active_review，跟踪 MFE/MAE</li><li>到期结算 → <code>signal_performance.jsonl</code></li></ul>
+	<p>与微信推送无直接关系，供压测与复盘；登记门槛同样区分做多/做空 trade 分。</p>
 	</section>
 	<section class="card help-card"><h2>第八阶段：微信推送 push_gate</h2>
+	<h3>8.1 交易信号推送（push_if_needed）</h3>
 	<ol class="help-list"><li><code>signals</code> 非空</li><li><code>final_decision.push_recommendation</code> ≠ none</li><li><code>push_gate</code> 校验 confidence 阈值与类型开关</li><li>不在冷却期</li><li><code>push_enabled</code> + <code>WECHAT_SEND_KEY</code> 决定是否真发</li></ol>
 	<table class="help-table"><thead><tr><th>push_recommendation</th><th>push_gate 额外校验</th></tr></thead><tbody>
-	<tr><td><strong>trade</strong></td><td>direction 为做多/做空，confidence ≥ push_score</td></tr>
+	<tr><td><strong>trade</strong></td><td>direction 为做多/做空，confidence ≥ push_score（做多）或 short_push_score（做空）</td></tr>
 	<tr><td><strong>watch</strong></td><td>confidence ≥ watch_push_score；本地来源需命中观察类信号或 AI 来源</td></tr>
 	<tr><td><strong>spike</strong></td><td>confidence ≥ spike_push_score；L3 超短线急速异动</td></tr>
 	</tbody></table>
-	<p>冷却 key：<code>{push_kind}:{inst_id}:{direction}:{信号类型组合}</code>。推送正文同样来自 final_decision。<strong>trade/watch/spike 三类通道 Web 配置默认全开</strong>，是否发出由 final_decision 与 push_score 决定。</p>
+	<p>冷却 key：<code>{push_kind}:{inst_id}:{direction}:{信号类型组合}</code>，间隔 <code>PUSH_COOLDOWN_SECONDS</code>（默认 900s）。推送正文展示「做多 / 做空 / watch / spike」四类门槛。</p>
+	<h3>8.2 AI 异常运维告警（_maybe_push_ai_abnormal_alert）</h3>
+	<p>与 8.1 无关：即使关闭「启用微信推送」，只要配置了 <code>WECHAT_SEND_KEY</code> 且 AI 长时间异常，仍会发告警。正文包含失败原因与排查建议；详见第五阶段「AI 长时间异常微信告警」。</p>
 	</section>
 	<section class="card help-card"><h2>第九阶段：日志 log_result</h2>
-	<p>配置页或日志页可开关「写入分析日志」。关闭时 live 监控跳过 JSON 与控制台摘要写入；离线回放仍写入 <code>replay_analysis.jsonl</code>。开启后写入 <code>okx_signal_analysis.jsonl</code>：<code>score</code>（本地参考）、<code>local_trigger</code>、<code>analysis</code>、<code>final_decision</code>（权威）。控制台以 <code>【AI分析/本地规则/本地兜底】</code> 前缀输出触发原因、分析结论与推送摘要；详细 debug 设 <code>CONSOLE_VERBOSE=1</code>。</p>
+	<p>配置页设置<strong>单文件日志上限</strong>与<strong>日志总容量上限</strong>（默认 500MB / 1500MB）。当前分卷满则轮转为 <code>.jsonl.1</code>、<code>.jsonl.2</code> …；合计超过总容量时删除最旧分卷。写入 <code>okx_signal_analysis.jsonl</code> 系列：<code>score</code>（本地参考）、<code>local_trigger</code>、<code>analysis</code>、<code>final_decision</code>（权威）。控制台以 <code>【AI分析/本地规则/本地兜底】</code> 前缀输出触发原因、分析结论与推送摘要；详细 debug 设 <code>CONSOLE_VERBOSE=1</code>。</p>
 	<h3>关键配置对照</h3>
 	<table class="help-table"><thead><tr><th>Web 可配项</th><th>影响阶段</th></tr></thead><tbody>
 	<tr><td>策略周期 / 确认严格度</td><td>raw_direction 路径、guard、降级门槛、strategy_view 覆盖、动量阈值、score_weights</td></tr>
-	<tr><td>push_score / watch_push_score / spike_push_score</td><td>trade / watch / spike 三类推送门槛（可拆分配置）</td></tr>
-	<tr><td>ai_enabled / push_enabled</td><td>是否调 AI / 是否发微信</td></tr>
-	<tr><td>写入分析日志</td><td>是否每轮写 JSON 与控制台摘要；关闭可减磁盘与 Web 开销</td></tr>
+	<tr><td>push_score / short_push_score</td><td>做多 / 做空 trade 微信推送门槛（<code>trade_push_score</code>）</td></tr>
+	<tr><td>watch_push_score / spike_push_score</td><td>watch / spike 推送门槛</td></tr>
+	<tr><td>ai_enabled / push_enabled</td><td>是否调 AI / 是否发<strong>交易信号</strong>微信</td></tr>
+	<tr><td>单文件 / 总日志容量</td><td>分卷轮转与最旧分卷回收；Web API 读取分析日志时默认 tail 16MB（压测 32MB），非全量扫描</td></tr>
 	<tr><td>AI 密钥与 Base URL</td><td>AI 连接</td></tr>
 	</tbody></table>
-	<p>以下使用内置默认，不在 Web 暴露：策略检测阈值、高级 scalp 开关、trade/watch/spike 通道开关（默认全开）、网络重试与日志轮转等。</p>
+	<h3>环境变量（监控进程，Web 未暴露）</h3>
+	<table class="help-table"><thead><tr><th>变量</th><th>默认</th><th>说明</th></tr></thead><tbody>
+	<tr><td><code>AI_CIRCUIT_FAIL_THRESHOLD</code></td><td>3</td><td>连续失败几次后开熔断</td></tr>
+	<tr><td><code>AI_CIRCUIT_COOLDOWN_SECONDS</code></td><td>120</td><td>熔断冷却时长</td></tr>
+	<tr><td><code>AI_PROBE_INTERVAL_SECONDS</code></td><td>60</td><td>熔断期间探活间隔</td></tr>
+	<tr><td><code>AI_CALL_MIN_INTERVAL_SECONDS</code></td><td>60</td><td>同指纹 L2 重复调 AI 最短间隔</td></tr>
+	<tr><td><code>AI_REQUEST_TIMEOUT</code></td><td>30</td><td>单次 chat 超时（秒）</td></tr>
+	<tr><td><code>AI_ABNORMAL_ALERT_SECONDS</code></td><td>300</td><td>AI 异常持续多久后发微信告警</td></tr>
+	<tr><td><code>AI_ABNORMAL_ALERT_COOLDOWN_SECONDS</code></td><td>3600</td><td>同类 AI 告警最短间隔</td></tr>
+	<tr><td><code>PUSH_COOLDOWN_SECONDS</code></td><td>900</td><td>交易信号推送冷却</td></tr>
+	<tr><td><code>RETRY_TIMES</code> / <code>RETRY_BACKOFF_SECONDS</code></td><td>3 / 1.5</td><td>HTTP 与 AI 请求重试</td></tr>
+	<tr><td><code>CONSOLE_VERBOSE</code></td><td>0</td><td>设为 1 输出更多 debug</td></tr>
+	<tr><td><code>OKX_CIRCUIT_FAIL_THRESHOLD</code></td><td>5</td><td>OKX 连续失败几次后全局熔断</td></tr>
+	<tr><td><code>OKX_CIRCUIT_COOLDOWN_SECONDS</code></td><td>90</td><td>OKX 熔断冷却时长</td></tr>
+	<tr><td><code>REPLAY_DATASET_MAX_BYTES</code></td><td>500MB</td><td>replay 数据集单文件轮转阈值</td></tr>
+	<tr><td><code>REPLAY_DATASET_TOTAL_MAX_BYTES</code></td><td>1500MB</td><td>replay 数据集总容量上限</td></tr>
+	</tbody></table>
+	<h3>环境变量（Web 控制台，可选）</h3>
+	<table class="help-table"><thead><tr><th>变量</th><th>默认</th><th>说明</th></tr></thead><tbody>
+	<tr><td><code>WEB_REALTIME_LOG_TAIL_BYTES</code></td><td>16MB</td><td>监控图表读分析日志 tail 上限</td></tr>
+	<tr><td><code>WEB_ACCURACY_LOG_TAIL_BYTES</code></td><td>32MB</td><td>压测 API 读分析日志 tail 上限</td></tr>
+	<tr><td><code>WEB_LOG_DISPLAY_MAX_LINES</code></td><td>2000</td><td>日志页 textarea 最多显示行数</td></tr>
+	<tr><td><code>WEB_CONSOLE_LOG_MAX_BYTES</code></td><td>100MB</td><td>控制台日志单文件轮转（启动/读取/状态轮询时检查）</td></tr>
+	<tr><td><code>WEB_API_CACHE_TTL_SECONDS</code></td><td>3</td><td>monitor-candles / accuracy-data 短缓存</td></tr>
+	<tr><td><code>WEB_CANDLE_CACHE_TTL_SECONDS</code></td><td>45</td><td>Web 侧 OKX K 线 REST 缓存</td></tr>
+	<tr><td><code>WEB_SESSION_TTL_SECONDS</code></td><td>7 天</td><td>登录会话滑动过期</td></tr>
+	<tr><td><code>WEB_SESSION_ABSOLUTE_TTL_SECONDS</code></td><td>30 天</td><td>登录会话绝对最长寿命</td></tr>
+	<tr><td><code>WEB_MONITOR_AUTO_RESTART</code></td><td>1</td><td>监控子进程意外退出时自动重启</td></tr>
+	<tr><td><code>WEB_MONITOR_MAX_AUTO_RESTARTS</code></td><td>5</td><td>每窗口内最多自动重启次数</td></tr>
+	<tr><td><code>WEB_MONITOR_CRASH_ALERT</code></td><td>1</td><td>意外退出时发微信运维告警（需 SendKey）</td></tr>
+	<tr><td><code>WEB_MAX_CONCURRENT_REQUESTS</code></td><td>48</td><td>Web HTTP 并发上限</td></tr>
+	<tr><td><code>OKX_LAUNCHED_BY_TRAY</code></td><td>—</td><td>由 <code>tray_launcher.py</code> 注入（只读）；Web 电源关机/重启会通过退出码通知托盘同步退出或重拉子进程</td></tr>
+	<tr><td><code>OKX_WEB_SKIP_BROWSER</code></td><td>—</td><td>设为 1 时 Web 启动不自动开浏览器（托盘/重启场景）</td></tr>
+	</tbody></table>
+	<p>以下使用内置默认，不在 Web 暴露：策略检测阈值、高级 scalp 开关、trade/watch/spike 通道开关（默认全开）、日志轮转细节等。</p>
 	<div class="help-note">一句话：本地负责「发现异常 + 决定是否叫 AI」；AI 负责「被叫时的主决策」；final_decision 负责「推送、跟踪、Web 展示」的统一出口。</div>
+	</section>
+	<section class="card help-card"><h2>附录 A：采集参数与技术指标</h2>
+	<h3>采集的数据</h3><div class="help-grid">
+	<div class="help-item"><strong>行情与K线</strong><p>默认提供 BTC/ETH 快捷选项，也可在配置页通过「增加新币种」添加更多 OKX USDT 永续（添加时会校验）。每轮采集 ticker、买卖一档、1m/3m/5m/15m/1H/4H K线；每个周期请求最近 <code>200</code> 根。</p></div>
+	<div class="help-item"><strong>合约资金数据</strong><p>OI、资金费率、5m 多空比。OI/费率按约 <code>60s</code> 采样，保留约 <code>3小时</code>，用于 15m 变化与资金状态。</p></div>
+	<div class="help-item"><strong>盘口数据</strong><p>前 20 档订单簿，top5/top20 不平衡与价差；缓存约 5s，仅作入场确认与风险修正。</p></div>
+	<div class="help-item"><strong>运行内统计</strong><p>放量倍数、ATR%、盘口不平衡按约 60s 采样；动态阈值来自近 3h 分位数；结算样本 → <code>signal_performance.jsonl</code>。</p></div>
+	</div>
+	<h3>计算的技术指标</h3><table class="help-table"><thead><tr><th>类别</th><th>指标</th><th>用途</th></tr></thead><tbody>
+	<tr><td>趋势</td><td>EMA9/20/60/120、MA120、结构高低点、ADX/+DI/-DI</td><td>趋势排列、强度、多周期共振、震荡识别。</td></tr>
+	<tr><td>动量</td><td>RSI6/14/24、MACD、KDJ、实体占比、RSI 背离</td><td>动能增强/衰减/过热/背离。</td></tr>
+	<tr><td>波动</td><td>ATR、ATR%、布林带、带宽</td><td>高/低波动、挤压；入场/止损/止盈锚点。</td></tr>
+	<tr><td>量价</td><td>1m 放量倍数、量能方向、近 5 根趋势</td><td>突破/回踩量能确认。</td></tr>
+	<tr><td>合约资金</td><td>OI 15m 变化、费率及变化、多空比</td><td>新增仓、平仓、拥挤、过热。</td></tr>
+	<tr><td>数据质量</td><td>确认 K 线数、各指标 ready 标志</td><td>15m 确认 K 少于 35 根会降低趋势/动量分。</td></tr>
+	</tbody></table>
+	<h3>八层评分（score.layer_scores）</h3>
+	<ul class="help-list"><li><code>market_regime_score</code> — 市场状态</li><li><code>trend_score</code> / <code>momentum_score</code></li><li><code>volume_price_score</code> / <code>derivatives_score</code></li><li><code>orderbook_score</code> / <code>entry_quality_score</code> / <code>risk_control_score</code></li></ul>
+	</section>
+	<section class="card help-card"><h2>附录 B：推送分数建议（配置页）</h2>
+	<table class="help-table"><thead><tr><th>配置项</th><th>含义</th><th>保守</th><th>标准</th><th>激进</th></tr></thead><tbody>
+	<tr><td><code>push_score</code></td><td>做多 trade</td><td>80</td><td>75</td><td>70</td></tr>
+	<tr><td><code>short_push_score</code></td><td>做空 trade</td><td>74</td><td>70</td><td>65</td></tr>
+	<tr><td><code>watch_push_score</code></td><td>watch</td><td>72</td><td>65</td><td>62</td></tr>
+	<tr><td><code>spike_push_score</code></td><td>spike</td><td>68</td><td>62</td><td>58</td></tr>
+	</tbody></table>
+	<p>配置页可按「确认严格度」一键填入。做空门槛通常比做多低 4–6 分，以补偿结构确认链更长。</p>
+	</section>
+	<section class="card help-card"><h2>附录 C：JSON / Snapshot 字段</h2>
+	<table class="help-table"><thead><tr><th>字段</th><th>来源</th><th>说明</th></tr></thead><tbody>
+	<tr><td><code>final_decision.direction</code></td><td>merge</td><td>权威方向；Web 图表/压测/推送均优先读此字段。</td></tr>
+	<tr><td><code>final_decision.confidence</code></td><td>merge / AI</td><td>推送 trade 时：做多 ≥ push_score，做空 ≥ short_push_score。</td></tr>
+	<tr><td><code>final_decision.push_recommendation</code></td><td>merge / AI</td><td>none / watch / trade / spike。</td></tr>
+	<tr><td><code>decision_source</code></td><td>merge</td><td>ai / local / local_fallback。</td></tr>
+	<tr><td><code>trigger_level</code></td><td>local_trigger</td><td>L0–L3；L2/L3 才可能调 AI。</td></tr>
+	<tr><td><code>score.raw_total_score</code></td><td>本地</td><td>观察分；与 confidence 可不一致。</td></tr>
+	<tr><td><code>score.final_trade_score</code></td><td>strategy_view</td><td>本地交易分；AI 有效时以 confidence 为准。</td></tr>
+	<tr><td><code>score.trends["15m"]</code> vs <code>trend_profiles["15m"].trend</code></td><td>本地</td><td>二者可能不一致；<strong>策略方向以后者为准</strong>。</td></tr>
+	<tr><td><code>analysis.error</code></td><td>AI</td><td>请求失败或熔断时的错误文本；local_fallback 时 merge 仍走本地规则。</td></tr>
+	<tr><td><code>analysis.ai_status</code></td><td>AI</td><td>如 <code>circuit_open</code>、<code>open</code> 等连接状态。</td></tr>
+	<tr><td><code>oi_warmup_ready</code> / <code>funding_warmup_ready</code></td><td>snapshot</td><td>满 15 分钟后 OI/费率变化类信号才完全生效。</td></tr>
+	</tbody></table>
+	<h3>入场 / 止损 / 止盈</h3>
+	<ul class="help-list"><li>由 ATR、结构位、EMA/VWAP 生成入场区；止损为结构失效 + ATR 缓冲；止盈约 1R/2R 两档。</li><li>信号跟踪：触达 entry → 统计 MFE/MAE → 写入 <code>signal_performance.jsonl</code>。</li></ul>
+	</section>
+	<section class="card help-card"><h2>附录 D：Web 控制台 web_control_panel.py</h2>
+	<p>Web 进程与监控子进程分离：配置页保存 → <code>build_monitor_args</code> 拉起 <code>okx_signal_monitor.py</code>；日志/图表 API 读取 <code>build/runtime_logs/</code> 下 JSONL。</p>
+	<table class="help-table"><thead><tr><th>能力</th><th>说明</th></tr></thead><tbody>
+	<tr><td>监控图表</td><td>读分析日志 K 线 + 指标；OKX K 线 REST 默认缓存 45s；未选中 K 线时快照面板显示最新 <code>final_decision</code></td></tr>
+	<tr><td>监控守护</td><td>子进程意外退出：写控制台日志、可选微信告警（<code>WEB_MONITOR_CRASH_ALERT</code>）、默认自动重启（<code>WEB_MONITOR_AUTO_RESTART</code>，窗口内最多 5 次）</td></tr>
+	<tr><td>孤儿 PID 文件</td><td>Web 启动时若 <code>local_state/monitor.pid</code> / <code>replay.pid</code> 对应进程已退出则清理；若进程仍存活则<strong>不终止</strong>（兼容 Web 崩溃后监控继续 7×24 运行）</td></tr>
+	<tr><td>诊断包导出</td><td>测试页 <code>POST /api/diagnostic-export</code>：ZIP 含打码配置、状态、日志、实时/回放压测 JSON、回放数据尾部；单文件默认 tail 32MB，整包上限 150MB</td></tr>
+	<tr><td>电源 API</td><td><code>POST /api/power/restart</code> · <code>POST /api/power/shutdown</code>（需登录）；重启前将会话写入 <code>local_state/web_restart_sessions.json</code> 并在新进程恢复</td></tr>
+	<tr><td>托盘 API</td><td><code>POST /api/tray/shutdown</code>（仅 127.0.0.1，无需登录）— 托盘菜单「退出」调用；与 Web 关机走同一停止逻辑</td></tr>
+	<tr><td>重启拉起（终端）</td><td>未设 <code>OKX_LAUNCHED_BY_TRAY</code> 时：Windows 走 <code>restart_web_control_panel_windows.bat</code> → 延迟后 <code>start_web_control_panel_windows.bat</code>；子进程设 <code>OKX_WEB_SKIP_BROWSER=1</code></td></tr>
+	<tr><td>重启拉起（托盘）</td><td>设 <code>OKX_LAUNCHED_BY_TRAY=1</code> 时：Web 以退出码 101 结束，<code>tray_launcher.py</code> 监控后在本进程内重拉 <code>web_control_panel.py</code>（不新开 cmd）</td></tr>
+	<tr><td>关机（托盘）</td><td>Web 以退出码 100 结束 → 托盘 <code>quit_application()</code> 同步退出；与托盘菜单「退出」效果一致</td></tr>
+	<tr><td>终端行为</td><td>终端模式 Web 正常退出（关机/重启旧窗口）→ cmd 自动关闭；Ctrl+C → pause 后关闭。托盘模式无 cmd 窗口</td></tr>
+	</tbody></table>
+	<h3>Windows 启动方式</h3>
+	<table class="help-table"><thead><tr><th>方式</th><th>入口</th><th>说明</th></tr></thead><tbody>
+	<tr><td>托盘（安装包默认）</td><td><code>launch_web_control_panel.vbs</code> → <code>tray_launcher.py</code></td><td>系统托盘 + 可选任务栏小窗；Web 设 <code>OKX_LAUNCHED_BY_TRAY=1</code>；关浏览器不停服务</td></tr>
+	<tr><td>终端</td><td><code>start_web_control_panel_windows.bat</code></td><td>可见 cmd；电源「重启」会延迟后新开 bat；「关机」关闭 Web 与 cmd</td></tr>
+	</tbody></table>
+	</section></div></div>
+"""
+
+
+def help_manual_html(config: Dict[str, Any]) -> str:
+    panel_url = f"http://{HOST}:{PORT}"
+    return f"""
+	<div class="page-panel" data-page="help"><section class="card toolbar-card"><div><h2>帮助</h2><p class="section-sub">操作手册：版本信息、界面用法、服务启停与常见问题。流程与参数详见「设计」页。</p></div><div class="toolbar-right"><a class="button btn-view" href="#design">查看设计文档</a></div></section><div class="help-panel doc-panel">
+	<section class="card help-card"><h2>版本与组成</h2>
+	<table class="help-table"><thead><tr><th>项</th><th>说明</th></tr></thead><tbody>
+	<tr><td>产品</td><td>{esc(APP_NAME)}</td></tr>
+	<tr><td>版本</td><td>{esc(APP_VERSION)}</td></tr>
+	<tr><td>Web 控制台</td><td><code>web_control_panel.py</code> · 默认 {esc(panel_url)}</td></tr>
+	<tr><td>监控进程</td><td><code>okx_signal_monitor.py</code> · 由 Web 页启动/停止</td></tr>
+	<tr><td>托盘启动器</td><td><code>tray_launcher.py</code> · 安装包桌面图标默认入口；管理 Web 子进程生命周期</td></tr>
+	<tr><td>支持合约</td><td>OKX USDT 永续（如 BTC-USDT-SWAP、ETH-USDT-SWAP；配置页可手动添加其他 SWAP）</td></tr>
+	</tbody></table>
+	</section>
+	<section class="card help-card"><h2>启动与停止</h2>
+	<h3>启动 Web 控制台</h3>
+	<ul class="help-list">
+	<li><strong>Windows 安装包（推荐）</strong>：双击桌面图标或 <code>launch_web_control_panel.vbs</code> → 系统托盘图标（可选任务栏小窗）→ 自动打开浏览器。首次请先完成安装向导中的 <code>setup_windows_runtime.bat</code>。</li>
+	<li><strong>Windows 终端</strong>：双击 <code>start_web_control_panel_windows.bat</code>（开发/调试常用；可见 cmd 窗口）。</li>
+	<li><strong>命令行</strong>：在项目目录执行 <code>python web_control_panel.py</code>。</li>
+	<li>浏览器未自动打开时，手动访问 {esc(panel_url)}；默认账号见 <code>config/web_console_auth.default.json</code>，可在「设置」页修改。</li>
+	</ul>
+	<h3>启动 / 停止 OKX 监控</h3>
+	<ul class="help-list">
+	<li>在「配置」页保存策略与密钥后，切到「监控」页，点击<strong>开始监控</strong>（按钮变为停止态）。</li>
+	<li>再次点击同一按钮<strong>停止监控</strong>；停止后图表可能仍显示本次会话已写入的日志数据。</li>
+	<li>修改日志容量、轮询间隔、推送分数等：先在「配置」页保存，再<strong>停止并重新启动</strong>监控后生效。</li>
+	</ul>
+	<h3>离线回放</h3>
+	<ul class="help-list">
+	<li>配置页勾选「录制回放数据集」→ 运行监控采集 → <strong>停止监控</strong> →「测试」页点击「开始回放」。</li>
+	<li>回放与实时监控<strong>不能同时</strong>运行；回放进行中请勿再点「开始监控」。</li>
+	<li>停止回放：测试页「停止回放」。</li>
+	</ul>
+	<h3>退出</h3>
+	<ul class="help-list">
+	<li><strong>托盘模式</strong>（安装包默认）：系统托盘「退出」，或任务栏小窗「退出」，与 Web 侧边栏<strong>关机</strong>等效 — 停止监控/回放、关闭 Web，并<strong>同步退出托盘</strong>。托盘「打开控制台」仅打开浏览器，不会停止服务。</li>
+	<li>侧边栏左下角<strong>电源按钮</strong>：<strong>重启控制台</strong> — 停止监控/回放 → 关闭当前 Web → 自动拉起新实例（登录会话尽量保持）。托盘模式下由托盘重拉 Web（不新开 cmd）；终端模式下延迟后新开 <code>start_web_control_panel_windows.bat</code>。提示「服务已恢复，请手动刷新浏览器」后请按 <strong>F5</strong> 刷新。</li>
+	<li>同一菜单：<strong>关机</strong> — 停止所有服务并关闭 Web。托盘模式下<strong>同步退出托盘</strong>；终端模式下运行 Web 的 cmd 窗口会自动关闭。</li>
+	<li>终端内 <strong>Ctrl+C</strong>：停止 Web 控制台；窗口会 pause 并提示，按任意键后关闭（便于确认已停止）。</li>
+	<li>仅关闭浏览器标签<strong>不会</strong>停止后台服务；需使用「停止监控」、电源菜单「关机」或托盘「退出」。</li>
+	</ul>
+	</section>
+	<section class="card help-card"><h2>页面导航</h2>
+	<table class="help-table"><thead><tr><th>页面</th><th>用途</th><th>常用操作</th></tr></thead><tbody>
+	<tr><td><strong>监控</strong></td><td>实时价格、Snapshot、模拟账户</td><td>开始/停止监控；切换 BTC/ETH；滚轮缩放、拖动平移、点击看 Snapshot</td></tr>
+	<tr><td><strong>配置</strong></td><td>币种、策略、AI/推送、密钥</td><td>勾选合约；保存配置；一键填入推送分数建议</td></tr>
+	<tr><td><strong>日志</strong></td><td>JSON 分析日志、控制台摘要</td><td>查看容量与分卷；刷新；另存为；打开日志目录</td></tr>
+	<tr><td><strong>测试</strong></td><td>AI 对话、微信连通性、压测、回放</td><td>AI 对话 / 测试推送；刷新压测；开始/停止回放</td></tr>
+	<tr><td><strong>设计</strong></td><td>流程与参数技术文档</td><td>查阅九阶段链路、AI 熔断/告警与环境变量附录</td></tr>
+	<tr><td><strong>帮助</strong></td><td>本操作手册</td><td>启停与界面说明</td></tr>
+	<tr><td><strong>设置</strong></td><td>Web 登录账号</td><td>修改用户名/密码</td></tr>
+	</tbody></table>
+	<p>侧边栏底部<strong>电源按钮</strong>：重启 Web 或完整退出（托盘模式会同步退出托盘；详见「启动与停止 → 退出」）。</p>
+	</section>
+	<section class="card help-card"><h2>监控页</h2>
+	<ul class="help-list">
+	<li>右上角<strong>K 线开关</strong>默认开启；关闭后不再请求 OKX/日志绘图，但监控进程与磁盘日志照常运行。</li>
+	<li>未启动监控时显示<strong>虚拟行情</strong>；启动后读取本次会话写入的分析日志叠加指标。</li>
+	<li>左上角快照：未选中 K 线时显示<strong>最新分析快照</strong>（<code>final_decision</code> 方向、置信度、推送、价位与 AI 摘要）；选中 K 线时显示该根 K 线的 OHLC、涨跌与成交量。</li>
+	<li>底部<strong>模拟账户</strong>：按 <code>final_direction</code> 从 $10,000 满仓跟单，方向变才换仓；非真实成交。</li>
+	<li>图表：滚轮缩放时间轴；Shift+滚轮缩放价格；拖动平移；双击重置视图。</li>
+	</ul>
+	</section>
+	<section class="card help-card"><h2>配置页</h2>
+	<ul class="help-list">
+	<li><strong>策略周期</strong>：超短线 / 短线 / 中线，决定主方向逻辑（详见「设计」附录）。</li>
+	<li><strong>确认严格度</strong>：保守 / 标准 / 激进，影响动量阈值与降级门槛。</li>
+	<li><strong>AI与推送</strong>：启用 AI、微信推送（交易信号）；<code>push_score</code>（做多）与 <code>short_push_score</code>（做空）分开配置。Server酱 SendKey 在密钥区配置。</li>
+	<li><strong>AI 异常告警</strong>：与「启用微信推送」无关；启用 AI 且配置了 SendKey 时，AI 连续异常超过约 5 分钟会自动发微信，正文含失败原因。间隔与阈值见「设计」页环境变量表（<code>AI_ABNORMAL_ALERT_*</code>）。</li>
+	<li><strong>监控进程意外退出</strong>：默认会自动尝试重启（见设计页 <code>WEB_MONITOR_*</code>）；若配置了 SendKey 会另发运维微信告警。Web 重启时仅清理已死亡子进程的 PID 文件，不会终止仍在运行的监控。</li>
+	<li><strong>日志容量</strong>：单文件默认 500MB、总容量 1500MB；满则轮转并删除最旧分卷。Web 压测与监控图指标叠加依赖分析日志。</li>
+	<li>底部「另存为配置 / 导入配置」可备份 <code>trading_assistant_config.json</code>。</li>
+	</ul>
+	</section>
+	<section class="card help-card"><h2>日志页</h2>
+	<ul class="help-list">
+	<li>右上角<strong>开关</strong>默认关闭，仅控制 Web 是否读取并展示；<strong>不影响</strong>监控进程写 {esc(MONITOR_JSON_LOG_FILE)} / {esc(MONITOR_PROCESS_LOG_FILE)}。</li>
+	<li><strong>JSON 分析日志</strong>：完整每轮记录 → {esc(MONITOR_JSON_LOG_FILE)}</li>
+	<li><strong>控制台日志</strong>：精简摘要（信号、推送结果）→ {esc(MONITOR_PROCESS_LOG_FILE)}</li>
+	<li>页面只显示<strong>本次启动监控后</strong>的内容；「打开日志目录」可查看磁盘上的完整文件。</li>
+	<li>顶部显示当前分卷占用；容量在配置页调整，变更后需<strong>重启监控</strong>。</li>
+	</ul>
+	</section>
+	<section class="card help-card"><h2>测试页</h2>
+	<h3>问题排查导出</h3>
+	<ul class="help-list">
+	<li>测试页顶部<strong>导出诊断包</strong>：压缩下载配置（密钥打码）、状态、日志、压测 JSON、回放数据与 AI 对话记录。</li>
+	<li>超大单文件仅含尾部；详见包内 <code>manifest.json</code> 与 <code>README.txt</code>。</li>
+	</ul>
+	<h3>AI 对话</h3>
+	<ul class="help-list">
+	<li>在输入框发送消息，AI 回复会显示在上方对话区；Enter 发送，Shift+Enter 换行。</li>
+	<li>发送前会先保存配置页中的 AI 密钥；对话历史仅保留在本页浏览器内存中。</li>
+	<li><strong>连通性测试</strong>会发送固定探针消息，用于快速验证 API 是否可用。</li>
+	</ul>
+	<h3>微信推送</h3>
+	<ul class="help-list">
+	<li><strong>测试微信推送</strong>：会先保存配置页中的密钥再发起请求。</li>
+	<li><strong>测试微信推送</strong>发送的是与真实监控相同结构的格式预览，不代表 AI 异常告警样式（异常告警标题为 <code>[AI异常] …</code>，正文含失败原因与排查项）。</li>
+	</ul>
+	<h3>实时预测压测</h3>
+	<ul class="help-list">
+	<li>右上角<strong>开关</strong>默认关闭；打开后才会读取分析日志并自动刷新压测图表（节省长期运行资源）。</li>
+	<li>选择合约、验证窗口（短线建议 15–20 分钟）、范围（本次启动后 / 全部历史 / 回放会话）。</li>
+	<li>顶部绿底卡片 + 图表<strong>绿线</strong>为 $10k 模拟账户；<strong>蓝线</strong>价格、<strong>黄线</strong>方向累计（非 0–100 分）。</li>
+	<li>绿/红点表示该点预测是否在验证窗内合理；「已验证/日志」分母为成熟样本数。</li>
+	<li>可导出/导入图表 JSON 快照。</li>
+	</ul>
+	<h3>离线回放压测</h3>
+	<ul class="help-list">
+	<li>数据集：{esc(REPLAY_DATASET_FILE)} · 回放结果：{esc(REPLAY_ANALYSIS_LOG_FILE)}</li>
+	<li>回放完成后，压测范围选「回放会话」查看曲线。</li>
+	</ul>
+	</section>
+	<section class="card help-card"><h2>设置页</h2>
+	<ul class="help-list"><li>修改登录用户名或密码时须<strong>手动输入当前密码</strong>；页面不会预填或自动填充密码。</li><li>保存后会自动停止监控与回放，并强制重新登录。</li><li>本机私密配置目录：<code>local_state/</code>（含登录信息与可选的配置副本）。</li></ul>
+	</section>
+	<section class="card help-card"><h2>本地文件位置</h2>
+	<ul class="help-list">
+	<li>运行日志：<code>build/runtime_logs/</code></li>
+	<li>默认配置模板：<code>config/</code></li>
+	<li>本机运行态与密钥：<code>local_state/</code>（勿提交版本库）</li>
+	<li>当前生效配置：{esc(active_config_file())}</li>
+	</ul>
+	</section>
+	<section class="card help-card"><h2>常见问题</h2>
+	<ul class="help-list">
+	<li><strong>监控已开但图表无指标</strong>：等待几轮轮询；确认日志目录有写入且未超出总容量被回收。</li>
+	<li><strong>压测一直「待验证」</strong>：验证窗口未到期；到期后点「刷新压测」。范围选「本次启动后」时须监控曾运行过。</li>
+	<li><strong>有做空方向但没推 trade</strong>：微信推送看 confidence 是否达到 <code>short_push_score</code>；模拟账户不卡此门槛。</li>
+	<li><strong>修改配置不生效</strong>：监控进程需停止后重新启动；密钥类配置测试前也会自动保存。</li>
+	<li><strong>回放无数据</strong>：须先录制数据集并在测试页点击「开始回放」，再选压测范围「回放会话」。</li>
+	<li><strong>收到 [AI异常] 微信</strong>：表示监控仍在跑但 AI 已长时间不可用（密钥、网络、接口或熔断）。查看控制台 / JSON 日志 <code>analysis.error</code>；修复后监控会自动探活恢复，无需重启（改密钥后建议重启监控）。</li>
+	<li><strong>Web 重启后页面空白或旧数据</strong>：按提示<strong>手动刷新浏览器</strong>（F5）；若仍异常，用电源「关机」或托盘「退出」后重新打开应用。</li>
+	<li><strong>关机后托盘仍在 / cmd 仍停留</strong>：请用 Web 电源「关机」或托盘「退出」，不要只关浏览器。托盘模式关机后图标应消失；终端模式 cmd 应自动关闭。</li>
+	</ul>
+	<div class="help-note">流程细节、信号条件、评分层与推送推导规则见侧边栏「设计」页，不在本手册重复。</div>
 	</section></div></div>
 """
 
@@ -2292,22 +3826,38 @@ def render_page(message: str = "") -> bytes:
     config = load_config()
     env = load_env()
     auth = load_auth()
-    selected = set(config.get("inst_ids", []))
-    selected_instruments = [inst for inst in SUPPORTED_INSTRUMENTS if inst in selected]
+    selected_instruments = order_configured_inst_ids(config.get("inst_ids", []))
+    selected = set(selected_instruments)
+    inst_pool = visible_inst_pool(config)
+    removed_inst_ids = [inst for inst in order_configured_inst_ids(config.get("removed_inst_ids", [])) if inst in PRESET_INSTRUMENTS]
     monitor_initial = selected_instruments[0] if selected_instruments else ""
+    accuracy_inst_options = "".join(
+        f'<option value="{esc(inst)}">{esc(inst)}</option>' for inst in selected_instruments
+    ) or '<option value="">未配置</option>'
     if selected_instruments:
         monitor_tabs = "".join(
-            f'<button class="button coin-tab {"active" if index == 0 else ""}" type="button" data-monitor-inst="{inst}">{inst}</button>'
+            f'<button class="button coin-tab {"active" if index == 0 else ""}" type="button" data-monitor-inst="{esc(inst)}">{esc(inst)}</button>'
             for index, inst in enumerate(selected_instruments)
         )
     else:
         monitor_tabs = '<span class="empty-coin">请先在配置页选择监控币种</span>'
+    monitor_bar_tabs = "".join(
+        f'<button type="button" class="button bar-tab {"active" if bar == "1m" else ""}" data-monitor-bar="{bar}">{bar}</button>'
+        for bar in MONITOR_BAR_CHANNELS
+    )
     rows = []
-    rows.append('<section class="card hero-card page-section" data-page="config"><div><h2>配置币种</h2><p class="section-sub">选择本次需要监控的OKX永续合约。</p></div><div class="checks">')
-    for inst in SUPPORTED_INSTRUMENTS:
-        checked = "checked" if inst in selected else ""
-        rows.append(f'<label class="check-tile"><input type="checkbox" name="inst_ids" value="{inst}" {checked}><span>{inst}</span></label>')
-    rows.append("</div></section>")
+    rows.append('<section class="card page-section" data-page="config"><h2>配置币种</h2><p class="section-sub">勾选需要监控的 OKX USDT 永续；可通过「增加新币种」添加更多合约。每个币种右侧可点<strong>删除</strong>从列表移除。</p><div class="checks" id="instChecks">')
+    for inst in inst_pool:
+        rows.append(inst_tile_html(inst, checked=inst in selected))
+    for inst in removed_inst_ids:
+        rows.append(f'<input type="hidden" name="removed_inst_ids" value="{esc(inst)}">')
+    rows.append(
+        '</div><div class="add-inst-field"><label for="newInstId">增加新币种</label><div>'
+        '<div class="add-inst-row"><input type="text" id="newInstId" autocomplete="off" placeholder="例如 SOL-USDT-SWAP">'
+        '<button class="button btn-save action-control" type="button" id="addInstBtn">添加</button></div>'
+        '<p id="addInstFeedback" class="inst-feedback">输入 OKX 永续合约 ID 并点击添加；校验通过后会出现在上方，右侧「删除」可移除。</p>'
+        '</div></div></section>'
+    )
     current = ""
     for section, key, kind, label, help_text in CONFIG_FIELDS:
         if section != current:
@@ -2321,6 +3871,7 @@ def render_page(message: str = "") -> bytes:
     suggested_rows = "".join(
         f"<tr><td>{esc(RISK_PREFERENCE_LABELS.get(risk_key, risk_key))}</td>"
         f"<td>{values['push_score']}</td>"
+        f"<td>{values['short_push_score']}</td>"
         f"<td>{values['watch_push_score']}</td>"
         f"<td>{values['spike_push_score']}</td></tr>"
         for risk_key, values in SUGGESTED_PUSH_SCORES.items()
@@ -2330,7 +3881,7 @@ def render_page(message: str = "") -> bytes:
         f'<h2>推送分数建议</h2>'
         f'<p class="section-sub" id="pushScoreGuideText">{esc(push_score_guide_text(risk, bool(config.get("ai_enabled"))))}</p>'
         f'<table class="help-table" style="grid-column:1/-1;"><thead><tr>'
-        f'<th>确认严格度</th><th>trade</th><th>watch</th><th>spike</th>'
+        f'<th>确认严格度</th><th>做多</th><th>做空</th><th>watch</th><th>spike</th>'
         f'</tr></thead><tbody>{suggested_rows}</tbody></table>'
         f'<div class="toolbar-right" style="grid-column:1/-1;justify-content:flex-start;">'
         f'<button class="btn-save action-control" type="button" id="applySuggestedPushScores">填入当前严格度建议值</button>'
@@ -2349,133 +3900,62 @@ def render_page(message: str = "") -> bytes:
         notice_class = "notice notice-error" if is_error else "notice"
         notice_html = f'<div class="{notice_class}">{esc(message)}</div>'
 
+    tray_mode = launched_by_tray()
+    if tray_mode:
+        power_mode_hint = "托盘模式：关机同步退出托盘；重启由托盘重拉 Web"
+        power_menu_restart_hint = "托盘保持运行，恢复后请 F5 刷新"
+        power_menu_shutdown_hint = "停止服务并退出托盘"
+        power_confirm_restart = "将停止监控/回放并由托盘重启 Web 控制台，是否继续？"
+        power_confirm_shutdown = "将停止所有服务并退出托盘，是否继续？"
+        power_shutdown_done = "服务已关闭，托盘已退出。可关闭此浏览器标签页。"
+    else:
+        power_mode_hint = "终端模式：关机将关闭 cmd 窗口"
+        power_menu_restart_hint = "延迟后新开 cmd 窗口"
+        power_menu_shutdown_hint = "停止服务并关闭 Web"
+        power_confirm_restart = "将停止监控/回放并重启 Web 控制台，是否继续？"
+        power_confirm_shutdown = "将停止所有服务并关闭 Web 控制台，是否继续？"
+        power_shutdown_done = "Web 控制台已关闭。可关闭此浏览器标签页。"
+
     body = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>OKX AI Assistant</title>
 <style>
 :root{{--bg:#f5f5f6;--panel:#fff;--text:#172033;--muted:#6b7a90;--line:#e1e8f0;--primary:#8b6cf6;--shadow:0 8px 26px rgba(15,23,42,.08)}}
 *{{box-sizing:border-box}} body{{margin:0;font-family:"Segoe UI","Microsoft YaHei",Arial,sans-serif;background:var(--bg);color:var(--text)}} .app{{min-height:100vh;display:grid;grid-template-columns:258px 1fr}}
-.sidebar{{position:sticky;top:0;height:100vh;background:#fff;border-right:1px solid #eceef3;padding:26px 16px;box-shadow:4px 0 24px rgba(15,23,42,.04)}} .brand{{display:flex;align-items:center;gap:10px;margin:0 0 24px;padding:0 8px;font-size:22px;font-weight:800;color:#201a38}} .logo{{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;color:#fff;background:linear-gradient(135deg,#ec4899,#8b5cf6 58%,#38bdf8)}}
+.sidebar{{position:sticky;top:0;height:100vh;display:flex;flex-direction:column;background:#fff;border-right:1px solid #eceef3;padding:26px 16px 18px;box-shadow:4px 0 24px rgba(15,23,42,.04)}} .sidebar-main{{flex:1;min-height:0}} .sidebar-footer{{position:relative;margin-top:auto;padding-top:12px}} .sidebar-footer-panel{{border:1px solid #eceef3;border-radius:16px;background:linear-gradient(180deg,#fafbfc 0%,#f4f6f8 100%);box-shadow:inset 0 1px 0 rgba(255,255,255,.9),0 4px 14px rgba(15,23,42,.04);overflow:visible}} .sidebar-footer-power{{position:relative;display:flex;align-items:center;gap:10px;padding:10px 12px;cursor:pointer;transition:background .18s ease;border-radius:16px 16px 0 0;overflow:visible}} .sidebar-footer-power:hover{{background:rgba(255,255,255,.55)}} .power-btn-label{{flex:1;font-size:13px;font-weight:650;color:#475569;line-height:1.2}} .power-btn-chevron{{color:#94a3b8;font-size:16px;line-height:1;user-select:none}} .power-mode-hint{{padding:0 12px 10px;font-size:11px;line-height:1.45;color:#64748b;border-bottom:1px solid #e8ecf1}} .sidebar-version{{display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:0;padding:9px 12px;background:rgba(255,255,255,.72)}} .sidebar-version-name{{font-size:11px;font-weight:650;color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}} .sidebar-version-tag{{flex-shrink:0;padding:3px 8px;border-radius:999px;background:#ede9fe;color:#6d28d9;font-size:11px;font-weight:750;letter-spacing:.03em;line-height:1.2}} .power-btn{{width:40px;height:40px;border-radius:12px;border:1px solid #fca5a5;background:linear-gradient(180deg,#fff7f7 0%,#ffe4e6 100%);cursor:pointer;display:grid;place-items:center;color:#dc2626;padding:0;min-width:40px;box-shadow:0 4px 12px rgba(220,38,38,.12),inset 0 1px 0 rgba(255,255,255,.85);transition:background .18s ease,color .18s ease,border-color .18s ease,box-shadow .18s ease,transform .18s ease}} .power-btn:hover{{background:linear-gradient(180deg,#ffe4e6 0%,#fecaca 100%);color:#b91c1c;border-color:#f87171;box-shadow:0 6px 16px rgba(220,38,38,.18);transform:translateY(-1px)}} .power-btn:focus-visible{{outline:2px solid #fca5a5;outline-offset:2px}} .power-btn svg{{display:block;width:20px;height:20px;filter:drop-shadow(0 1px 0 rgba(255,255,255,.75))}} .power-menu{{position:absolute;left:8px;right:8px;bottom:calc(100% + 8px);background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:6px;box-shadow:0 16px 34px rgba(15,23,42,.14);z-index:40}} .power-menu[hidden]{{display:none}} .power-menu button{{display:flex;flex-direction:column;align-items:flex-start;gap:2px;width:100%;text-align:left;padding:10px 12px;border:0;background:transparent;border-radius:10px;cursor:pointer;font-size:13px;font-weight:650;color:#334155;min-width:0}} .power-menu button:hover{{background:#f1f5f9}} .power-menu-desc{{font-size:11px;font-weight:500;color:#64748b;line-height:1.35}} .power-menu button.danger{{color:#dc2626}} .power-menu button.danger:hover{{background:#fef2f2}} .power-menu button.danger .power-menu-desc{{color:#b91c1c;opacity:.85}} .power-overlay{{position:fixed;inset:0;display:grid;place-items:center;background:rgba(15,23,42,.42);z-index:9999;color:#fff;font-size:16px;font-weight:650;padding:24px;text-align:center}} .brand{{display:flex;align-items:center;gap:10px;margin:0 0 24px;padding:0 8px;font-size:22px;font-weight:800;color:#201a38}} .logo{{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;color:#fff;background:linear-gradient(135deg,#ec4899,#8b5cf6 58%,#38bdf8)}}
 .nav-item{{display:flex;align-items:center;min-height:44px;padding:0 14px;border-radius:12px;color:#3c4050;text-decoration:none;font-weight:650;margin-bottom:6px}} .nav-item:hover{{background:#f1edff}} .nav-item.active{{background:#ddd5ff;color:#201a38;box-shadow:inset 4px 0 0 #8b6cf6}}
 .content{{min-width:0;min-height:100vh;padding:18px 22px 22px}} .page-panel,.page-section{{display:none}} .page-panel.active{{display:block}} .page-panel[data-page="monitor"].active{{height:100%}} .page-section.active{{display:grid}} .page-section.hero-card.active{{display:flex}}
 .card{{position:relative;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 22px;background:#fff;border:1px solid #edf0f5;border-radius:18px;padding:22px;margin-bottom:18px;box-shadow:var(--shadow)}} .card::before{{content:"";position:absolute;inset:0 0 auto;height:3px;background:linear-gradient(90deg,#8b6cf6,#60a5fa,transparent);opacity:.55}} .hero-card{{justify-content:space-between;align-items:center}} h2{{grid-column:1/-1;margin:0 0 4px;font-size:18px}} .section-sub{{margin:0;color:var(--muted);font-size:13px}}
-.field{{display:grid;grid-template-columns:160px minmax(160px,1fr);gap:6px 14px;align-items:center;min-height:74px;padding:12px 14px;border:1px solid var(--line);border-radius:14px;background:#fff}} .field p{{margin:0;color:var(--muted);font-size:12px}} label{{font-weight:650}} input[type=text],input[type=password],input[type=number],select{{width:100%;padding:11px 12px;border:1px solid #cbd7e5;border-radius:12px;outline:none;background:#fff;color:var(--text);font-size:14px}} input[type=checkbox]{{width:16px;height:16px;accent-color:var(--primary)}} .password-wrap{{position:relative}} .password-wrap input{{padding-right:50px}} .eye-btn{{position:absolute;right:7px;top:50%;transform:translateY(-50%);width:34px;min-width:34px;height:34px;padding:0;border-radius:11px;background:#e2e8f0;border:1px solid #94a3b8;color:#334155;box-shadow:0 3px 10px rgba(15,23,42,.12)}} .eye-btn::before{{content:"";position:absolute;left:8px;top:12px;width:16px;height:9px;border:2px solid #334155;border-radius:18px 18px 12px 12px;transform:rotate(-6deg)}} .eye-btn::after{{content:"";position:absolute;left:14px;top:15px;width:6px;height:6px;border-radius:50%;background:#2563eb}} .eye-btn.is-visible{{background:#dbeafe;border-color:#60a5fa}} .eye-btn.is-visible::before{{border-color:#1d4ed8}} .eye-btn.is-visible::after{{left:8px;top:16px;width:19px;height:2px;border-radius:2px;background:#1d4ed8;transform:rotate(-42deg)}}
+.field{{display:grid;grid-template-columns:160px minmax(160px,1fr);gap:6px 14px;align-items:center;min-height:74px;padding:12px 14px;border:1px solid var(--line);border-radius:14px;background:#fff}} .field p{{margin:0;color:var(--muted);font-size:12px}} .autofill-trap{{position:absolute;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none}} label{{font-weight:650}} input[type=text],input[type=password],input[type=number],select{{width:100%;padding:11px 12px;border:1px solid #cbd7e5;border-radius:12px;outline:none;background:#fff;color:var(--text);font-size:14px}} input[type=checkbox]{{width:16px;height:16px;accent-color:var(--primary)}} .password-wrap{{position:relative}} .password-wrap input{{padding-right:50px}} .eye-btn{{position:absolute;right:7px;top:50%;transform:translateY(-50%);width:34px;min-width:34px;height:34px;padding:0;border-radius:11px;background:#e2e8f0;border:1px solid #94a3b8;color:#334155;box-shadow:0 3px 10px rgba(15,23,42,.12)}} .eye-btn::before{{content:"";position:absolute;left:8px;top:12px;width:16px;height:9px;border:2px solid #334155;border-radius:18px 18px 12px 12px;transform:rotate(-6deg)}} .eye-btn::after{{content:"";position:absolute;left:14px;top:15px;width:6px;height:6px;border-radius:50%;background:#2563eb}} .eye-btn.is-visible{{background:#dbeafe;border-color:#60a5fa}} .eye-btn.is-visible::before{{border-color:#1d4ed8}} .eye-btn.is-visible::after{{left:8px;top:16px;width:19px;height:2px;border-radius:2px;background:#1d4ed8;transform:rotate(-42deg)}}
 .switch{{display:inline-flex;width:46px;height:26px;border-radius:999px;background:#cbd5e1;position:relative}} .switch input{{opacity:0}} .switch span{{position:absolute;width:20px;height:20px;left:3px;top:3px;border-radius:50%;background:white;box-shadow:0 2px 8px rgba(15,23,42,.22)}} .switch:has(input:checked){{background:linear-gradient(135deg,#8b6cf6,#5b8cff)}} .switch:has(input:checked) span{{transform:translateX(20px)}}
-.checks{{display:flex;gap:14px;flex-wrap:wrap}} .check-tile{{display:inline-flex;align-items:center;gap:9px;padding:13px 16px;border-radius:14px;background:#f8fafc;border:1px solid var(--line);cursor:pointer}} .check-tile:has(input:checked){{background:#efeaff;border-color:#a78bfa;color:#4c1d95}}
+.checks{{display:flex;gap:14px;flex-wrap:wrap;align-items:stretch;width:100%;grid-column:1/-1}} .check-tile{{display:inline-flex;align-items:center;gap:10px;padding:10px 12px 10px 14px;border-radius:14px;background:#f8fafc;border:1px solid var(--line)}} .check-tile label{{display:inline-flex;align-items:center;gap:9px;cursor:pointer;margin:0;font-weight:650}} .check-tile:has(input:checked){{background:#efeaff;border-color:#a78bfa;color:#4c1d95}} .check-tile-custom{{padding-right:8px}} .inst-remove-btn{{min-width:auto!important;width:auto!important;height:30px!important;padding:0 10px!important;border-radius:10px!important;border:1px solid #fecaca!important;background:#fff5f5!important;color:#b91c1c!important;font-size:12px!important;font-weight:650!important;line-height:1!important;box-shadow:none!important}} .inst-remove-btn:hover{{background:#fee2e2!important;border-color:#f87171!important;color:#991b1b!important}} .add-inst-field{{width:100%;grid-column:1/-1;display:grid;grid-template-columns:160px minmax(160px,1fr);gap:6px 14px;align-items:start;padding:12px 14px;border:1px solid var(--line);border-radius:14px;background:#fff;margin-top:4px}} .add-inst-field label{{font-weight:650;padding-top:11px}} .add-inst-row{{display:flex;gap:10px;align-items:center}} .add-inst-row input{{flex:1}} .add-inst-row button{{min-width:88px}} .inst-feedback{{margin:0;color:var(--muted);font-size:12px;white-space:pre-wrap}} .inst-feedback.is-error{{color:#b91c1c}} .inst-feedback.is-ok{{color:#047857}}
 .actions{{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap;position:sticky;bottom:0;margin-top:20px;padding:14px;border-radius:18px;background:rgba(255,255,255,.9);border:1px solid rgba(255,255,255,.9);box-shadow:var(--shadow);backdrop-filter:blur(12px)}} .action-group,.toolbar-right,.toolbar-left{{display:flex;align-items:center;gap:10px;flex-wrap:wrap}}
 button,.button{{border:0;border-radius:12px;padding:11px 16px;background:#f1f3f8;color:#263449;min-width:94px;justify-content:center;white-space:nowrap;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;font-size:14px;font-weight:650;transition:background .18s ease,color .18s ease,box-shadow .18s ease,transform .18s ease,opacity .18s ease}} button:disabled,.button.disabled{{cursor:not-allowed;opacity:.72}} .btn-save,.btn-log{{background:#ede9fe;color:#5b21b6}} .btn-run{{background:#dcfce7;color:#047857}} .btn-run.is-running{{background:linear-gradient(135deg,#ef4444,#f97316);color:#fff;box-shadow:0 10px 26px rgba(239,68,68,.24)}} .btn-run.is-starting{{background:linear-gradient(135deg,#60a5fa,#8b5cf6);color:#fff;box-shadow:0 10px 26px rgba(99,102,241,.25)}} .btn-danger{{background:#fee2e2;color:#b91c1c}} .btn-danger.is-ready{{background:#ef4444;color:#fff;box-shadow:0 10px 26px rgba(239,68,68,.22)}} .btn-test{{background:#e0f2fe;color:#0369a1}} .btn-view{{background:#f1f5f9;color:#334155}}
-.toolbar-card{{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:16px}} .toolbar-card::before{{display:none}} .coin-tabs{{display:inline-flex;gap:8px;padding:4px;border-radius:14px;background:#f1f5f9;border:1px solid #e2e8f0}} .coin-tab.active{{background:#8b6cf6;color:#fff}} .empty-coin{{display:inline-flex;align-items:center;padding:0 12px;color:#64748b;font-size:13px;font-weight:650}}
-	.market-card{{background:#242424;border:1px solid #3a3a3a;border-radius:18px;margin:0;padding:18px 20px 16px;color:#f8fafc;box-shadow:0 12px 34px rgba(15,23,42,.16);overflow:hidden;height:calc(100vh - 40px);display:flex;flex-direction:column}} .monitor-card{{height:calc(100vh - 188px);min-height:520px}} .market-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:12px}} .market-title{{font-size:18px;font-weight:800;margin-bottom:4px}} .market-sub{{color:#a3a3a3;font-size:12px}} .market-price{{text-align:right}} .market-price strong{{display:block;font-size:24px;line-height:1.1}} .market-price span{{font-size:13px;color:#94a3b8}} .market-price.up span{{color:#fb7185}} .market-price.down span{{color:#22c55e}} .market-canvas-wrap{{position:relative;flex:1;min-height:0;border-top:1px solid #393939;background:linear-gradient(rgba(255,255,255,.055) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);background-size:100% 72px,72px 100%}} canvas{{width:100%;height:100%;display:block;cursor:grab}} canvas.dragging{{cursor:grabbing}} .market-loading{{position:absolute;inset:0;display:grid;place-items:center;color:#a3a3a3;pointer-events:none}} .snapshot-panel{{position:absolute;left:16px;top:16px;z-index:2;min-width:260px;max-width:min(500px,calc(100% - 32px));max-height:calc(100% - 32px);overflow:auto;padding:10px 12px;border-radius:12px;background:rgba(15,23,42,.62);border:1px solid rgba(148,163,184,.20);box-shadow:0 12px 28px rgba(0,0,0,.18);backdrop-filter:blur(8px);font-size:12px;line-height:1.35;color:#dbeafe;pointer-events:none}} .snapshot-panel strong{{display:block;color:#fff;font-size:13px;margin-bottom:5px}} .snapshot-grid{{display:grid;grid-template-columns:68px minmax(0,1fr);gap:3px 8px;align-items:start}} .snapshot-grid span{{color:#9ca3af}} .snapshot-grid b{{font-weight:700;color:#e5e7eb;word-break:break-word}} .market-time-range{{margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.08);color:#a3a3a3;font-size:12px;display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}} #monitorPaperAccount.paper-up{{color:#4ade80}} #monitorPaperAccount.paper-down{{color:#fb7185}}
-	.log-window{{width:100%;min-height:220px;height:34vh;max-height:46vh;resize:vertical;border:1px solid #dbe4ef;border-radius:16px;padding:16px;background:#0f172a;color:#d1fae5;font-family:Consolas,"Courier New",monospace;font-size:13px;line-height:1.55;white-space:pre}} .log-window-console{{background:#111827;color:#e5e7eb}} .log-panel{{display:block;margin-bottom:14px}} .log-panel h3{{margin:0 0 6px;font-size:16px;color:#111827}} .log-panel p{{margin:0 0 10px;color:#64748b;font-size:12px}} .notice{{background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0;padding:13px 15px;border-radius:14px;margin-bottom:16px}} .notice-error{{background:#fee2e2;color:#991b1b;border-color:#fecaca}}
+.toolbar-card{{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:16px}} .toolbar-card::before{{display:none}} .logs-toolbar-card{{align-items:flex-start}} .logs-toolbar-card .toolbar-right{{align-items:center;justify-content:flex-end;flex-wrap:wrap;row-gap:8px}} .coin-tabs{{display:inline-flex;gap:8px;padding:4px;border-radius:14px;background:#f1f5f9;border:1px solid #e2e8f0}} .coin-tab.active{{background:#8b6cf6;color:#fff}} .empty-coin{{display:inline-flex;align-items:center;padding:0 12px;color:#64748b;font-size:13px;font-weight:650}} .bar-tabs{{display:inline-flex;gap:6px;flex-wrap:wrap;padding:4px;border-radius:12px;background:#2a2a2a;border:1px solid #404040;margin-top:8px}} .bar-tab{{min-width:42px;padding:7px 10px;font-size:12px;background:transparent;color:#cbd5e1;border:0;box-shadow:none}} .bar-tab.active{{background:#8b6cf6;color:#fff}}
+	.market-card{{background:#242424;border:1px solid #3a3a3a;border-radius:18px;margin:0;padding:18px 20px 16px;color:#f8fafc;box-shadow:0 12px 34px rgba(15,23,42,.16);overflow:hidden;height:calc(100vh - 40px);display:flex;flex-direction:column}} .monitor-card{{height:calc(100vh - 188px);min-height:520px}} .monitor-toolbar-card{{align-items:flex-start}} .monitor-toolbar-card .toolbar-right{{align-items:center;justify-content:flex-end;flex-wrap:wrap;row-gap:8px;gap:10px}} .monitor-chart-off .snapshot-panel{{display:none}} .monitor-chart-off .bar-tabs,.monitor-chart-off .market-price{{opacity:.45;pointer-events:none}} .monitor-chart-off-hint{{margin:0 0 14px}} .market-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:12px}} .market-title{{font-size:18px;font-weight:800;margin-bottom:4px}} .market-sub{{color:#a3a3a3;font-size:12px}} .market-price{{text-align:right}} .market-price strong{{display:block;font-size:24px;line-height:1.1}} .market-price span{{font-size:13px;color:#94a3b8}} .market-price.up span{{color:#fb7185}} .market-price.down span{{color:#22c55e}} .market-canvas-wrap{{position:relative;flex:1;min-height:0;border-top:1px solid #393939;background:linear-gradient(rgba(255,255,255,.055) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);background-size:100% 72px,72px 100%}} canvas{{width:100%;height:100%;display:block;cursor:grab}} canvas.dragging{{cursor:grabbing}} .market-loading{{position:absolute;inset:0;display:grid;place-items:center;color:#a3a3a3;pointer-events:none}} .snapshot-panel{{position:absolute;left:16px;top:16px;z-index:2;min-width:260px;max-width:min(500px,calc(100% - 32px));max-height:calc(100% - 32px);overflow:auto;padding:10px 12px;border-radius:12px;background:rgba(15,23,42,.62);border:1px solid rgba(148,163,184,.20);box-shadow:0 12px 28px rgba(0,0,0,.18);backdrop-filter:blur(8px);font-size:12px;line-height:1.35;color:#dbeafe;pointer-events:none}} .snapshot-panel strong{{display:block;color:#fff;font-size:13px;margin-bottom:5px}} .snapshot-grid{{display:grid;grid-template-columns:68px minmax(0,1fr);gap:3px 8px;align-items:start}} .snapshot-grid span{{color:#9ca3af}} .snapshot-grid b{{font-weight:700;color:#e5e7eb;word-break:break-word}} .snapshot-note{{margin-top:8px;padding:8px 10px;border-radius:10px;background:rgba(255,255,255,.06);color:#cbd5e1;font-size:12px;line-height:1.45;word-break:break-word}} .market-time-range{{margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.08);color:#a3a3a3;font-size:12px;display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}} #monitorPaperAccount.paper-up{{color:#4ade80}} #monitorPaperAccount.paper-down{{color:#fb7185}}
+	.log-window{{width:100%;min-height:340px;height:100%;resize:vertical;border:1px solid #dbe4ef;border-radius:16px;padding:16px;background:#0f172a;color:#d1fae5;font-family:Consolas,"Courier New",monospace;font-size:13px;line-height:1.55;white-space:pre;box-sizing:border-box}} .log-window-console{{background:#111827;color:#e5e7eb}} .logs-card{{display:block;padding:18px 20px 20px}} .logs-card::before{{opacity:.35}} .logs-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px 18px;align-items:stretch}} .log-panel{{display:flex;flex-direction:column;min-height:560px;margin:0}} .log-panel h3{{margin:0 0 8px;font-size:16px;color:#111827}} .log-panel-desc{{min-height:4.6em;margin:0 0 12px;color:#64748b;font-size:12px;line-height:1.5}} .log-panel-body{{flex:1 1 auto;display:flex;flex-direction:column;min-height:360px}} .log-panel-footer{{flex:0 0 auto;margin-top:12px}} .log-panel-footer .toolbar-card{{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0;padding:0;border:0;box-shadow:none;background:transparent}} .log-panel-footer .toolbar-card::before{{display:none}} .log-panel-footer .section-sub{{margin:0}} .accuracy-off-hint{{margin:0 0 14px}} .notice{{background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0;padding:13px 15px;border-radius:14px;margin-bottom:16px}} .notice-error{{background:#fee2e2;color:#991b1b;border-color:#fecaca}}
 	.help-panel{{display:grid;grid-template-columns:1fr;gap:16px}} .help-card{{display:block;line-height:1.68}} .help-card::before{{display:none}} .help-card h3{{margin:18px 0 8px;font-size:16px;color:#111827}} .help-card h3:first-child{{margin-top:0}} .help-card p{{margin:6px 0;color:#475569;font-size:13px}} .help-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}} .help-item{{border:1px solid #e2e8f0;border-radius:12px;padding:12px;background:#f8fafc}} .help-item strong{{display:block;margin-bottom:4px;color:#1f2937}} .help-list{{margin:8px 0 0;padding-left:18px;color:#475569;font-size:13px}} .help-list li{{margin:4px 0}} .help-table{{width:100%;border-collapse:collapse;margin-top:10px;font-size:13px}} .help-table th,.help-table td{{border:1px solid #e2e8f0;padding:9px 10px;text-align:left;vertical-align:top}} .help-table th{{background:#f1f5f9;color:#334155}} .help-note{{border-left:4px solid #8b6cf6;background:#f5f3ff;padding:10px 12px;border-radius:10px;color:#4c1d95;font-size:13px;margin-top:10px}} .flow-chain{{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0 4px}} .flow-chain span{{display:inline-flex;align-items:center;padding:8px 12px;border-radius:999px;background:#eef2ff;border:1px solid #c7d2fe;color:#3730a3;font-size:12px;font-weight:650}} .flow-chain span:not(:last-child)::after{{content:"→";margin-left:8px;color:#94a3b8;font-weight:400}} code{{background:#eef2ff;color:#4338ca;border-radius:6px;padding:1px 5px}}
-	.accuracy-card{{display:block}} .accuracy-controls{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0 12px}} .accuracy-controls select{{width:auto;min-width:150px}} .accuracy-controls .btn-save{{min-width:88px}} .accuracy-summary{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px}} .accuracy-summary div{{border:1px solid #e2e8f0;border-radius:12px;padding:10px;background:#f8fafc}} .accuracy-summary div.accuracy-primary{{border-color:#93c5fd;background:#eff6ff}} .accuracy-summary div.accuracy-paper-primary{{border-color:#86efac;background:#ecfdf5}} .accuracy-summary span{{display:block;color:#64748b;font-size:12px}} .accuracy-summary b{{display:block;margin-top:3px;font-size:18px;color:#111827}} .accuracy-canvas-wrap{{position:relative;height:320px;border:1px solid #e2e8f0;border-radius:14px;background:#0f172a;overflow:hidden}} .accuracy-canvas-wrap canvas{{width:100%;height:100%;cursor:grab}} .accuracy-canvas-wrap canvas.dragging{{cursor:grabbing}} .accuracy-point-panel{{position:absolute;left:12px;top:12px;z-index:2;min-width:240px;max-width:min(420px,calc(100% - 24px));max-height:calc(100% - 24px);overflow:auto;padding:10px 12px;border-radius:12px;background:rgba(15,23,42,.78);border:1px solid rgba(148,163,184,.28);box-shadow:0 12px 28px rgba(0,0,0,.22);backdrop-filter:blur(8px);font-size:12px;line-height:1.35;color:#dbeafe;pointer-events:none}} .accuracy-point-panel strong{{display:block;color:#fff;font-size:13px;margin-bottom:5px}} .accuracy-point-panel .snapshot-grid{{display:grid;grid-template-columns:72px minmax(0,1fr);gap:3px 8px;align-items:start}} .accuracy-point-panel .snapshot-grid span{{color:#9ca3af}} .accuracy-point-panel .snapshot-grid b{{font-weight:700;color:#e5e7eb;word-break:break-word}} .accuracy-note{{margin:10px 0 0;color:#64748b;font-size:12px}}
-	@media(max-width:860px){{.app{{grid-template-columns:1fr}}.sidebar{{position:relative;height:auto}}.card{{grid-template-columns:1fr}}.field{{grid-template-columns:1fr}}}}
-	</style></head><body><div class="app"><aside class="sidebar"><div class="brand"><span class="logo">O</span><span>OKX AI</span></div>
-	<a class="nav-item active" href="#monitor" data-page-link="monitor">监控</a><a class="nav-item" href="#config" data-page-link="config">配置</a><a class="nav-item" href="#logs" data-page-link="logs">日志</a><a class="nav-item" href="#tests" data-page-link="tests">测试</a><a class="nav-item" href="#design" data-page-link="design">流程设计</a><a class="nav-item" href="#help" data-page-link="help">帮助</a><a class="nav-item" href="#settings" data-page-link="settings">设置</a>
+	.accuracy-card{{display:block}} .accuracy-controls{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0 12px}} .accuracy-controls select{{width:auto;min-width:150px}} .accuracy-controls .btn-save{{min-width:88px}} .accuracy-summary{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px}} .accuracy-summary div{{border:1px solid #e2e8f0;border-radius:12px;padding:10px;background:#f8fafc}} .accuracy-summary div.accuracy-primary{{border-color:#93c5fd;background:#eff6ff}} .accuracy-summary div.accuracy-paper-primary{{border-color:#86efac;background:#ecfdf5}} .accuracy-summary span{{display:block;color:#64748b;font-size:12px}} .accuracy-summary b{{display:block;margin-top:3px;font-size:18px;color:#111827}} .accuracy-canvas-wrap{{position:relative;height:320px;border:1px solid #e2e8f0;border-radius:14px;background:#0f172a;overflow:hidden}} .accuracy-canvas-wrap canvas{{width:100%;height:100%;cursor:grab}} .accuracy-canvas-wrap canvas.dragging{{cursor:grabbing}} .accuracy-point-panel{{position:absolute;left:12px;top:12px;z-index:2;min-width:240px;max-width:min(420px,calc(100% - 24px));max-height:calc(100% - 24px);overflow:auto;padding:10px 12px;border-radius:12px;background:rgba(15,23,42,.78);border:1px solid rgba(148,163,184,.28);box-shadow:0 12px 28px rgba(0,0,0,.22);backdrop-filter:blur(8px);font-size:12px;line-height:1.35;color:#dbeafe;pointer-events:none}} .accuracy-point-panel strong{{display:block;color:#fff;font-size:13px;margin-bottom:5px}} .accuracy-point-panel .snapshot-grid{{display:grid;grid-template-columns:72px minmax(0,1fr);gap:3px 8px;align-items:start}} .accuracy-point-panel .snapshot-grid span{{color:#9ca3af}} .accuracy-point-panel .snapshot-grid b{{font-weight:700;color:#e5e7eb;word-break:break-word}} .accuracy-note{{margin:10px 0 0;color:#64748b;font-size:12px}} .ai-chat-card{{display:block;padding:18px 20px 20px}} .ai-chat-card::before{{opacity:.35}} .ai-chat-head{{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:12px}} .ai-chat-head .toolbar-right{{align-items:center;gap:8px;flex-wrap:wrap}} .ai-chat-window{{min-height:320px;max-height:480px;overflow-y:auto;border:1px solid #e2e8f0;border-radius:14px;background:#f8fafc;padding:14px;display:flex;flex-direction:column;gap:10px;margin-bottom:12px}} .ai-chat-empty{{color:#64748b;font-size:13px;text-align:center;padding:40px 12px;line-height:1.6}} .ai-chat-msg{{max-width:88%;padding:10px 12px;border-radius:14px;font-size:14px;line-height:1.55;white-space:pre-wrap;word-break:break-word}} .ai-chat-msg.user{{align-self:flex-end;background:#dbeafe;color:#1e3a8a;border-bottom-right-radius:4px}} .ai-chat-msg.assistant{{align-self:flex-start;background:#fff;color:#1f2937;border:1px solid #e2e8f0;border-bottom-left-radius:4px}} .ai-chat-msg.error{{align-self:stretch;background:#fee2e2;color:#991b1b;border:1px solid #fecaca}} .ai-chat-msg.pending{{align-self:flex-start;background:#eef2ff;color:#4338ca;font-style:italic}} .ai-chat-compose{{display:flex;gap:10px;align-items:flex-end}} .ai-chat-compose textarea{{flex:1;min-height:72px;max-height:180px;resize:vertical;border:1px solid #dbe4ef;border-radius:14px;padding:12px 14px;font-size:14px;line-height:1.5;font-family:inherit;box-sizing:border-box}} .ai-chat-compose .btn-test{{min-width:88px;align-self:stretch}} .ai-chat-usage{{margin-top:8px;padding-top:8px;border-top:1px solid #e2e8f0;color:#64748b;font-size:11px;text-align:right;line-height:1.4}} .diagnostic-export-card{{display:block;padding:18px 20px 20px;margin-bottom:16px}} .diagnostic-export-card::before{{opacity:.35}}
+	@media(max-width:860px){{.app{{grid-template-columns:1fr}}.sidebar{{position:relative;height:auto;min-height:auto}}.card{{grid-template-columns:1fr}}.field{{grid-template-columns:1fr}}.logs-grid{{grid-template-columns:1fr}}.log-panel{{min-height:420px}}}}
+	</style></head><body><div class="app"><aside class="sidebar"><div class="sidebar-main"><div class="brand"><span class="logo">O</span><span>OKX AI</span></div>
+	<a class="nav-item active" href="#monitor" data-page-link="monitor">监控</a><a class="nav-item" href="#config" data-page-link="config">配置</a><a class="nav-item" href="#logs" data-page-link="logs">日志</a><a class="nav-item" href="#tests" data-page-link="tests">测试</a><a class="nav-item" href="#design" data-page-link="design">设计</a><a class="nav-item" href="#help" data-page-link="help">帮助</a><a class="nav-item" href="#settings" data-page-link="settings">设置</a></div>
+	<div class="sidebar-footer"><div class="sidebar-footer-panel"><div class="sidebar-footer-power"><button class="power-btn" type="button" id="powerMenuBtn" title="电源管理" aria-label="电源管理" aria-haspopup="true" aria-expanded="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"><path d="M12 3v8"/><path d="M8.4 5.5a7 7 0 1 0 7.2 0"/></svg></button><span class="power-btn-label">电源管理</span><span class="power-btn-chevron" aria-hidden="true">›</span><div class="power-menu" id="powerMenu" hidden><button type="button" id="powerRestartBtn"><span>重启控制台</span><span class="power-menu-desc">{esc(power_menu_restart_hint)}</span></button><button type="button" class="danger" id="powerShutdownBtn"><span>关机</span><span class="power-menu-desc">{esc(power_menu_shutdown_hint)}</span></button></div></div><div class="power-mode-hint">{esc(power_mode_hint)}</div><div class="sidebar-version"><span class="sidebar-version-name">{esc(APP_NAME)}</span><span class="sidebar-version-tag">v{esc(APP_VERSION)}</span></div></div></div>
 </aside><div class="content"><main>
 {notice_html}
 <form class="config-form" method="post" action="/save#config">{''.join(rows)}<div class="actions config-actions" data-page-actions="config"><div class="action-group"><button class="action-control btn-save" type="button" id="saveConfigBtn">另存为配置</button><button class="action-control btn-save" type="button" id="importConfigBtn">导入配置</button><a class="button action-control btn-save" href="/config-json#config">查看配置</a></div></div></form>
-<form class="settings-form" method="post" action="/save-auth#settings"><section class="card page-panel" data-page="settings"><h2>登录账号</h2><div class="field"><label>用户名</label><div><input type="text" name="auth_username" value="{esc(auth.get("username","admin"))}"><p>Web控制台登录用户名。</p></div></div><div class="field"><label>新密码</label><div><div class="password-wrap"><input type="password" name="auth_password" placeholder="留空则不修改"><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>建议首次部署后立即修改默认密码。</p></div></div></section><div class="actions settings-actions" data-page-actions="settings"><div class="action-group"><button class="action-control btn-save" type="submit">保存账号密码</button><a class="button action-control btn-view" href="/logout">切换账号</a><a class="button action-control btn-danger" href="/logout">退出登录</a></div></div></form>
-<div class="page-panel active" data-page="monitor"><section class="card toolbar-card"><div><h2>实时监控</h2><p class="section-sub">未启动时显示虚拟行情；启动后读取真实日志。下方<strong>模拟账户</strong>按 final_direction 满仓跟单（会话 $10,000 重置），非真实成交。</p></div><div class="toolbar-right"><div class="coin-tabs">{monitor_tabs}</div><button class="button btn-run action-control" type="button" id="monitorToggleBtn">开始监控</button></div></section><section class="market-card monitor-card"><div class="market-head"><div><div class="market-title" id="monitorTitle">{esc(monitor_initial or "未配置币种")} 实时走势</div><div class="market-sub" id="monitorMeta">{esc("虚拟行情预览 · 启动监控后自动切换真实数据" if monitor_initial else "请先在配置页选择监控币种")}</div></div><div class="market-price" id="monitorPrice"><strong>--</strong><span>生成模拟行情</span></div></div><div class="market-canvas-wrap"><canvas id="monitorChart"></canvas><div class="market-loading" id="monitorLoading">正在生成虚拟走势...</div><div class="snapshot-panel" id="snapshotPanel"><strong>Snapshot</strong><div class="snapshot-grid"><span>价格</span><b>--</b><span>时间</span><b>--</b><span>评分</span><b>--</b><span>方向</span><b>--</b></div></div></div><div class="market-time-range"><span id="monitorUptime">已监控：未启动</span><span id="monitorPaperAccount">模拟账户：--</span><span id="monitorPointCount">数据点：0</span></div></section></div>
-	<div class="page-panel" data-page="logs"><section class="card toolbar-card"><div><h2>实时日志</h2><p class="section-sub">默认关闭写入以节省资源。打开「写入分析日志」后，监控进程才会输出 JSON 与控制台摘要；下方窗口仅显示本次启动后的内容。</p></div><div class="toolbar-right"><label class="switch" title="写入分析日志"><input type="checkbox" id="analysisLogSwitch" {"checked" if config.get("analysis_log_enabled") else ""}><span></span></label><span class="section-sub" id="analysisLogSwitchHint" style="margin:0;">{"已开启" if config.get("analysis_log_enabled") else "已关闭"} · 保存后需重启监控</span><button class="button btn-log" type="button" id="refreshLogBtn">刷新全部</button><button class="button btn-log" type="button" id="openLogDirBtn">打开日志目录</button></div></section><section class="card" style="display:block;"><div class="log-panel"><h3>JSON 分析日志</h3><p>Web 图表/压测依赖的完整分析记录，默认保存：{esc(MONITOR_JSON_LOG_FILE)}</p><textarea class="log-window" id="logWindow" readonly>正在加载日志...</textarea><div class="toolbar-card" style="margin:12px 0 0;box-shadow:none;"><div><p class="section-sub" id="saveLogHint">可另存为 .jsonl 文件，便于回放与统计。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveLogBtn">另存为文件</button></div></div></div><div class="log-panel"><h3>控制台日志</h3><p>监控进程精简调试输出（信号摘要、推送结果、错误）；详细重试日志需设置 CONSOLE_VERBOSE=1，默认保存：{esc(MONITOR_PROCESS_LOG_FILE)}</p><textarea class="log-window log-window-console" id="consoleLogWindow" readonly>正在加载控制台日志...</textarea><div class="toolbar-card" style="margin:12px 0 0;box-shadow:none;"><div><p class="section-sub" id="saveConsoleLogHint">可另存为 .log 文件，便于快速排查信号与推送。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearConsoleLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveConsoleLogBtn">另存为文件</button></div></div></div></section></div>
-	<div class="page-panel" data-page="tests"><section class="card toolbar-card"><div><h2>连通性测试</h2><p class="section-sub">测试 AI 接口和微信推送（Server酱）配置是否可用。点击后会先保存当前配置页中的密钥，再发起测试；<strong>测试微信推送</strong>会发送与真实监控相同结构的格式预览（模拟 AI 全字段示例）。</p></div><div class="toolbar-right"><button class="button action-control btn-test" type="button" id="testAiBtn">测试AI</button><button class="button action-control btn-test" type="button" id="testPushBtn">测试微信推送</button></div></section><div id="connectivityTestNotice" class="notice" hidden></div><section class="card accuracy-card"><h2>实时预测压测</h2><p class="section-sub">顶部<strong>模拟账户</strong>按 final_direction 从 $10,000 满仓跟单（方向变才换仓）；绿线为权益曲线。下方为分层预测准确度；短线建议验证窗 15–20 分钟。</p><div class="accuracy-controls"><select id="accuracyInst"><option value="BTC-USDT-SWAP">BTC-USDT-SWAP</option><option value="ETH-USDT-SWAP">ETH-USDT-SWAP</option></select><select id="accuracyHorizon"><option value="5">5秒 · 轮询级</option><option value="15">15秒</option><option value="30">30秒</option><option value="60">1分钟</option><option value="180">3分钟</option><option value="300">5分钟</option><option value="900">15分钟 · 短线推荐</option><option value="1200">20分钟 · 短线结构</option></select><select id="accuracyScope"><option value="session">本次启动后</option><option value="replay">回放会话</option><option value="all">全部历史日志</option></select><select id="accuracyRetentionHours" title="结合配置页轮询间隔计算图表最多保留多少点"><option value="1">保留1小时</option><option value="2">保留2小时</option><option value="4">保留4小时</option><option value="8">保留8小时</option><option value="12" selected>保留12小时</option><option value="24">保留24小时</option><option value="48">保留48小时</option></select><button class="btn-test" type="button" id="accuracyRefreshBtn">刷新压测</button><button class="btn-save" type="button" id="accuracyExportBtn">导出图表</button><button class="btn-save" type="button" id="accuracyImportBtn">导入图表</button><button class="btn-test" type="button" id="accuracyLiveBtn" style="display:none">返回实时</button><input type="file" id="accuracyImportInput" accept=".json,application/json" hidden></div><div class="accuracy-summary" id="accuracySummary"><div><span>可靠性等级</span><b>--</b></div><div><span>已验证/日志</span><b>--</b></div><div><span>决策合理率</span><b>--</b></div><div><span>相对观望基准</span><b>--</b></div></div><div class="accuracy-canvas-wrap"><canvas id="accuracyChart"></canvas><div class="accuracy-point-panel" id="accuracyPointPanel" hidden></div></div><p class="accuracy-note" id="accuracyNote">观望：后续波动未超阈值即合理（错失机会记红点）。交易：验证窗内价格朝做多/做空方向走即方向命中；入场/止盈/止损仅在较长验证窗下有参考价值。</p></section><section class="card"><h2>离线回放压测</h2><p class="section-sub">配置页勾选「录制回放数据集」并运行监控，每轮原始输入写入 {esc(REPLAY_DATASET_FILE)}；停止监控后点击下方「开始回放」启动子进程，结果写入 {esc(REPLAY_ANALYSIS_LOG_FILE)}，再选上方「回放会话」查看压测曲线。</p><div class="replay-status" id="replayDatasetInfo">正在加载数据集状态...</div><div class="field"><label>回放间隔(秒)</label><div><input type="number" id="replayInterval" value="0" min="0" max="120" step="0.1"><p>0 表示尽快跑完；大于 0 可在回放过程中观察压测曲线刷新。</p></div></div><div class="field"><label>控制</label><div><div class="toolbar-right" style="justify-content:flex-start;gap:8px;"><button class="btn-test" type="button" id="replayStartBtn">开始回放</button><button class="btn-danger action-control" type="button" id="replayStopBtn">停止回放</button><button class="button btn-log" type="button" id="replayRefreshBtn">刷新状态</button></div><p id="replayStatusText">等待加载...</p></div></div></section></div>
-	<div class="page-panel" data-page="help"><section class="card toolbar-card"><div><h2>帮助</h2><p class="section-sub">系统架构、指标含义、界面字段、推送规则与压测说明。详细流程见「流程设计」页。</p></div><div class="toolbar-right"><a class="button btn-view" href="#design">查看流程设计</a></div></section><div class="help-panel">
-	<section class="card help-card"><h2>系统架构与决策边界</h2>
-	<p>每轮监控按「采集 → 检测 → 本地评分 → AI 触发 →（可选）AI 分析 → merge → 跟踪 → 推送 → 写日志」执行。三层职责如下：</p>
-	<table class="help-table"><thead><tr><th>层级</th><th>做什么</th><th>看什么字段</th></tr></thead><tbody>
-	<tr><td>本地规则</td><td>发现异常信号、给出参考方向/分数/价位、决定是否调用 AI（L0–L3）</td><td><code>signals</code>、<code>score</code>、<code>local_trigger</code></td></tr>
-	<tr><td>AI</td><td>L2/L3 被触发时做深分析；本地分仅作参考</td><td><code>analysis</code></td></tr>
-	<tr><td>最终结论</td><td>推送、Web 图表、压测、信号跟踪的统一依据</td><td><code>final_decision</code></td></tr>
-	</tbody></table>
-	<ul class="help-list"><li>L0/L1 不调 AI；L1 最多推 watch，不推 trade。</li><li>AI 返回有效 JSON 时，<code>decision_source=ai</code>；已调 AI 但失败时为 <code>local_fallback</code>。</li><li>推送读 <code>final_decision.push_recommendation</code> + <code>confidence</code>；trade/watch/spike 通道默认全开，Web 只需配 push_score 与是否启用推送。</li></ul>
-	<div class="help-note">监控页 Snapshot 与压测曲线已通过 <code>final_decision</code> 展示方向与置信度；日志里仍保留 <code>score</code> 便于对比 AI 与本地差异。</div>
-	</section>
-	<section class="card help-card"><h2>采集参数、计算指标与评分产出</h2>
-	<h3>采集的数据</h3><div class="help-grid">
-	<div class="help-item"><strong>行情与K线</strong><p>只监控 BTC-USDT-SWAP、ETH-USDT-SWAP。每轮采集 ticker、买卖一档、1m/3m/5m/15m/1H/4H K线；每个周期请求最近 <code>200</code> 根，字段包括时间、开高低收、成交量、是否收盘。</p></div>
-	<div class="help-item"><strong>合约资金数据</strong><p>采集 Open Interest、资金费率、5m账户多空比。OI和资金费率按约 <code>60s</code> 一个有效样本保存，保留约 <code>3小时</code>，用于计算15分钟变化和资金状态。</p></div>
-	<div class="help-item"><strong>盘口数据</strong><p>采集前20档订单簿，计算 top5/top20 买卖量、盘口不平衡、价差百分比。盘口缓存约5秒，只作为入场确认和风险修正，不单独决定方向。</p></div>
-	<div class="help-item"><strong>运行内统计</strong><p>成交量倍数、ATR百分比、盘口不平衡按约60秒采样，保留约3小时，用分位数生成动态阈值；信号结算样本写入 <code>build/runtime_logs/signal_performance.jsonl</code>。</p></div>
-	</div>
-	<h3>计算的技术指标</h3><table class="help-table"><thead><tr><th>类别</th><th>指标</th><th>用途</th></tr></thead><tbody>
-	<tr><td>趋势</td><td>EMA9/20/60/120、MA120、结构高低点、ADX/+DI/-DI</td><td>判断趋势排列、趋势强度、短中周期是否共振，以及是否处于震荡弱趋势。</td></tr>
-	<tr><td>动量</td><td>RSI6/14/24、MACD、KDJ、K线实体占比、RSI背离</td><td>判断动能是否增强、过热、衰减或背离；KDJ用于短线入场时机确认。</td></tr>
-	<tr><td>波动</td><td>ATR、ATR%、布林带、布林带宽度</td><td>识别高波动、低波动、挤压蓄势；入场区、止损、止盈根据ATR和结构位生成。</td></tr>
-	<tr><td>量价</td><td>已收盘1m放量倍数、成交量方向、近5根量能趋势</td><td>判断突破或回踩是否有成交量确认，避免只看价格方向。</td></tr>
-	<tr><td>合约资金</td><td>OI 15m变化、资金费率、资金费率变化、多空比</td><td>判断新增仓、平仓、拥挤、过热和反身性风险。</td></tr>
-	<tr><td>数据质量</td><td>确认K线数量、EMA120/MACD/ADX/RSI ready</td><td>用于判断当前周期指标是否足够可靠；15m确认K线少于35根会降低趋势和动量评分。</td></tr>
-	</tbody></table>
-	<h3>评分体系（本地参考分 score）</h3><p>按配置页<strong>策略周期</strong>走 <code>_raw_direction_for_mode</code>，再经 guard、入场质量降级，最后由<strong>当前策略的 strategy_view</strong> 覆盖 <code>final_direction</code>（无 direction_guard 时）。观察分 <code>raw_total_score</code> 按 strategy_mode 的 score_weights 加权；交易分仅在最终方向为做多/做空时有值。推送以 merge 后的 <code>final_decision</code> 为准。</p>
-	<ul class="help-list"><li><code>market_regime_score</code>：趋势、震荡、挤压、高波动等市场状态。</li><li><code>trend_score</code>：EMA/ADX/结构突破/多周期一致性。</li><li><code>momentum_score</code>：RSI、MACD、KDJ、背离和动能。</li><li><code>volume_price_score</code>：放量、量价方向、突破量能确认。</li><li><code>derivatives_score</code>：OI+价格组合、资金费率、多空拥挤。</li><li><code>orderbook_score</code>：top5/top20盘口支持和价差风险。</li><li><code>entry_quality_score</code>：价格距离EMA/ATR、入场区和等待确认。</li><li><code>risk_control_score</code>：资金费率、拥挤、高波动、背离、数据质量等风险控制。</li></ul>
-	<div class="help-note">可靠性判断：指标越多不是越可靠，关键看数据质量、周期共振、量价确认、资金数据是否同向，以及是否触达入场区。系统给出的是观察和风险提示，不是自动交易指令；OI/资金费率刚启动不足15分钟时会降低变化类信号权重。<strong>15m 方向以 trend_profiles 为准</strong>，急涨时 profile 转 <code>up</code> 往往晚于 1m/5m。</div>
-	</section>
-	<section class="card help-card"><h2>策略周期与确认严格度（配置页）</h2>
-	<p>两项配置正交：<strong>策略周期</strong>决定看哪些 K 线、如何给方向；<strong>确认严格度</strong>决定动量阈值高低、降级分数门槛与部分 guard 规则。日志里三种 <code>strategy_views</code> 每轮都会算，但只有当前选中的 mode 会覆盖 <code>final_direction</code>。</p>
-	<h3>策略周期</h3><table class="help-table"><thead><tr><th>模式</th><th>时间尺度</th><th>给做多的典型条件（概要）</th></tr></thead><tbody>
-	<tr><td>超短线 scalp</td><td>5–10 分钟 / 持仓 3–15 分钟</td><td>5m 或 10m 脉冲；1m/3m/5m 投票；15m profile 强反向时不追小脉冲</td></tr>
-	<tr><td>短线 short（推荐）</td><td>20 分钟结构 / 持仓 15 分钟–数小时</td><td>5m+15m profile 均 up；或 20m 延伸且 15m 已 up；标准模式不靠单 pressure</td></tr>
-	<tr><td>中线 swing</td><td>30–60 分钟+ / 持仓数小时–数天</td><td>1H+4H 同向；或 1H+15m 转多且 4H 不空；30–60m 动量（15m 可 mixed）</td></tr>
-	</tbody></table>
-	<h3>确认严格度</h3><table class="help-table"><thead><tr><th>档位</th><th>适用场景</th><th>要点</th></tr></thead><tbody>
-	<tr><td>保守</td><td>宁可错过、少假信号</td><td>动量阈值 ×1.15；保留方向需更高分；短线 neutral 要 5m+15m 双票</td></tr>
-	<tr><td>标准</td><td>默认平衡</td><td>短线 wait_confirmation 约 ≥60 分可保留方向；neutral 要 1 票</td></tr>
-	<tr><td>激进</td><td>更早给方向</td><td>阈值更低；短线可凭短窗 pressure 给方向；scalp guard 最松</td></tr>
-	</tbody></table>
-	<div class="help-note">急拉行情：15m profile 未转 <code>up</code> 时，短线与中线都会长时间观望——这是结构确认设计，不是 bug。要吃 5–10 分钟脉冲请选<strong>超短线</strong>作主策略。</div>
-	</section>
-	<section class="card help-card"><h2>模拟跟单账户（监控页 + 压测页）</h2>
-	<ul class="help-list">
-	<li>每次<strong>开始监控</strong>、<strong>离线回放</strong>或压测范围切换时，虚拟账户从该范围内首条日志起算 <strong>$10,000</strong>。</li>
-	<li>按 <code>final_direction</code> 满仓跟单：做多/做空持仓，观望为空仓；仅在<strong>方向变化</strong>时换仓。</li>
-	<li><strong>测试页</strong>：顶部绿底「模拟账户」卡片 + 图表<strong>绿线</strong>为权益曲线；监控页底部也会显示当前权益。</li>
-	<li>1x、不计手续费；非真实成交，仅用于感受策略表现。</li>
-	</ul>
-	</section>
-	<section class="card help-card"><h2>压测图表说明（测试页）</h2>
-	<ul class="help-list">
-	<li><strong>模拟账户($10k)</strong>：绿底卡片与绿线权益曲线，按 final_direction 跟单。</li>
-	<li><strong>综合预测准确度</strong>：观望 + 交易方向命中；图表绿/红点与此一致。</li>
-	<li><strong>蓝线</strong>价格、<strong>黄线</strong>预测方向累计；长时段顶部显示抽稀信息。</li>
-	</ul>
-	</section>
-	<section class="card help-card"><h2>界面字段、推送与日志解读</h2>
-	<h3>走势图 Snapshot（读 final_decision）</h3><table class="help-table"><thead><tr><th>字段</th><th>含义</th><th>解读方式</th></tr></thead><tbody>
-	<tr><td>方向</td><td><code>final_decision.direction</code></td><td>权威结论；本地 <code>raw_direction → final_direction</code> 仅作对比参考。</td></tr>
-	<tr><td>分数/置信度</td><td><code>final_decision.confidence</code></td><td>推送与压测用的置信度；本地 raw/final_trade_score 在 JSON 的 score 字段中。</td></tr>
-	<tr><td>决策来源</td><td><code>decision_source</code></td><td><code>ai</code> / <code>local</code> / <code>local_fallback</code>，表示 final_decision 如何产生。</td></tr>
-	<tr><td>触发等级</td><td><code>trigger_level</code>（L0–L3）</td><td>本轮 AI 触发级别；L2/L3 才可能调用 AI。</td></tr>
-	<tr><td>市场/策略</td><td><code>market_regime / strategy_template</code></td><td>识别趋势、震荡、挤压或高波动，匹配策略模板。</td></tr>
-	<tr><td>风险/动作</td><td><code>risk_level / trade_action_level</code></td><td>风险描述与是否适合执行；高风险不等于一定反向。</td></tr>
-	<tr><td>入场质量</td><td><code>entry_plan.quality / entry_quality_score</code></td><td>入场区是否有效；震荡、高波动、离 EMA 过远会降低质量。</td></tr>
-	<tr><td>数据质量</td><td>15m 确认 K 线数量与 ready 状态</td><td>指标不足时系统偏向观望。</td></tr>
-	<tr><td>预热</td><td><code>oi_warmup_ready / funding_warmup_ready</code></td><td>OI/资金费率变化需满 15 分钟窗口。</td></tr>
-	<tr><td>OI / 资金费率 / 多空比</td><td>合约资金数据</td><td>判断新增仓、平仓、拥挤与过热；需结合价格方向理解。</td></tr>
-	<tr><td>放量 / ATR / 盘口</td><td>量价与波动确认</td><td>辅助确认，不单独定方向；动态阈值来自近 3 小时采样分位数。</td></tr>
-	<tr><td>分层</td><td>八层评分摘要</td><td>定位本地 score 来源；AI 决策时仅作参考。</td></tr>
-	</tbody></table>
-	<h3>推送类型（读 final_decision.push_recommendation）</h3><div class="help-grid">
-	<div class="help-item"><strong>trade</strong><p>方向为做多/做空且 confidence ≥ push_score。正文含入场、止损、止盈。</p></div>
-	<div class="help-item"><strong>watch</strong><p>风险提示型推送；门槛为 watch_push_score（低于 trade）。</p></div>
-	<div class="help-item"><strong>spike</strong><p>L3 急速异动；门槛为 spike_push_score（通常最低）。</p></div>
-	</div>
-	<p>三类推送通道默认全开；实际是否发出取决于 final_decision、push_score、冷却期，以及是否启用微信推送。</p>
-	<h3>日志字段</h3><ul class="help-list">
-	<li><strong>JSON 分析日志</strong>（<code>okx_signal_analysis.jsonl</code>）：完整结构化数据，含 score、local_trigger、analysis、final_decision。需在配置页或日志页开启「写入分析日志」并重启监控。</li>
-	<li><strong>控制台日志</strong>（<code>signal_monitor_console.log</code>）：每行以 <code>【AI分析】/【本地规则】/【本地兜底】</code> 开头，含 AI 触发原因、AI 结论或本地结论、推送结果；设 <code>CONSOLE_VERBOSE=1</code> 可看重试/冷却等 debug。</li>
-	</ul>
-	<h3>入场、止损、止盈与追踪</h3><ul class="help-list"><li>入场区由 ATR、结构位、EMA/VWAP 锚点生成。</li><li>止损参考结构失效位 + ATR 缓冲；止盈按风险距离生成两档（约 1R/2R）。</li><li>跟踪基于 final_decision：先等触达入场区，再统计 MFE/MAE，结算写入 signal_performance.jsonl。</li><li>追踪成交价保守估算：做多按入场区上沿，做空按下沿。</li></ul>
-	<h3>测试与压测</h3><ul class="help-list">
-	<li><strong>实时预测压测</strong>（测试页）：按 final_decision 方向验证后续短窗价格表现；范围可选「本次启动后 / 全部历史日志」。</li>
-	<li><strong>离线回放压测</strong>：配置页勾选「录制回放数据集」→ 监控运行写入 <code>replay_dataset.jsonl</code> → 停止后在测试页启动回放子进程，走完整 <code>_process_inst</code> 链路（不访问 OKX、不推送），结果写入 <code>replay_analysis.jsonl</code>；压测范围选「回放会话」。</li>
-	<li>监控与离线回放互斥；重新启动监控且仍勾选录制时会清空旧数据集。</li>
-	</ul>
-	<h3>本地文件位置</h3><ul class="help-list"><li>运行日志：<code>build/runtime_logs</code>；默认配置模板：<code>config</code>；本机密钥与登录：<code>local_state</code>。</li><li><code>build</code> 与 <code>local_state</code> 为运行时/私密目录，不应提交版本库。</li></ul>
-	<h3>常见误读</h3><ul class="help-list"><li>本地观察分高 ≠ 一定推送；最终以 final_decision.push_recommendation 为准。</li><li>L1 弱信号不调 AI，也不会推 trade。</li><li>AI 与本地方向不一致时，以 final_decision 为准（AI 有效时 decision_source=ai）。</li><li>观望时 entry/stop/TP 为 <code>-</code> 是正常结果。</li><li>压测图<strong>红点</strong>在观望+大涨时只表示「观望错失机会」，不是做空信号。</li><li><code>score.trends["15m"]</code> 与 <code>trend_profiles["15m"].trend</code> 可能不一致；策略方向以后者为准。</li><li>日志里 scalp 视图做多但 final 仍观望：主策略不是超短线时，scalp 仅参考不覆盖。</li><li>盘口、OI、资金费率需结合价格与多周期结构理解，不宜单指标下结论。</li></ul>
-	</section></div></div>
-	{pipeline_design_html()}
+<form class="settings-form" method="post" action="/save-auth#settings" autocomplete="off"><input type="text" name="fake_username" autocomplete="username" tabindex="-1" aria-hidden="true" class="autofill-trap"><input type="password" name="fake_password" autocomplete="current-password" tabindex="-1" aria-hidden="true" class="autofill-trap"><section class="card page-panel" data-page="settings"><h2>登录账号</h2><div class="field"><label>用户名</label><div><input type="text" name="auth_username" autocomplete="off" value="{esc(auth.get("username","admin"))}"><p>Web 控制台登录用户名（单账户）。</p></div></div><div class="field"><label>当前密码</label><div><div class="password-wrap"><input type="password" name="auth_current_password" autocomplete="off" placeholder="请手动输入当前密码" readonly data-verify-password><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>须手动输入当前密码验证身份，不会自动填充。</p></div></div><div class="field"><label>新密码</label><div><div class="password-wrap"><input type="password" name="auth_password" autocomplete="off" placeholder="留空则不修改" readonly data-verify-password><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>留空表示保留当前密码；保存后将停止监控/回放并退出登录。</p></div></div></section><div class="actions settings-actions" data-page-actions="settings"><div class="action-group"><button class="action-control btn-save" type="submit">保存账号密码</button><a class="button action-control btn-danger" href="/logout">退出登录</a></div></div></form>
+<div class="page-panel active" data-page="monitor"><section class="card toolbar-card monitor-toolbar-card"><div><h2>实时监控</h2><p class="section-sub">K 线默认显示；关闭开关后不再请求 OKX/日志绘图，<strong>监控进程照常运行</strong>。下方模拟账户按 final_direction 满仓跟单（会话 $10,000 重置）。</p></div><div class="toolbar-right"><span class="section-sub" id="monitorChartLabel" style="margin:0;white-space:nowrap;">K线显示已开启</span><label class="switch" title="仅控制 Web 是否绘制 K 线与快照，不影响后台监控"><input type="checkbox" id="monitorChartEnableToggle" checked><span></span></label><div class="coin-tabs">{monitor_tabs}</div><button class="button btn-run action-control" type="button" id="monitorToggleBtn">开始监控</button></div></section><p class="accuracy-note accuracy-off-hint monitor-chart-off-hint" id="monitorChartOffHint" hidden>K 线显示已关闭。监控进程与磁盘日志照常运行；打开右上角开关后将请求 OKX 并绘制图表。</p><section class="market-card monitor-card" id="monitorChartPanel"><div class="market-head"><div><div class="market-title" id="monitorTitle">{esc(monitor_initial or "未配置币种")} K线</div><div class="market-sub" id="monitorMeta">{esc("选择周期查看蜡烛图 · 启动监控后叠加分析指标" if monitor_initial else "请先在配置页选择监控币种")}</div><div class="bar-tabs" id="monitorBarTabs">{monitor_bar_tabs}</div></div><div class="market-price" id="monitorPrice"><strong>--</strong><span>加载中</span></div></div><div class="market-canvas-wrap"><canvas id="monitorChart"></canvas><div class="market-loading" id="monitorLoading">正在加载 K 线...</div><div class="snapshot-panel" id="snapshotPanel"><strong>最新快照</strong><div class="snapshot-grid"><span>状态</span><b>加载中...</b><span>提示</span><b>点击 K 线查看 OHLC</b></div></div></div><div class="market-time-range"><span id="monitorProcessInfo">PID -- · Token --</span><span id="monitorUptime">已监控：未启动</span><span id="monitorPaperAccount">模拟账户：--</span><span id="monitorPointCount">K线：0</span></div></section></div>
+	<div class="page-panel" data-page="logs"><section class="card toolbar-card logs-toolbar-card"><div><h2>实时日志</h2><p class="section-sub">监控进程仍会照常写入磁盘（JSON 分析 + 控制台）；本页<strong>默认不拉取显示</strong>以节省资源。配置页可设单文件/总容量上限。</p></div><div class="toolbar-right" style="align-items:center;gap:10px;flex-wrap:wrap;"><span class="section-sub" id="logsDisplayLabel" style="margin:0;white-space:nowrap;">显示已关闭</span><label class="switch" title="仅控制 Web 是否读取并展示日志，不影响磁盘写入"><input type="checkbox" id="logsDisplayToggle"><span></span></label><span class="section-sub" id="analysisLogSwitchHint" style="margin:0;">{esc(log_size_summary_text(config))} · 修改后需重启监控</span><button class="button btn-log" type="button" id="refreshLogBtn">刷新全部</button><button class="button btn-log" type="button" id="openLogDirBtn">打开日志目录</button></div></section><p class="accuracy-note accuracy-off-hint" id="logsOffHint">Web 显示已关闭。监控仍正常写日志到磁盘；打开右上角开关后可在此查看本次启动后的内容。</p><section class="card logs-card" id="logPanelBody" hidden><div class="logs-grid"><div class="log-panel"><h3>JSON 分析日志</h3><p class="log-panel-desc">Web 图表/压测依赖的完整分析记录，分卷保存：{esc(MONITOR_JSON_LOG_FILE)} 及 .jsonl.1/.2 …</p><div class="log-panel-body"><textarea class="log-window" id="logWindow" readonly>正在加载日志...</textarea></div><div class="log-panel-footer"><div class="toolbar-card"><div><p class="section-sub" id="saveLogHint">可另存为 .jsonl 文件，便于回放与统计。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveLogBtn">另存为文件</button></div></div></div></div><div class="log-panel"><h3>控制台日志</h3><p class="log-panel-desc">监控进程精简调试输出（信号摘要、推送结果、错误）；详细重试日志需设置 CONSOLE_VERBOSE=1，默认保存：{esc(MONITOR_PROCESS_LOG_FILE)}</p><div class="log-panel-body"><textarea class="log-window log-window-console" id="consoleLogWindow" readonly>正在加载控制台日志...</textarea></div><div class="log-panel-footer"><div class="toolbar-card"><div><p class="section-sub" id="saveConsoleLogHint">可另存为 .log 文件，便于快速排查信号与推送。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearConsoleLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveConsoleLogBtn">另存为文件</button></div></div></div></div></div></section></div>
+	<div class="page-panel" data-page="tests"><section class="card diagnostic-export-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">问题排查导出</h2><p class="section-sub" style="margin:0;">一键打包配置（密钥已打码）、监控/回放状态、日志、压测图表与回放数据，便于反馈 bug 时分析。超大日志仅含尾部。</p></div><div class="toolbar-right"><button class="button action-control btn-save" type="button" id="diagnosticExportBtn">导出诊断包</button></div></div><p class="accuracy-note" id="diagnosticExportHint">将下载 ZIP 文件；包含 JSON 分析日志、控制台日志、回放数据、实时/回放压测 JSON、Token 统计与当前 AI 对话（如有）。</p></section><section class="card ai-chat-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">AI 对话测试</h2><p class="section-sub" style="margin:0;">使用配置页中的 AI 密钥与模型；发送前会先保存当前配置。对话历史仅保留在本页浏览器内存中。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="aiChatClearBtn">清空对话</button><button class="button action-control btn-test" type="button" id="aiChatPingBtn">连通性测试</button></div></div><div class="ai-chat-window" id="aiChatWindow"><div class="ai-chat-empty">输入下方消息开始与 AI 对话。可先点「连通性测试」验证配置是否可用。</div></div><div class="ai-chat-compose"><textarea id="aiChatInput" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea><button class="button action-control btn-test" type="button" id="aiChatSendBtn">发送</button></div></section><section class="card toolbar-card"><div><h2>微信推送测试</h2><p class="section-sub">测试 Server酱 推送是否可用。点击后会先保存配置页中的密钥，再发送与真实监控相同结构的格式预览（模拟 AI 全字段示例）。</p></div><div class="toolbar-right"><button class="button action-control btn-test" type="button" id="testPushBtn">测试微信推送</button></div></section><div id="connectivityTestNotice" class="notice" hidden></div><section class="card accuracy-card"><div class="toolbar-card" style="margin:0 0 12px;box-shadow:none;padding:0;background:transparent;border:none;align-items:flex-start;"><div><h2 style="margin:0 0 6px;">实时预测压测</h2><p class="section-sub" style="margin:0;">顶部<strong>模拟账户</strong>按 final_direction 从 $10,000 满仓跟单（方向变才换仓）；绿线为权益曲线。下方为分层预测准确度；短线建议验证窗 15–20 分钟。<strong>默认关闭</strong>以节省资源，需要时再打开。</p></div><div class="toolbar-right" style="align-items:center;gap:10px;flex-shrink:0;"><span class="section-sub" id="accuracyEnableLabel" style="margin:0;white-space:nowrap;">压测已关闭</span><label class="switch" title="启用后才会读取分析日志并自动刷新压测图表"><input type="checkbox" id="accuracyEnableToggle"><span></span></label></div></div><p class="accuracy-note accuracy-off-hint" id="accuracyOffHint">压测已关闭。打开右上角开关后将读取分析日志并自动刷新图表。</p><div id="accuracyPanelBody" hidden><div class="accuracy-controls"><select id="accuracyInst">{accuracy_inst_options}</select><select id="accuracyHorizon"><option value="5">5秒 · 轮询级</option><option value="15">15秒</option><option value="30">30秒</option><option value="60">1分钟</option><option value="180">3分钟</option><option value="300">5分钟</option><option value="900">15分钟 · 短线推荐</option><option value="1200">20分钟 · 短线结构</option></select><select id="accuracyScope"><option value="session">本次启动后</option><option value="replay">回放会话</option><option value="all">全部历史日志</option></select><select id="accuracyRetentionHours" title="结合配置页轮询间隔计算图表最多保留多少点"><option value="1">保留1小时</option><option value="2">保留2小时</option><option value="4">保留4小时</option><option value="8">保留8小时</option><option value="12" selected>保留12小时</option><option value="24">保留24小时</option><option value="48">保留48小时</option></select><button class="btn-test" type="button" id="accuracyRefreshBtn">刷新压测</button><button class="btn-save" type="button" id="accuracyExportBtn">导出图表</button><button class="btn-save" type="button" id="accuracyImportBtn">导入图表</button><button class="btn-test" type="button" id="accuracyLiveBtn" style="display:none">返回实时</button><input type="file" id="accuracyImportInput" accept=".json,application/json" hidden></div><div class="accuracy-summary" id="accuracySummary"><div><span>可靠性等级</span><b>--</b></div><div><span>已验证/日志</span><b>--</b></div><div><span>决策合理率</span><b>--</b></div><div><span>相对观望基准</span><b>--</b></div></div><div class="accuracy-canvas-wrap"><canvas id="accuracyChart"></canvas><div class="accuracy-point-panel" id="accuracyPointPanel" hidden></div></div><p class="accuracy-note" id="accuracyNote">观望：后续波动未超阈值即合理（错失机会记红点）。交易：验证窗内价格朝做多/做空方向走即方向命中；入场/止盈/止损仅在较长验证窗下有参考价值。</p></div></section><section class="card"><h2>离线回放压测</h2><p class="section-sub">配置页勾选「录制回放数据集」并运行监控，每轮原始输入写入 {esc(REPLAY_DATASET_FILE)}；停止监控后点击下方「开始回放」启动子进程，结果写入 {esc(REPLAY_ANALYSIS_LOG_FILE)}，再选上方「回放会话」查看压测曲线。</p><div class="replay-status" id="replayDatasetInfo">正在加载数据集状态...</div><div class="field"><label>回放间隔(秒)</label><div><input type="number" id="replayInterval" value="0" min="0" max="120" step="0.1"><p>0 表示尽快跑完；大于 0 可在回放过程中观察压测曲线刷新。</p></div></div><div class="field"><label>控制</label><div><div class="toolbar-right" style="justify-content:flex-start;gap:8px;"><button class="btn-test" type="button" id="replayStartBtn">开始回放</button><button class="btn-danger action-control" type="button" id="replayStopBtn">停止回放</button><button class="button btn-log" type="button" id="replayRefreshBtn">刷新状态</button></div><p id="replayStatusText">等待加载...</p></div></div></section></div>
+	{help_manual_html(config)}
+	{design_docs_html()}
 	</main></div></div>
 <script>
 const SUGGESTED_PUSH_SCORES = {json.dumps(SUGGESTED_PUSH_SCORES, ensure_ascii=False)};
 const RISK_PREFERENCE_LABELS = {json.dumps(RISK_PREFERENCE_LABELS, ensure_ascii=False)};
+const LAUNCHED_BY_TRAY = {json.dumps(tray_mode)};
+const POWER_CONFIRM_RESTART = {json.dumps(power_confirm_restart, ensure_ascii=False)};
+const POWER_CONFIRM_SHUTDOWN = {json.dumps(power_confirm_shutdown, ensure_ascii=False)};
+const POWER_SHUTDOWN_DONE = {json.dumps(power_shutdown_done, ensure_ascii=False)};
 function currentRiskPreference() {{
   const el = document.querySelector('.config-form select[name="risk_preference"]');
   return el && el.value ? el.value : 'standard';
@@ -2493,9 +3973,10 @@ function updatePushScoreGuide() {{
     const aiNote = currentAiEnabled()
       ? '已启用 AI：trade 建议可贴近下表。'
       : '未启用 AI：建议 trade 取偏保守一档（如标准 75→78~80）。';
-    textEl.textContent = '当前严格度「' + label + '」建议 trade ' + suggested.push_score
+    textEl.textContent = '当前严格度「' + label + '」建议 做多 ' + suggested.push_score
+      + ' · 做空 ' + suggested.short_push_score
       + ' · watch ' + suggested.watch_push_score + ' · spike ' + suggested.spike_push_score
-      + '。' + aiNote + ' watch/spike 应低于 trade，避免噪音推送。';
+      + '。' + aiNote + ' watch/spike 应低于 trade，做空可略低于做多。';
   }}
 }}
 function applySuggestedPushScores() {{
@@ -2503,9 +3984,11 @@ function applySuggestedPushScores() {{
   if (!form) return;
   const suggested = SUGGESTED_PUSH_SCORES[currentRiskPreference()] || SUGGESTED_PUSH_SCORES.standard;
   const tradeEl = form.querySelector('[name="push_score"]');
+  const shortTradeEl = form.querySelector('[name="short_push_score"]');
   const watchEl = form.querySelector('[name="watch_push_score"]');
   const spikeEl = form.querySelector('[name="spike_push_score"]');
   if (tradeEl) tradeEl.value = String(suggested.push_score);
+  if (shortTradeEl) shortTradeEl.value = String(suggested.short_push_score);
   if (watchEl) watchEl.value = String(suggested.watch_push_score);
   if (spikeEl) spikeEl.value = String(suggested.spike_push_score);
   updatePushScoreGuide();
@@ -2541,11 +4024,15 @@ function showPage(page) {{
   document.querySelectorAll('[data-page-actions]').forEach(function(actions) {{
     actions.style.display = actions.getAttribute('data-page-actions') === page ? 'flex' : 'none';
   }});
-  if (page === 'logs') {{ refreshLogs(false); refreshConsoleLogs(false); }}
-  if (page === 'monitor') fetchMonitor(false);
+  if (page === 'logs' && isLogsDisplayEnabled()) {{ refreshLogs(false); refreshConsoleLogs(false); }}
+  if (page === 'monitor') {{
+    if (isMonitorChartEnabled()) fetchMonitor(false);
+    else showMonitorChartOffState();
+  }}
+  if (page === 'settings' && settingsForm) initVerifyPasswordFields(settingsForm);
   if (page === 'tests') {{
     refreshReplayInfo({{ lite: false }}).then(function(info) {{
-      fetchAccuracy({{ resetView: true }});
+      if (isAccuracyEnabled()) fetchAccuracy({{ resetView: true }});
       if (info && info.replay_running) startReplayProgress();
     }});
   }}
@@ -2572,24 +4059,164 @@ async function autoSaveConfig() {{
   const form = document.querySelector('.config-form');
   if (!form) return {{ ok: true }};
   const payload = await postFormJson('/api/config/save', form);
-  if (payload.inst_ids) refreshMonitorTabs(payload.inst_ids);
+  if (payload.inst_ids) refreshInstSelectors(payload.inst_ids);
+  setAddInstFeedback('配置已保存。', true);
   return payload;
+}}
+function setAddInstFeedback(text, ok) {{
+  const box = document.getElementById('addInstFeedback');
+  if (!box) return;
+  box.textContent = text || '输入 OKX 永续合约 ID 并点击添加；校验通过后会出现在上方，右侧「删除」可移除。';
+  box.classList.remove('is-error', 'is-ok');
+  if (ok === true) box.classList.add('is-ok');
+  if (ok === false) box.classList.add('is-error');
+}}
+function ensureHiddenValue(form, name, value) {{
+  if (!form || !value) return;
+  const exists = Array.from(form.querySelectorAll('input[name="' + name + '"]')).some(function(el) {{ return el.value === value; }});
+  if (exists) return;
+  const input = document.createElement('input');
+  input.type = 'hidden';
+  input.name = name;
+  input.value = value;
+  form.appendChild(input);
+}}
+function removeHiddenValue(form, name, value) {{
+  if (!form || !value) return;
+  form.querySelectorAll('input[name="' + name + '"]').forEach(function(el) {{
+    if (el.value === value) el.remove();
+  }});
+}}
+function knownInstIds() {{
+  const ids = [];
+  document.querySelectorAll('#instChecks [data-inst]').forEach(function(el) {{
+    const inst = el.getAttribute('data-inst');
+    if (inst) ids.push(inst);
+  }});
+  return ids;
+}}
+function appendInstTile(instId, checked, isPreset) {{
+  const box = document.getElementById('instChecks');
+  const form = document.querySelector('.config-form');
+  if (!box || !instId || knownInstIds().indexOf(instId) >= 0) return false;
+  if (form) removeHiddenValue(form, 'removed_inst_ids', instId);
+  const tile = document.createElement('div');
+  tile.className = 'check-tile check-tile-custom';
+  tile.setAttribute('data-inst', instId);
+  tile.setAttribute('data-preset', isPreset ? '1' : '0');
+  tile.innerHTML = '<label><input type="checkbox" name="inst_ids" value="' + instId + '"' + (checked ? ' checked' : '') + '><span>' + instId + '</span></label>'
+    + '<button class="inst-remove-btn" type="button" data-remove-inst="' + instId + '" aria-label="删除 ' + instId + '">删除</button>'
+    + (isPreset ? '' : '<input type="hidden" name="custom_inst_ids" value="' + instId + '">');
+  box.appendChild(tile);
+  bindInstTileActions(tile);
+  return true;
+}}
+function removeInstTile(instId) {{
+  const form = document.querySelector('.config-form');
+  const tile = document.querySelector('#instChecks [data-inst="' + instId + '"]');
+  if (!tile) return;
+  const isPreset = tile.getAttribute('data-preset') === '1';
+  tile.remove();
+  if (form && isPreset) ensureHiddenValue(form, 'removed_inst_ids', instId);
+}}
+function bindInstTileActions(root) {{
+  (root || document).querySelectorAll('.inst-remove-btn').forEach(function(btn) {{
+    if (btn.dataset.bound === '1') return;
+    btn.dataset.bound = '1';
+    btn.addEventListener('click', function(event) {{
+      event.preventDefault();
+      event.stopPropagation();
+      const instId = btn.getAttribute('data-remove-inst');
+      if (!instId) return;
+      if (!window.confirm('确定删除 ' + instId + ' 吗？')) return;
+      removeInstTile(instId);
+      autoSaveConfig().catch(function(error) {{
+        showMainNotice('配置保存失败：' + error, false);
+        setAddInstFeedback(String(error), false);
+      }});
+    }});
+  }});
+}}
+async function addNewInstId() {{
+  const input = document.getElementById('newInstId');
+  const btn = document.getElementById('addInstBtn');
+  const instId = input ? String(input.value || '').trim().toUpperCase() : '';
+  if (!instId) {{
+    setAddInstFeedback('请输入合约 ID，例如 SOL-USDT-SWAP。', false);
+    if (input) input.focus();
+    return;
+  }}
+  if (knownInstIds().indexOf(instId) >= 0) {{
+    setAddInstFeedback(instId + ' 已在列表中，直接勾选即可。', false);
+    return;
+  }}
+  if (btn) {{ btn.disabled = true; btn.textContent = '校验中...'; }}
+  try {{
+    const response = await fetch('/api/add-inst-id', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }},
+      body: 'inst_id=' + encodeURIComponent(instId),
+      cache: 'no-store'
+    }});
+    const payload = await response.json();
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || '添加失败');
+    appendInstTile(payload.inst_id || instId, true, !!payload.is_preset);
+    if (input) input.value = '';
+    await autoSaveConfig();
+    setAddInstFeedback('已添加 ' + (payload.inst_id || instId) + '，并已加入监控列表。', true);
+  }} catch (error) {{
+    setAddInstFeedback(String(error), false);
+    showMainNotice('添加币种失败：' + error, false);
+  }} finally {{
+    if (btn) {{ btn.disabled = false; btn.textContent = '添加'; }}
+  }}
+}}
+function refreshInstSelectors(insts) {{
+  if (!Array.isArray(insts)) return;
+  refreshMonitorTabs(insts);
+  const sel = document.getElementById('accuracyInst');
+  if (!sel) return;
+  const current = sel.value;
+  sel.innerHTML = insts.map(function(inst) {{ return '<option value="' + inst + '">' + inst + '</option>'; }}).join('');
+  if (insts.indexOf(current) >= 0) sel.value = current;
+  else if (insts.length) sel.value = insts[0];
 }}
 let autoSaveTimer = null;
 const configForm = document.querySelector('.config-form');
 if (configForm) {{
-  configForm.addEventListener('input', function() {{
+  bindInstTileActions(configForm);
+  configForm.addEventListener('input', function(event) {{
+    if (event.target && event.target.id === 'newInstId') return;
     clearTimeout(autoSaveTimer);
-    autoSaveTimer = setTimeout(function() {{ autoSaveConfig().catch(function() {{}}); }}, 450);
+    autoSaveTimer = setTimeout(function() {{
+      autoSaveConfig().catch(function(error) {{
+        showMainNotice('配置保存失败：' + error, false);
+        setAddInstFeedback(String(error), false);
+      }});
+    }}, 450);
   }});
   configForm.addEventListener('change', function(event) {{
-    if (event.target && event.target.name === 'analysis_log_enabled') {{
-      analysisLogEnabled = !!event.target.checked;
-      syncAnalysisLogUi();
+    if (event.target && event.target.name === 'inst_ids') {{
+      clearTimeout(autoSaveTimer);
+      autoSaveTimer = setTimeout(function() {{
+        autoSaveConfig().catch(function(error) {{
+          showMainNotice('配置保存失败：' + error, false);
+          setAddInstFeedback(String(error), false);
+        }});
+      }}, 120);
     }}
-    clearTimeout(autoSaveTimer);
-    autoSaveTimer = setTimeout(function() {{ autoSaveConfig().catch(function() {{}}); }}, 120);
   }});
+  const addInstBtn = document.getElementById('addInstBtn');
+  const newInstInput = document.getElementById('newInstId');
+  if (addInstBtn) addInstBtn.addEventListener('click', function() {{ addNewInstId(); }});
+  if (newInstInput) {{
+    newInstInput.addEventListener('keydown', function(event) {{
+      if (event.key === 'Enter') {{
+        event.preventDefault();
+        addNewInstId();
+      }}
+    }});
+  }}
 }}
 document.querySelectorAll('[data-toggle-password]').forEach(function(btn) {{
   btn.addEventListener('click', function() {{
@@ -2599,6 +4226,54 @@ document.querySelectorAll('[data-toggle-password]').forEach(function(btn) {{
     btn.classList.toggle('is-visible', input.type === 'text');
   }});
 }});
+function initVerifyPasswordFields(root) {{
+  (root || document).querySelectorAll('input[data-verify-password]').forEach(function(input) {{
+    input.value = '';
+    input.setAttribute('readonly', 'readonly');
+    input.addEventListener('focus', function() {{ input.removeAttribute('readonly'); }}, {{ once: true }});
+  }});
+}}
+initVerifyPasswordFields(document.querySelector('.settings-form'));
+function showMainNotice(text, ok) {{
+  let box = document.querySelector('main > .notice');
+  if (!text) {{
+    if (box) box.remove();
+    return;
+  }}
+  if (!box) {{
+    box = document.createElement('div');
+    box.className = ok === false ? 'notice notice-error' : 'notice';
+    const main = document.querySelector('main');
+    if (main) main.insertBefore(box, main.firstChild);
+  }} else {{
+    box.className = ok === false ? 'notice notice-error' : 'notice';
+  }}
+  box.textContent = text;
+}}
+const settingsForm = document.querySelector('.settings-form');
+if (settingsForm) {{
+  settingsForm.addEventListener('submit', async function(event) {{
+    event.preventDefault();
+    const btn = settingsForm.querySelector('button[type="submit"]');
+    const currentPwd = settingsForm.querySelector('input[name="auth_current_password"]');
+    const newPwd = settingsForm.querySelector('input[name="auth_password"]');
+    if (!currentPwd || !String(currentPwd.value || '').trim()) {{
+      showMainNotice('请先输入当前密码。', false);
+      if (currentPwd) currentPwd.focus();
+      return;
+    }}
+    if (btn) {{ btn.disabled = true; btn.textContent = '保存中...'; }}
+    try {{
+      const payload = await postFormJson('/api/save-auth', settingsForm);
+      if (currentPwd) currentPwd.value = '';
+      if (newPwd) newPwd.value = '';
+      window.location.href = payload.redirect || '/login?auth_changed=1';
+    }} catch (error) {{
+      showMainNotice('保存账号失败：' + error, false);
+      if (btn) {{ btn.disabled = false; btn.textContent = '保存账号密码'; }}
+    }}
+  }});
+}}
 function autoName() {{
   const d = new Date();
   const p = function(n) {{ return String(n).padStart(2, '0'); }};
@@ -2672,17 +4347,23 @@ const importConfigBtn = document.getElementById('importConfigBtn');
 	function renderReplayDatasetInfo(info){{const box=document.getElementById('replayDatasetInfo');if(!box)return;const lines=[];lines.push('数据集: '+(info.exists?info.frame_count+' 帧 · '+((info.inst_ids||[]).join(', ')||'--'):'尚未录制'));if(info.exists){{lines.push('路径: '+(info.path||'--'));if(info.recorded_at)lines.push('录制 meta: '+info.recorded_at);if(info.interval_seconds)lines.push('录制间隔: '+info.interval_seconds+' 秒');}}if(info.replay_running&&info.analysis_log_bytes)lines.push('回放日志: 约 '+Math.max(1,Math.round(info.analysis_log_bytes/1024))+' KB');else if(info.analysis_log_lines)lines.push('上次回放分析日志: '+info.analysis_log_lines+' 行');lines.push('录制开关: '+(info.record_enabled?'已勾选':'未勾选')+' · 监控: '+(info.monitor_running?'运行中':'未运行'));box.textContent=lines.join('\\n');}}
 	function renderReplayStatus(info){{const text=document.getElementById('replayStatusText');if(!text)return;const st=info&&info.replay_status?info.replay_status:{{}};let msg=(st.text||'--')+(st.started_at?' · 开始 '+st.started_at:'')+(st.elapsed_seconds!=null?' · 已运行 '+st.elapsed_seconds+' 秒':'');if(info&&info.replay_running&&info.analysis_log_bytes)msg+=' · 日志约 '+Math.max(1,Math.round(info.analysis_log_bytes/1024))+' KB';else if(!info.replay_running&&info.analysis_log_lines)msg+=' · 分析日志 '+info.analysis_log_lines+' 行';text.textContent=msg;}}
 	function setReplayStartButtonState(mode){{const btn=document.getElementById('replayStartBtn');if(!btn)return;if(mode==='running'){{btn.disabled=false;btn.textContent='回放中...';btn.classList.add('is-starting');}}else if(mode==='starting'){{btn.disabled=true;btn.textContent='启动中...';btn.classList.add('is-starting');}}else{{btn.disabled=false;btn.textContent='开始回放';btn.classList.remove('is-starting');}}}}
-	async function refreshReplayInfo(options){{options=options||{{}};const lite=options.lite!==false;try{{const url='/api/replay-dataset'+(lite?'?lite=1':'');const r=await fetch(url,{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'加载失败');renderReplayDatasetInfo(p);renderReplayStatus(p);if(!lite&&syncAccuracyScopeWithReplay(p))fetchAccuracy({{resetView:true}});if(!lite&&p.replay_running)startReplayProgress();return p;}}catch(e){{const box=document.getElementById('replayDatasetInfo');if(box)box.textContent='加载回放状态失败：'+e;renderReplayStatus({{replay_status:{{text:String(e)}}}});return null;}}}}
+	async function refreshReplayInfo(options){{options=options||{{}};const lite=options.lite!==false;try{{const url='/api/replay-dataset'+(lite?'?lite=1':'');const r=await fetch(url,{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'加载失败');renderReplayDatasetInfo(p);renderReplayStatus(p);if(!lite&&syncAccuracyScopeWithReplay(p)&&isAccuracyEnabled())fetchAccuracy({{resetView:true}});if(!lite&&p.replay_running)startReplayProgress();return p;}}catch(e){{const box=document.getElementById('replayDatasetInfo');if(box)box.textContent='加载回放状态失败：'+e;renderReplayStatus({{replay_status:{{text:String(e)}}}});return null;}}}}
 	let replayProgressTimer=null,replayFinishedNotified=false,fetchAccuracyInFlight=null;
 	function stopReplayProgress(){{stopReplayAccuracyPoll();if(replayProgressTimer){{clearInterval(replayProgressTimer);replayProgressTimer=null;}}}}
-	function startReplayProgress(){{stopReplayProgress();replayFinishedNotified=false;switchAccuracyToReplaySession();replayProgressTimer=setInterval(async function(){{if(currentPage()!=='tests')return;const info=await refreshReplayInfo({{lite:true}});if(!info)return;setReplayStartButtonState(info.replay_running?'running':'idle');if(info.replay_running){{fetchAccuracy({{resetView:false}});return;}}stopReplayProgress();fetchAccuracy({{resetView:true}});if(!replayFinishedNotified){{replayFinishedNotified=true;const lines=info.analysis_log_lines!=null?info.analysis_log_lines:'--';alert('回放完成 · 分析日志 '+lines+' 行 · 上方压测已切到「回放会话」');}}}},2500);}}
-	async function startReplayRun(){{const intervalEl=document.getElementById('replayInterval'),interval=Number(intervalEl&&intervalEl.value),statusEl=document.getElementById('replayStatusText');setReplayStartButtonState('starting');if(statusEl)statusEl.textContent='正在启动回放，请稍候...';try{{const r=await fetch('/api/replay-start',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{interval:Number.isFinite(interval)?interval:0}}),cache:'no-store'}});let p=null;const ct=(r.headers.get('content-type')||'').toLowerCase();if(ct.includes('application/json')){{p=await r.json();}}else{{throw new Error('服务器返回异常页面（HTTP '+r.status+'），请刷新并重新登录后再试');}}if(!r.ok||p.ok===false)throw new Error(p.error||p.message||'启动失败');renderReplayDatasetInfo(p);renderReplayStatus(p);if(statusEl)statusEl.textContent=p.message||'回放已启动';setReplayStartButtonState('running');fetchAccuracy({{resetView:true}});startReplayProgress();}}catch(e){{setReplayStartButtonState('idle');if(statusEl)statusEl.textContent='启动失败：'+e;alert('启动回放失败：'+e);}}}}
-	async function stopReplayRun(){{const btn=document.getElementById('replayStopBtn');if(btn)btn.disabled=true;try{{const r=await fetch('/api/replay-stop',{{method:'POST',cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||p.message||'停止失败');stopReplayProgress();setReplayStartButtonState('idle');await refreshReplayInfo({{lite:false}});fetchAccuracy({{resetView:true}});alert(p.message||'回放已停止');}}catch(e){{alert('停止回放失败：'+e);}}finally{{if(btn)btn.disabled=false;}}}}
+	function startReplayProgress(){{stopReplayProgress();replayFinishedNotified=false;switchAccuracyToReplaySession();replayProgressTimer=setInterval(async function(){{if(currentPage()!=='tests')return;const info=await refreshReplayInfo({{lite:true}});if(!info)return;setReplayStartButtonState(info.replay_running?'running':'idle');if(info.replay_running){{if(isAccuracyEnabled())fetchAccuracy({{resetView:false}});return;}}stopReplayProgress();if(isAccuracyEnabled())fetchAccuracy({{resetView:true}});if(!replayFinishedNotified){{replayFinishedNotified=true;const lines=info.analysis_log_lines!=null?info.analysis_log_lines:'--';alert('回放完成 · 分析日志 '+lines+' 行 · 上方压测已切到「回放会话」');}}}},2500);}}
+	async function startReplayRun(){{const intervalEl=document.getElementById('replayInterval'),interval=Number(intervalEl&&intervalEl.value),statusEl=document.getElementById('replayStatusText');setReplayStartButtonState('starting');if(statusEl)statusEl.textContent='正在启动回放，请稍候...';try{{const r=await fetch('/api/replay-start',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{interval:Number.isFinite(interval)?interval:0}}),cache:'no-store'}});let p=null;const ct=(r.headers.get('content-type')||'').toLowerCase();if(ct.includes('application/json')){{p=await r.json();}}else{{throw new Error('服务器返回异常页面（HTTP '+r.status+'），请刷新并重新登录后再试');}}if(!r.ok||p.ok===false)throw new Error(p.error||p.message||'启动失败');renderReplayDatasetInfo(p);renderReplayStatus(p);if(statusEl)statusEl.textContent=p.message||'回放已启动';setReplayStartButtonState('running');setAccuracyEnabled(true,{{fetchNow:true}});startReplayProgress();}}catch(e){{setReplayStartButtonState('idle');if(statusEl)statusEl.textContent='启动失败：'+e;alert('启动回放失败：'+e);}}}}
+	async function stopReplayRun(){{const btn=document.getElementById('replayStopBtn');if(btn)btn.disabled=true;try{{const r=await fetch('/api/replay-stop',{{method:'POST',cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||p.message||'停止失败');stopReplayProgress();setReplayStartButtonState('idle');await refreshReplayInfo({{lite:false}});if(isAccuracyEnabled())fetchAccuracy({{resetView:true}});alert(p.message||'回放已停止');}}catch(e){{alert('停止回放失败：'+e);}}finally{{if(btn)btn.disabled=false;}}}}
 	const replayStartBtn=document.getElementById('replayStartBtn'),replayStopBtn=document.getElementById('replayStopBtn'),replayRefreshBtn=document.getElementById('replayRefreshBtn');
 	if(replayStartBtn)replayStartBtn.addEventListener('click',startReplayRun);
 	if(replayStopBtn)replayStopBtn.addEventListener('click',stopReplayRun);
 	if(replayRefreshBtn)replayRefreshBtn.addEventListener('click',refreshReplayInfo);
 	const accuracyRefreshBtn=document.getElementById('accuracyRefreshBtn');
+	const ACCURACY_ENABLE_KEY='okx_accuracy_enabled';
+	function isAccuracyEnabled(){{const el=document.getElementById('accuracyEnableToggle');return!!(el&&el.checked);}}
+	function setAccuracyEnabled(enabled,options){{options=options||{{}};const toggle=document.getElementById('accuracyEnableToggle');if(toggle)toggle.checked=!!enabled;updateAccuracyEnableUI(!!options.fetchNow);}}
+	function updateAccuracyEnableUI(fetchNow){{const enabled=isAccuracyEnabled(),body=document.getElementById('accuracyPanelBody'),label=document.getElementById('accuracyEnableLabel'),offHint=document.getElementById('accuracyOffHint');if(body)body.hidden=!enabled;if(offHint)offHint.hidden=enabled;if(label)label.textContent=enabled?'压测已开启 · 自动刷新':'压测已关闭 · 按需打开';try{{localStorage.setItem(ACCURACY_ENABLE_KEY,enabled?'1':'0');}}catch(e){{}}if(!enabled)return;if(fetchNow)fetchAccuracy({{resetView:true}});}}
+	function initAccuracyEnableToggle(){{const toggle=document.getElementById('accuracyEnableToggle');if(!toggle)return;try{{toggle.checked=localStorage.getItem(ACCURACY_ENABLE_KEY)==='1';}}catch(e){{}}updateAccuracyEnableUI(false);toggle.addEventListener('change',function(){{updateAccuracyEnableUI(true);syncReplayAccuracyPoll();}});}}
+	initAccuracyEnableToggle();
 	let monitorIntervalSeconds={int(config.get("interval", 5))};
 	const accuracyView={{points:[],start:0,end:1,yZoom:1,yPan:0,priceRg:1,drag:null,followLatest:true,selectedKey:''}};
 	let accuracyPlotPoints=[];
@@ -2701,7 +4382,7 @@ const importConfigBtn = document.getElementById('importConfigBtn');
 	function applyImportedAccuracyBundle(bundle){{setAccuracyImportedMode(true,bundle.exported_at||bundle.start_at||'导入快照');accuracyLivePayload=Object.assign({{ok:true}},bundle);if(bundle.inst_id){{const instEl=document.getElementById('accuracyInst');if(instEl)instEl.value=bundle.inst_id;}}if(bundle.horizon_seconds){{const hEl=document.getElementById('accuracyHorizon');if(hEl)hEl.value=String(bundle.horizon_seconds);}}if(bundle.scope){{const sEl=document.getElementById('accuracyScope');if(sEl&&['session','all','imported'].indexOf(bundle.scope)>=0)sEl.value=bundle.scope==='imported'?'session':bundle.scope;}}if(bundle.retention_hours){{const rEl=document.getElementById('accuracyRetentionHours');if(rEl)rEl.value=String(bundle.retention_hours);}}accuracyQueryKey=accuracyQuerySignature();updateAccuracySummary(bundle.summary||{{}});syncAccuracyPoints(bundle.points||[],{{resetView:true}});redrawAccuracyChart();const note=document.getElementById('accuracyNote');if(note)note.textContent='导入快照 · '+accuracyImportedLabel+' · '+bundle.inst_id+' · '+bundle.points.length+' 点 · 窗口 '+bundle.horizon_seconds+' 秒 · 双击图表重置缩放 · 点「返回实时」恢复自动刷新';}}
 	async function exportAccuracyChart(){{try{{const bundle=buildAccuracyExportBundle(),text=JSON.stringify(bundle,null,2),name=await saveJsonFile(text,accuracyExportFileName(),'OKX压测图表');const note=document.getElementById('accuracyNote');if(note)note.textContent='已导出 '+name+' · '+bundle.points.length+' 点 · 可在测试页「导入图表」回放';}}catch(e){{alert('导出图表失败：'+e);}}}}
 	async function pickAccuracyImportFile(){{if(window.showOpenFilePicker){{const handles=await showOpenFilePicker({{multiple:false,types:[{{description:'OKX压测图表',accept:{{'application/json':['.json']}}}}]}});return await handles[0].getFile();}}return await new Promise(resolve=>{{const input=document.getElementById('accuracyImportInput');if(!input){{resolve(null);return;}}input.onchange=()=>resolve(input.files&&input.files[0]?input.files[0]:null);input.value='';input.click();}});}}
-	async function importAccuracyChart(){{try{{const file=await pickAccuracyImportFile();if(!file)return;const bundle=normalizeAccuracyBundle(JSON.parse(await file.text()));applyImportedAccuracyBundle(bundle);}}catch(e){{alert('导入图表失败：'+e);}}}}
+	async function importAccuracyChart(){{try{{const file=await pickAccuracyImportFile();if(!file)return;const bundle=normalizeAccuracyBundle(JSON.parse(await file.text()));setAccuracyEnabled(true,{{fetchNow:false}});applyImportedAccuracyBundle(bundle);}}catch(e){{alert('导入图表失败：'+e);}}}}
 	function exitAccuracyImportedMode(){{setAccuracyImportedMode(false,'');fetchAccuracy({{resetView:true}});}}
 	function clamp(v,a,b){{return Math.max(a,Math.min(b,v));}}
 	function accuracyDirectionValue(o){{const v=String((o&&o.direction)||'');if(v==='\\u505a\\u591a')return 1;if(v==='\\u505a\\u7a7a')return -1;return 0;}}
@@ -2722,8 +4403,8 @@ const importConfigBtn = document.getElementById('importConfigBtn');
 	function accuracyTimeLabel(t,spanHours){{if(spanHours>=4)return compactTime(t);return shortTime(t);}}
 	function syncAccuracyPoints(points,options){{const opts=options||{{}},clean=(points||[]).filter(o=>Number.isFinite(Number(o&&o.price))),hadFullView=accuracyView.start<=0.001&&accuracyView.end>=0.999;if(opts.resetView){{accuracyView.points=clean;resetAccuracyView();return;}}const followLatest=accuracyView.followLatest!==false&&accuracyView.end>=0.995;accuracyView.points=clean;if(clean.length>2&&(followLatest||hadFullView)){{accuracyView.start=0;accuracyView.end=1;accuracyView.followLatest=true;}}else if(followLatest&&clean.length>2){{const span=Math.max(0.001,accuracyView.end-accuracyView.start);accuracyView.end=1;accuracyView.start=Math.max(0,1-span);}}}}
 	function redrawAccuracyChart(){{drawAccuracyChart();}}
-	async function fetchAccuracy(options){{options=options||{{}};if(fetchAccuracyInFlight&&!options.force)return fetchAccuracyInFlight;const run=async()=>{{const canvas=document.getElementById('accuracyChart');if(!canvas)return;const resetView=!!options.resetView||accuracyQuerySignature()!==accuracyQueryKey;if(accuracyImportedMode&&!options.resetView)return;if(options.resetView)setAccuracyImportedMode(false,'');const inst=(document.getElementById('accuracyInst')||{{}}).value||'BTC-USDT-SWAP',h=(document.getElementById('accuracyHorizon')||{{}}).value||'5',scope=(document.getElementById('accuracyScope')||{{}}).value||'session',retention=accuracyRetentionHours(),interval=configuredMonitorInterval(),note=document.getElementById('accuracyNote');const queryKey=accuracyQuerySignature();accuracyQueryKey=queryKey;try{{if(note&&resetView)note.textContent='正在统计实时预测压测...';const qs='inst_id='+encodeURIComponent(inst)+'&horizon='+encodeURIComponent(h)+'&scope='+encodeURIComponent(scope)+'&retention_hours='+encodeURIComponent(retention)+'&interval_seconds='+encodeURIComponent(interval);const r=await fetch('/api/accuracy-data?'+qs,{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'统计失败');accuracyLivePayload=p;const s=p.summary||{{}};updateAccuracySummary(s);syncAccuracyPoints(p.points||[],{{resetView:resetView}});redrawAccuracyChart();if(p.replay_pending){{if(note)note.textContent=p.hint||'请先点击下方「开始回放」；切换「回放会话」不会自动启动回放。';return;}}const maxPts=p.max_points||0,intervalSec=p.interval_seconds||interval,retainH=p.retention_hours||retention;let noteExtra='';if(p.scope==='replay'&&(s.total??0)===0&&((s.raw_log_total??0)>0||(s.pending_total??0)>0))noteExtra=' · 回放日志已有数据，验证窗口成熟后曲线才会加点';else if(p.scope==='replay'&&(s.raw_log_total??0)===0)noteExtra=' · 回放进行中，请稍候';else if(p.scope==='session'&&(s.raw_log_total??0)===0)noteExtra=' · 监控刚启动，请等待几轮轮询';else if((s.pending_total??0)>0&&(s.next_pending_seconds??0)>0)noteExtra=' · 还有 '+s.pending_total+' 条待验证，最近约 '+s.next_pending_seconds+' 秒后可加点';else if((s.pending_total??0)>0)noteExtra=' · 还有 '+s.pending_total+' 条待验证，点「刷新压测」即可尝试更新';if(note)note.textContent=(p.scope==='replay'?'回放会话':p.scope==='session'?'本次启动后':'全部历史')+' · 模拟 '+formatPaperSummary(s)+' · 综合 '+fmt(s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,1)+'% · 窗口 '+formatHorizonLabel(p.horizon_seconds||h)+((p.time_start&&p.time_end)?(' · 范围 '+compactTime(p.time_start)+' ~ '+compactTime(p.time_end)):'')+' · '+(p.chart_points||accuracyView.points.length||0)+'点 · 双击重置缩放'+noteExtra;}}catch(e){{updateAccuracySummary({{}});syncAccuracyPoints([],{{resetView:true}});redrawAccuracyChart();if(note)note.textContent='预测压测统计失败：'+e;}}}};fetchAccuracyInFlight=run();try{{await fetchAccuracyInFlight;}}finally{{fetchAccuracyInFlight=null;}}}}
-	function switchAccuracyToLiveSession(){{const scopeEl=document.getElementById('accuracyScope');if(scopeEl&&scopeEl.value!=='session'){{accuracyScopeSyncing=true;scopeEl.value='session';accuracyScopeSyncing=false;}}setAccuracyImportedMode(false,'');accuracyQueryKey='';fetchAccuracy({{resetView:true}});}}
+	async function fetchAccuracy(options){{options=options||{{}};if(!isAccuracyEnabled())return null;if(fetchAccuracyInFlight&&!options.force)return fetchAccuracyInFlight;const run=async()=>{{const canvas=document.getElementById('accuracyChart');if(!canvas)return;const resetView=!!options.resetView||accuracyQuerySignature()!==accuracyQueryKey;if(accuracyImportedMode&&!options.resetView)return;if(options.resetView)setAccuracyImportedMode(false,'');const inst=(document.getElementById('accuracyInst')||{{}}).value||'BTC-USDT-SWAP',h=(document.getElementById('accuracyHorizon')||{{}}).value||'5',scope=(document.getElementById('accuracyScope')||{{}}).value||'session',retention=accuracyRetentionHours(),interval=configuredMonitorInterval(),note=document.getElementById('accuracyNote');const queryKey=accuracyQuerySignature();accuracyQueryKey=queryKey;try{{if(note&&resetView)note.textContent='正在统计实时预测压测...';const qs='inst_id='+encodeURIComponent(inst)+'&horizon='+encodeURIComponent(h)+'&scope='+encodeURIComponent(scope)+'&retention_hours='+encodeURIComponent(retention)+'&interval_seconds='+encodeURIComponent(interval);const r=await fetch('/api/accuracy-data?'+qs,{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'统计失败');accuracyLivePayload=p;const s=p.summary||{{}};updateAccuracySummary(s);syncAccuracyPoints(p.points||[],{{resetView:resetView}});redrawAccuracyChart();if(p.replay_pending){{if(note)note.textContent=p.hint||'请先点击下方「开始回放」；切换「回放会话」不会自动启动回放。';return;}}const maxPts=p.max_points||0,intervalSec=p.interval_seconds||interval,retainH=p.retention_hours||retention;let noteExtra='';if(p.scope==='replay'&&(s.total??0)===0&&((s.raw_log_total??0)>0||(s.pending_total??0)>0))noteExtra=' · 回放日志已有数据，验证窗口成熟后曲线才会加点';else if(p.scope==='replay'&&(s.raw_log_total??0)===0)noteExtra=' · 回放进行中，请稍候';else if(p.scope==='session'&&(s.raw_log_total??0)===0)noteExtra=' · 监控刚启动，请等待几轮轮询';else if((s.pending_total??0)>0&&(s.next_pending_seconds??0)>0)noteExtra=' · 还有 '+s.pending_total+' 条待验证，最近约 '+s.next_pending_seconds+' 秒后可加点';else if((s.pending_total??0)>0)noteExtra=' · 还有 '+s.pending_total+' 条待验证，点「刷新压测」即可尝试更新';if(note)note.textContent=(p.scope==='replay'?'回放会话':p.scope==='session'?'本次启动后':'全部历史')+' · 模拟 '+formatPaperSummary(s)+' · 综合 '+fmt(s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,1)+'% · 窗口 '+formatHorizonLabel(p.horizon_seconds||h)+((p.time_start&&p.time_end)?(' · 范围 '+compactTime(p.time_start)+' ~ '+compactTime(p.time_end)):'')+' · '+(p.chart_points||accuracyView.points.length||0)+'点 · 双击重置缩放'+noteExtra;}}catch(e){{updateAccuracySummary({{}});syncAccuracyPoints([],{{resetView:true}});redrawAccuracyChart();if(note)note.textContent='预测压测统计失败：'+e;}}}};fetchAccuracyInFlight=run();try{{await fetchAccuracyInFlight;}}finally{{fetchAccuracyInFlight=null;}}}}
+	function switchAccuracyToLiveSession(){{const scopeEl=document.getElementById('accuracyScope');if(scopeEl&&scopeEl.value!=='session'){{accuracyScopeSyncing=true;scopeEl.value='session';accuracyScopeSyncing=false;}}setAccuracyImportedMode(false,'');accuracyQueryKey='';if(isAccuracyEnabled())fetchAccuracy({{resetView:true}});}}
 	function switchAccuracyToReplaySession(){{const scopeEl=document.getElementById('accuracyScope');if(scopeEl&&scopeEl.value!=='replay'){{accuracyScopeSyncing=true;scopeEl.value='replay';accuracyScopeSyncing=false;}}setAccuracyImportedMode(false,'');accuracyQueryKey='';}}
 	function syncAccuracyScopeWithReplay(info){{if(!info||!info.replay_running)return false;const scopeEl=document.getElementById('accuracyScope');if(!scopeEl||scopeEl.value==='replay')return false;switchAccuracyToReplaySession();return true;}}
 	async function onAccuracyScopeChange(){{if(accuracyScopeSyncing)return;const scopeEl=document.getElementById('accuracyScope');if(scopeEl&&scopeEl.value!=='replay')stopReplayAccuracyPoll();if(scopeEl&&scopeEl.value==='replay'){{let monitorRunning=false;try{{const st=await fetch('/api/status',{{cache:'no-store'}}).then(r=>r.json());monitorRunning=!!(st&&st.running);}}catch(e){{}}if(monitorRunning){{alert('监控运行中无法查看回放压测，请先停止监控');accuracyScopeSyncing=true;scopeEl.value='session';accuracyScopeSyncing=false;}}}}await fetchAccuracy({{resetView:true}});syncReplayAccuracyPoll();}}
@@ -2736,7 +4417,7 @@ const importConfigBtn = document.getElementById('importConfigBtn');
 	const accuracyScopeEl=document.getElementById('accuracyScope');if(accuracyScopeEl)accuracyScopeEl.addEventListener('change',onAccuracyScopeChange);
 	function formatHorizonLabel(sec){{const n=Number(sec)||0;if(n>=60&&n%60===0)return (n/60)+'分钟';return n+'秒';}}
 	function formatPaperSummary(s){{if(!s||s.paper_equity==null)return '--';const pnl=Number(s.paper_pnl_usd)||0,pct=Number(s.paper_pnl_pct)||0,sign=pnl>=0?'+':'';return '$'+fmt(s.paper_equity,0)+' ('+sign+fmt(pnl,0)+' / '+sign+fmt(pct,2)+'%) · '+(s.paper_position_label||'--');}}
-	function updateAccuracySummary(s){{const box=document.getElementById('accuracySummary');if(!box)return;s=s||{{}};const pred=s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,tradeTotal=s.trade_signal_total??0,tradeDir=s.trade_direction_accuracy_pct,tradePlan=s.trade_signal_accuracy_pct,watchTotal=s.watch_total??0,watchPct=s.watch_reasonable_pct,watchMiss=s.watch_missed_pct,resolved=s.trade_resolved_total??0,pending=s.pending_total??0,nextPending=s.next_pending_seconds??0,execLine=tradeTotal>=5?(fmt(s.entry_touch_pct,1)+'% / '+fmt(s.no_fill_pct,1)+'%'):'样本不足',paperPts=s.paper_log_points??0,verifiedLine=(s.total??0)+' / '+(s.raw_log_total??s.total??0)+(pending>0?(' · '+pending+'待'):'');const vals=[['模拟账户($10k)',formatPaperSummary(s)+' / '+(s.paper_trade_count??0)+'笔 · '+paperPts+'轮','paper'],['综合预测准确度',pred!=null?fmt(pred,1)+'% / '+(s.decision_total??s.total??0):'--','primary'],['可靠性等级',(s.reliability_level||'--')+' / '+(s.reliability_score!=null?fmt(s.reliability_score,1):'--')],['已验证/日志',verifiedLine],['待验证',pending>0?(nextPending>0?('约'+nextPending+'秒后下一条'):'窗口已够，刷新即验证'):'--'],['观望准确度',watchPct!=null?fmt(watchPct,1)+'% / '+watchTotal:'--'],['观望错失率',watchMiss!=null?fmt(watchMiss,1)+'% / '+watchTotal:'--'],['交易方向命中',tradeDir!=null?fmt(tradeDir,1)+'% / '+tradeTotal:'--'],['交易执行合理率',tradePlan!=null?fmt(tradePlan,1)+'% / '+tradeTotal:'--'],['验证窗口',formatHorizonLabel(s.horizon_seconds)+' · 阈值 '+fmt(s.threshold_pct,3)+'%'],['入场触达/未成交',execLine]];if(resolved>=3)vals.push(['止盈/止损/胜率',fmt(s.take_profit_pct,1)+'% / '+fmt(s.stop_hit_pct,1)+'% / '+fmt(s.trade_win_rate_pct,1)+'% ('+resolved+')']);box.innerHTML=vals.map(v=>'<div class="'+(v[2]==='paper'?'accuracy-paper-primary':(v[2]==='primary'?'accuracy-primary':''))+'"><span>'+v[0]+'</span><b>'+v[1]+'</b></div>').join('');}}
+	function updateAccuracySummary(s){{const box=document.getElementById('accuracySummary');if(!box)return;s=s||{{}};const pred=s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,tradeTotal=s.trade_signal_total??0,tradeDir=s.trade_direction_accuracy_pct,tradePlan=s.trade_signal_accuracy_pct,watchTotal=s.watch_total??0,watchPct=s.watch_reasonable_pct,resolved=s.trade_resolved_total??0,pending=s.pending_total??0,nextPending=s.next_pending_seconds??0,execLine=tradeTotal>=5?(fmt(s.entry_touch_pct,1)+'% / '+fmt(s.no_fill_pct,1)+'%'):'样本不足',paperPts=s.paper_log_points??0,verifiedLine=(s.total??0)+' / '+(s.raw_log_total??s.total??0)+(pending>0?(' · '+pending+'待'):'');const vals=[['模拟账户($10k)',formatPaperSummary(s)+' / '+(s.paper_trade_count??0)+'笔 · '+paperPts+'轮','paper'],['综合预测准确度',pred!=null?fmt(pred,1)+'% / '+(s.decision_total??s.total??0):'--','primary'],['可靠性等级',(s.reliability_level||'--')+' / '+(s.reliability_score!=null?fmt(s.reliability_score,1):'--')],['已验证/日志',verifiedLine],['待验证',pending>0?(nextPending>0?('约'+nextPending+'秒后下一条'):'窗口已够，刷新即验证'):'--'],['观望准确度',watchPct!=null?fmt(watchPct,1)+'% / '+watchTotal:'--'],['交易方向命中',tradeDir!=null?fmt(tradeDir,1)+'% / '+tradeTotal:'--'],['交易执行合理率',tradePlan!=null?fmt(tradePlan,1)+'% / '+tradeTotal:'--'],['验证窗口',formatHorizonLabel(s.horizon_seconds)+' · 阈值 '+fmt(s.threshold_pct,3)+'%'],['入场触达/未成交',execLine]];if(resolved>=3)vals.push(['止盈/止损/胜率',fmt(s.take_profit_pct,1)+'% / '+fmt(s.stop_hit_pct,1)+'% / '+fmt(s.trade_win_rate_pct,1)+'% ('+resolved+')']);box.innerHTML=vals.map(v=>'<div class="'+(v[2]==='paper'?'accuracy-paper-primary':(v[2]==='primary'?'accuracy-primary':''))+'"><span>'+v[0]+'</span><b>'+v[1]+'</b></div>').join('');}}
 	function drawAccuracyChart(points){{if(Array.isArray(points))syncAccuracyPoints(points,{{resetView:true}});const c=document.getElementById('accuracyChart');if(!c)return;accuracyPlotPoints=[];const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=Math.max(1,r.width*d);c.height=Math.max(1,r.height*d);const ctx=c.getContext('2d');ctx.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,pad={{l:58,r:52,t:24,b:40}},cw=W-pad.l-pad.r,ch=H-pad.t-pad.b;ctx.clearRect(0,0,W,H);ctx.fillStyle='#0f172a';ctx.fillRect(0,0,W,H);let clean=visibleAccuracyPoints();if(!clean.length){{updateAccuracyPointPanel(null);ctx.fillStyle='rgba(203,213,225,.82)';ctx.textAlign='center';ctx.textBaseline='middle';ctx.font='13px Segoe UI, Microsoft YaHei';const scopeNow=(document.getElementById('accuracyScope')||{{}}).value||'session',emptyMsg=scopeNow==='replay'?'回放会话暂无数据：请先点击下方「开始回放」，切换范围不会自动启动回放':(scopeNow==='all'?'全部历史暂无已验证点：请确认日志中有该币种数据':'暂无可验证样本：live 监控请启动后选「本次启动后」；离线回放请点「开始回放」后选「回放会话」');ctx.fillText(emptyMsg,W/2,H/2);return;}}const visibleCount=clean.length,totalCount=(accuracyView.points||[]).length;if(clean.length===1)clean=[clean[0],Object.assign({{}},clean[0])];const priceVals=clean.map(o=>Number(o.price)),mn=Math.min(...priceVals),mx=Math.max(...priceVals),basePriceRg=Math.max((mx||1)*0.001,(mx-mn)*1.16,0.01);let pred=0;const predVals=clean.map(o=>{{pred+=accuracyDirectionValue(o);return pred;}}),pmn=Math.min(...predVals),pmx=Math.max(...predVals),basePredRg=Math.max(1,(pmx-pmn)*1.16,1);const yZoom=Math.max(0.35,accuracyView.yZoom||1),yPan=accuracyView.yPan||0,normTop=0.5+yPan+0.5/yZoom,normBottom=0.5+yPan-0.5/yZoom,priceSpan=Math.max(0.000001,basePriceRg),predSpan=Math.max(0.000001,basePredRg),priceAxisBottom=mn+normBottom*priceSpan,priceAxisTop=mn+normTop*priceSpan,predAxisBottom=pmn+normBottom*predSpan,predAxisTop=pmn+normTop*predSpan;accuracyView.priceRg=priceSpan/yZoom;const pricePlotRg=Math.max(0.000001,priceAxisTop-priceAxisBottom),predPlotRg=Math.max(0.000001,predAxisTop-predAxisBottom),priceFlat=Math.abs(mx-mn)<1e-9,predFlat=Math.abs(pmx-pmn)<1e-9,bothFlat=priceFlat&&predFlat,priceY=o=>{{let norm=priceFlat?0.5:(Number(o.price)-priceAxisBottom)/pricePlotRg;return pad.t+ch-norm*ch-(bothFlat?16:0);}},predValY=val=>{{let norm=predFlat?0.5:(val-predAxisBottom)/predPlotRg;return pad.t+ch-norm*ch+(bothFlat?16:0);}},stepFull=cw/Math.max(1,clean.length-1),xAtFull=i=>pad.l+stepFull*i;const drawBudget=accuracyLinePointBudget(cw,clean.length),showMarkers=accuracyShowPointMarkers(cw,clean.length),decimated=decimateAccuracySeries(clean,predVals,drawBudget),drawPts=decimated.points,drawPred=decimated.predVals,stepDraw=cw/Math.max(1,drawPts.length-1),xAtDraw=i=>pad.l+stepDraw*i,denseMode=drawPts.length<clean.length,priceLineWidth=denseMode?1.5:2.6,predLineWidth=denseMode?1.1:2;ctx.strokeStyle='rgba(148,163,184,.22)';ctx.lineWidth=1;for(let i=0;i<=4;i++){{const y=pad.t+ch*i/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke();}}drawAccuracyLeftAxis(ctx,pad,W,H,priceAxisBottom,priceAxisTop);drawAccuracyRightAxis(ctx,pad,W,H,predAxisBottom,predAxisTop);drawAccuracyTimeAxis(ctx,W,H,pad,clean,cw);ctx.beginPath();drawPts.forEach((o,i)=>{{const px=xAtDraw(i),py=predValY(drawPred[i]);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);}});ctx.strokeStyle='rgba(251,191,36,.92)';ctx.lineWidth=predLineWidth;ctx.stroke();ctx.beginPath();drawPts.forEach((o,i)=>{{const px=xAtDraw(i),py=priceY(o);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);}});ctx.strokeStyle='rgba(96,165,250,.95)';ctx.lineWidth=priceLineWidth;ctx.stroke();const paperEq=clean.map(o=>Number(o.paper_equity)).filter(v=>Number.isFinite(v));if(paperEq.length>=2){{const pMn=Math.min(...paperEq),pMx=Math.max(...paperEq),pRg=Math.max(0.01,pMx-pMn),paperY=v=>pad.t+ch-((v-pMn)/pRg)*ch;let started=false;ctx.beginPath();clean.forEach((o,i)=>{{const pe=Number(o.paper_equity);if(!Number.isFinite(pe))return;const px=xAtFull(i),py=paperY(pe);if(!started){{ctx.moveTo(px,py);started=true;}}else ctx.lineTo(px,py);}});if(started){{ctx.strokeStyle='rgba(74,222,128,.92)';ctx.lineWidth=denseMode?1.2:2;ctx.stroke();}}}}const markerPriceRadius=showMarkers?(visibleCount>160?1.6:2.8):0,markerPredRadius=showMarkers?(visibleCount>160?1.4:2.4):0;clean.forEach((o,i)=>{{const px=xAtFull(i),pyPrice=priceY(o),pyPred=predValY(predVals[i]),selected=(o.time||'')===accuracyView.selectedKey;accuracyPlotPoints.push({{x:px,yPrice:pyPrice,yPred:pyPred,predVal:predVals[i],point:o}});if(!showMarkers&&!selected)return;const pr=selected?4.2:(markerPriceRadius||2.8),qr=selected?3.8:(markerPredRadius||2.4);ctx.lineWidth=selected?1.5:1;ctx.strokeStyle='rgba(15,23,42,.85)';ctx.fillStyle=selected?'#22d3ee':(o.hit?'#34d399':'#fb7185');ctx.beginPath();ctx.arc(px,pyPrice,pr,0,Math.PI*2);ctx.fill();ctx.stroke();ctx.strokeStyle='rgba(15,23,42,.85)';ctx.fillStyle=selected?'#fde047':'#fbbf24';ctx.beginPath();ctx.arc(px,pyPred,qr,0,Math.PI*2);ctx.fill();ctx.stroke();}});let selectedPlot=null;if(accuracyView.selectedKey){{selectedPlot=accuracyPlotPoints.find(o=>(o.point.time||'')===accuracyView.selectedKey)||null;if(selectedPlot){{drawAccuracyCrosshair(ctx,pad,W,H,selectedPlot);updateAccuracyPointPanel(selectedPlot.point);}}else{{accuracyView.selectedKey='';updateAccuracyPointPanel(null);}}}}else{{updateAccuracyPointPanel(null);}}ctx.fillStyle='rgba(226,232,240,.92)';ctx.font='12px Segoe UI, Microsoft YaHei';ctx.textAlign='left';ctx.textBaseline='top';ctx.fillText('蓝线：价格',pad.l,pad.t+4);ctx.fillStyle='#4ade80';ctx.fillText('绿线：模拟账户',pad.l+72,pad.t+4);ctx.fillStyle='#fbbf24';ctx.fillText('黄线：预测方向',pad.l+168,pad.t+4);ctx.fillStyle=denseMode?'#fcd34d':'rgba(203,213,225,.72)';ctx.fillText(' · 绘制 '+drawPts.length+'/'+visibleCount+(denseMode?' 已抽稀':' 全量'),pad.l+248,pad.t+4);ctx.textAlign='right';ctx.fillStyle='rgba(203,213,225,.68)';ctx.textBaseline='top';ctx.fillText('总计 '+totalCount+' 点 · 滚轮缩放 · 拖动平移 · 点击选点',W-pad.r,H-26);}}
 	function setupAccuracyChartInteractions(){{const c=document.getElementById('accuracyChart');if(!c||c.dataset.panZoomBound)return;c.dataset.panZoomBound='1';c.addEventListener('wheel',e=>{{if(!accuracyView.points.length)return;e.preventDefault();const rect=c.getBoundingClientRect(),mx=(e.clientX-rect.left)/Math.max(1,rect.width),factor=e.deltaY>0?1.18:0.85,n=accuracyView.points.length;if(e.shiftKey||n<=2){{accuracyView.yZoom=clamp(accuracyView.yZoom/factor,0.35,12);}}else{{const span=accuracyView.end-accuracyView.start,newSpan=clamp(span*factor,accuracyMinTimeSpan(),1),anchor=accuracyView.start+span*mx;accuracyView.start=clamp(anchor-newSpan*mx,0,1-newSpan);accuracyView.end=accuracyView.start+newSpan;}}accuracyView.followLatest=accuracyView.end>=0.995;drawAccuracyChart();}},{{passive:false}});c.addEventListener('mousedown',e=>{{accuracyView.drag={{x:e.clientX,y:e.clientY,start:accuracyView.start,end:accuracyView.end,yPan:accuracyView.yPan,moved:false}};c.classList.add('dragging');}});window.addEventListener('mousemove',e=>{{const g=accuracyView.drag;if(!g)return;const rect=c.getBoundingClientRect(),dx=(e.clientX-g.x)/Math.max(1,rect.width),dy=(e.clientY-g.y)/Math.max(1,rect.height),span=g.end-g.start;if(Math.abs(e.clientX-g.x)>3||Math.abs(e.clientY-g.y)>3)g.moved=true;let ns=clamp(g.start-dx*span,0,1-span),ne=ns+span;accuracyView.start=ns;accuracyView.end=ne;accuracyView.yPan=clamp(g.yPan+dy*1.35,-3,3);accuracyView.followLatest=accuracyView.end>=0.995;drawAccuracyChart();}});window.addEventListener('mouseup',()=>{{if(accuracyView.drag){{setTimeout(function(){{accuracyView.drag=null;}},0);}}c.classList.remove('dragging');}});c.addEventListener('click',e=>{{if(accuracyView.drag&&accuracyView.drag.moved)return;selectAccuracyPoint(e,false);}});c.addEventListener('dblclick',e=>{{if(accuracyView.drag&&accuracyView.drag.moved)return;resetAccuracyView();drawAccuracyChart();}});}}
 	setupAccuracyChartInteractions();
@@ -2746,19 +4427,40 @@ let monitorInst={json.dumps(monitor_initial, ensure_ascii=False)}, monitorPayloa
 let monitorSeriesByInst={{}}, monitorLastTickerAt=0;
 let virtualSeriesByInst={{}};
 let monitorViewStart=0, monitorViewEnd=1;
-let monitorVisiblePoints=[], monitorPlotPoints=[], monitorSelectedKey='', monitorLatestPoint=null;
+let monitorVisiblePoints=[], monitorPlotPoints=[], monitorSelectedKey='', monitorLatestPoint=null, monitorLatestSnapshot=null;
 let monitorYZoom=1, monitorYPan=0, monitorYRange=1, monitorDrag=null;
 let monitorStartedAt='', monitorElapsedSeconds=0, monitorStatusRunning=false, monitorWasRunning=false;
+let monitorBar='1m', monitorCandlesByKey={{}}, monitorMetaText='';
+function monitorCacheKey(inst,bar){{return (inst||'')+'|'+(bar||'1m');}}
+function bindMonitorBarTabs(){{document.querySelectorAll('[data-monitor-bar]').forEach(function(btn){{btn.onclick=function(){{const next=btn.getAttribute('data-monitor-bar');if(!next||next===monitorBar)return;monitorBar=next;document.querySelectorAll('[data-monitor-bar]').forEach(function(el){{el.classList.toggle('active',el.getAttribute('data-monitor-bar')===monitorBar);}});monitorViewStart=0;monitorViewEnd=1;monitorYZoom=1;monitorYPan=0;monitorSelectedKey='';monitorLastTickerAt=0;if(isMonitorChartEnabled())bootstrapMonitorChart();}};}});}}
+const MONITOR_CHART_KEY='okx_monitor_chart_enabled';
+function isMonitorChartEnabled(){{const el=document.getElementById('monitorChartEnableToggle');return!!(el&&el.checked);}}
+function showMonitorChartOffState(){{const panel=document.getElementById('monitorChartPanel'),offHint=document.getElementById('monitorChartOffHint'),c=document.getElementById('monitorChart'),l=document.getElementById('monitorLoading'),t=document.getElementById('monitorTitle'),m=document.getElementById('monitorMeta'),p=document.getElementById('monitorPrice');if(panel)panel.classList.add('monitor-chart-off');if(offHint)offHint.hidden=false;monitorSelectedKey='';monitorVisiblePoints=[];monitorPlotPoints=[];if(c){{const r=c.getBoundingClientRect(),x=c.getContext('2d');c.width=Math.max(1,r.width);c.height=Math.max(1,r.height);x.clearRect(0,0,r.width,r.height);}}if(l){{l.style.display='grid';l.textContent='K 线显示已关闭。打开右上角开关后可加载图表。';}}if(t)t.textContent=monitorInst?monitorTitleText():'未配置币种';if(m)m.textContent='图表已暂停 · 监控进程不受影响';if(p)p.innerHTML='<strong>--</strong><span>显示已关闭</span>';updateChartFooter([]);}}
+function updateMonitorChartUI(fetchNow){{const enabled=isMonitorChartEnabled(),panel=document.getElementById('monitorChartPanel'),label=document.getElementById('monitorChartLabel'),offHint=document.getElementById('monitorChartOffHint');if(panel)panel.classList.toggle('monitor-chart-off',!enabled);if(offHint)offHint.hidden=enabled;if(label)label.textContent=enabled?'K线显示已开启':'K线显示已关闭';try{{localStorage.setItem(MONITOR_CHART_KEY,enabled?'1':'0');}}catch(e){{}}if(!enabled){{showMonitorChartOffState();return;}}const l=document.getElementById('monitorLoading');if(l&&l.textContent.indexOf('K 线显示已关闭')>=0)l.textContent='正在加载 K 线...';if(fetchNow)bootstrapMonitorChart();}}
+function initMonitorChartToggle(){{const toggle=document.getElementById('monitorChartEnableToggle');if(!toggle)return;try{{const saved=localStorage.getItem(MONITOR_CHART_KEY);toggle.checked=saved!=='0';}}catch(e){{toggle.checked=true;}}updateMonitorChartUI(false);toggle.addEventListener('change',function(){{updateMonitorChartUI(true);}});}}
+function candleOhlc(point){{if(!point)return null;const close=Number(point.close!=null?point.close:point.price);if(!Number.isFinite(close))return null;const open=Number(point.open!=null?point.open:close);const high=Number(point.high!=null?point.high:Math.max(open,close));const low=Number(point.low!=null?point.low:Math.min(open,close));return {{open:open,high:high,low:low,close:close}};}}
+function seriesToCandles(series){{if(!Array.isArray(series)||!series.length)return [];const base=virtualBase();return series.map(function(pt,i){{const close=Number(pt.price);const open=i>0?Number(series[i-1].price):close;const wick=Math.max(Math.abs(close-open)*0.35,base*0.00008,0.01);return Object.assign({{}},pt,{{open:open,close:close,high:Math.max(open,close)+wick,low:Math.min(open,close)-wick,price:close,kind:pt.kind||'virtual'}});}});}}
+function setMonitorCandles(points){{const series=(points||[]).slice();monitorCandlesByKey[monitorCacheKey(monitorInst,monitorBar)]=series;monitorSeriesByInst[monitorInst]=series;monitorPayload={{points:series,bar:monitorBar}};return series;}}
+function monitorTitleText(){{return monitorInst+' · '+monitorBar+' K线';}}
+function currentMonitorSeries(){{return monitorCandlesByKey[monitorCacheKey(monitorInst,monitorBar)]||monitorSeriesByInst[monitorInst]||[];}}
 function refreshMonitorTabs(insts){{if(!Array.isArray(insts))return;configuredMonitorInsts=insts;const box=document.querySelector('.coin-tabs');if(!box)return;if(!configuredMonitorInsts.length){{monitorInst='';box.innerHTML='<span class="empty-coin">请先在配置页选择监控币种</span>';clearChartMessage('请先在配置页选择监控币种');return;}}if(configuredMonitorInsts.indexOf(monitorInst)<0)monitorInst=configuredMonitorInsts[0];box.innerHTML=configuredMonitorInsts.map(inst=>'<button class="button coin-tab '+(inst===monitorInst?'active':'')+'" type="button" data-monitor-inst="'+inst+'">'+inst+'</button>').join('');bindMonitorTabs();}}
-function bindMonitorTabs(){{document.querySelectorAll('[data-monitor-inst]').forEach(b=>b.onclick=()=>{{const next=b.getAttribute('data-monitor-inst');if(configuredMonitorInsts.indexOf(next)<0)return;monitorInst=next;monitorViewStart=0;monitorViewEnd=1;monitorYZoom=1;monitorYPan=0;monitorSelectedKey='';monitorLastTickerAt=0;document.querySelectorAll('[data-monitor-inst]').forEach(o=>o.classList.remove('active'));b.classList.add('active');bootstrapMonitorChart();}});}}
-function virtualBase(){{return monitorInst==='ETH-USDT-SWAP'?3200:63000;}}
+function bindMonitorTabs(){{document.querySelectorAll('[data-monitor-inst]').forEach(b=>b.onclick=()=>{{const next=b.getAttribute('data-monitor-inst');if(configuredMonitorInsts.indexOf(next)<0)return;monitorInst=next;monitorViewStart=0;monitorViewEnd=1;monitorYZoom=1;monitorYPan=0;monitorSelectedKey='';monitorLastTickerAt=0;document.querySelectorAll('[data-monitor-inst]').forEach(o=>o.classList.remove('active'));b.classList.add('active');if(isMonitorChartEnabled())bootstrapMonitorChart();}});}}
+function virtualBase(){{if(monitorInst==='ETH-USDT-SWAP')return 3200;if(monitorInst==='BTC-USDT-SWAP')return 63000;return 100;}}
 function gen(n,base){{let a=[],v=base,now=Date.now();const step=Math.max(.18,base*.000055);for(let i=0;i<n;i++){{v+=(Math.random()-.5)*step+Math.sin((i+virtualTick)/18)*step*.18;a.push({{time:new Date(now-(n-i-1)*1000).toLocaleString(),price:v,kind:'virtual'}});}}return a;}}
 function nextVirtualSeries(){{if(!monitorInst)return [];virtualTick++;let series=virtualSeriesByInst[monitorInst]||[];if(series.length<2){{series=gen(260,virtualBase());}}else{{const last=Number(series[series.length-1].price)||virtualBase(),step=Math.max(.18,virtualBase()*.00007),drift=Math.sin(virtualTick/16)*step*.2,price=Math.max(.01,last+(Math.random()-.5)*step+drift);series=[...series.slice(-259),{{time:new Date().toLocaleString(),price:price,kind:'virtual'}}];}}virtualSeriesByInst[monitorInst]=series;return series;}}
-function visiblePoints(points){{if(!points||points.length<2)return points||[];const s=Math.max(0,Math.floor(monitorViewStart*(points.length-1))),e=Math.min(points.length,Math.ceil(monitorViewEnd*(points.length-1))+1);return points.slice(s,Math.max(s+2,e));}}
+function visiblePoints(points){{if(!points||points.length<2)return points||[];const last=points.length-1;let start=Math.max(0,Math.min(last,Math.floor(monitorViewStart*last)));let end=Math.max(start+1,Math.min(last,Math.ceil(monitorViewEnd*last)));return points.slice(start,end+1);}}
 function fmt(v,d){{const n=Number(v);return Number.isFinite(n)?n.toFixed(d):'--';}}
 function fmtPct(v){{const n=Number(v);return Number.isFinite(n)?n.toFixed(4)+'%':'--';}}
-function shortTime(t){{if(!t)return '--';const s=String(t);return s.length>=16?s.slice(11,16):s;}}
-function compactTime(t){{if(!t)return '--';const s=String(t);return s.length>=16?s.slice(5,16):s;}}
+function shortTime(t){{if(!t)return '--';const d=parsePointTime(t),pad=n=>String(n).padStart(2,'0');return pad(d.getHours())+':'+pad(d.getMinutes());}}
+function compactTime(t){{if(!t)return '--';const d=parsePointTime(t),pad=n=>String(n).padStart(2,'0');return pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes());}}
+function chartDate(t){{if(!t)return '--';const d=parsePointTime(t),pad=n=>String(n).padStart(2,'0');return pad(d.getMonth()+1)+'-'+pad(d.getDate());}}
+function monitorSpanHours(points){{if(!points||points.length<2)return 0;const a=parsePointTime(points[0].time).getTime(),b=parsePointTime(points[points.length-1].time).getTime();return Math.abs(b-a)/3600000;}}
+function monitorSpanDays(points){{return monitorSpanHours(points)/24;}}
+function monitorSameDay(left,right){{const a=parsePointTime(left),b=parsePointTime(right);return a.getFullYear()===b.getFullYear()&&a.getMonth()===b.getMonth()&&a.getDate()===b.getDate();}}
+function monitorSpansMultipleDays(points){{if(!points||points.length<2)return false;return !monitorSameDay(points[0].time,points[points.length-1].time);}}
+function monitorTimeLabel(t,spanHours,bar,points){{if(!t)return '--';const hours=Number(spanHours)||0,period=String(bar||monitorBar||'1m'),multiDay=monitorSpansMultipleDays(points);if(hours>=24*5||period==='4H')return chartDate(t);if(multiDay||hours>=18||period==='1H'||period==='15m')return compactTime(t);if(hours>=6)return compactTime(t);return shortTime(t);}}
+function timeAxisX(p,cw,points,index,candleMode){{if(candleMode)return p.l+(cw/points.length)*(index+0.5);return p.l+cw*index/Math.max(1,points.length-1);}}
+function drawTimeAxis(x,W,H,p,points,cw,options){{options=options||{{}};if(!points||points.length<2)return;const spanHours=monitorSpanHours(points),maxLabels=Math.max(2,Math.min(8,Math.floor(W/120))),step=Math.max(1,Math.floor((points.length-1)/(maxLabels-1))),candleMode=!!options.candleMode,labelFn=function(t){{return monitorTimeLabel(t,spanHours,options.bar||monitorBar,points);}};x.fillStyle='rgba(229,231,235,.9)';x.font='11px Segoe UI, Microsoft YaHei, Arial';x.textAlign='center';x.textBaseline='top';for(let i=0;i<points.length;i+=step){{const px=timeAxisX(p,cw,points,i,candleMode);x.fillText(labelFn(points[i].time),px,H-26);}}const lastIndex=points.length-1;if(lastIndex%step!==0){{x.fillText(labelFn(points[lastIndex].time),timeAxisX(p,cw,points,lastIndex,candleMode),H-26);}}}}
 function displayValue(v){{return v===undefined||v===null||v===''?'--':v;}}
 function compactList(v,limit){{if(!Array.isArray(v)||!v.length)return '--';return v.slice(0,limit||3).join(' / ')+(v.length>(limit||3)?' ...':'');}}
 function fmtScore(v){{const n=Number(v);return Number.isFinite(n)?String(Math.round(n)):'--';}}
@@ -2766,42 +4468,59 @@ function fmtSignedPct(v,d){{const n=Number(v);return Number.isFinite(n)?(n>=0?'+
 function fmtBool(v){{return v===true?'是':(v===false?'否':'--');}}
 function summarizeLayers(layers){{if(!layers||typeof layers!=='object')return '--';const keys=['market_regime_score','trend_score','momentum_score','volume_price_score','derivatives_score','orderbook_score','entry_quality_score','risk_control_score'];return keys.filter(k=>layers[k]!==undefined&&layers[k]!==null).map(k=>k.replace('_score','').replace('market_regime','状态').replace('volume_price','量价').replace('entry_quality','入场').replace('risk_control','风控').replace('orderbook','盘口').replace('derivatives','合约').replace('momentum','动量').replace('trend','趋势')+':'+fmtScore(layers[k])).join(' / ')||'--';}}
 function formatDuration(seconds){{let s=Math.max(0,Math.floor(Number(seconds)||0)),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60,pad=n=>String(n).padStart(2,'0');return h>0?h+'小时 '+pad(m)+'分 '+pad(sec)+'秒':pad(m)+':'+pad(sec);}}
-function updateMonitorUptime(status){{const el=document.getElementById('monitorUptime');if(status){{monitorStatusRunning=!!status.running;monitorStartedAt=status.started_at||'';monitorElapsedSeconds=Number(status.elapsed_seconds)||0;}}if(!el)return;if(monitorStatusRunning)el.textContent='已监控：'+formatDuration(monitorElapsedSeconds);else el.textContent=monitorStartedAt?'已停止：'+formatDuration(monitorElapsedSeconds):'已监控：未启动';}}
+function updateMonitorProcessInfo(status){{const el=document.getElementById('monitorProcessInfo');if(!el)return;if(status&&status.running&&status.pid){{el.textContent='PID '+status.pid+' · Token '+formatTokenCount(status.ai_total_tokens);return;}}if(status&&status.ai_total_tokens>0){{el.textContent='PID -- · Token '+formatTokenCount(status.ai_total_tokens);return;}}el.textContent='PID -- · Token --';}}
+function formatTokenCount(value){{const n=Number(value)||0;return n.toLocaleString('en-US');}}
+function updateMonitorUptime(status){{updateMonitorProcessInfo(status);const el=document.getElementById('monitorUptime');if(status){{monitorStatusRunning=!!status.running;monitorStartedAt=status.started_at||'';monitorElapsedSeconds=Number(status.elapsed_seconds)||0;}}if(!el)return;if(monitorStatusRunning)el.textContent='已监控：'+formatDuration(monitorElapsedSeconds);else el.textContent=monitorStartedAt?'已停止：'+formatDuration(monitorElapsedSeconds):'已监控：未启动';}}
 function formatPaperAccount(paper){{if(!paper||paper.equity==null)return '--';const eq=Number(paper.equity),pnl=Number(paper.pnl_usd)||0,pct=Number(paper.pnl_pct)||0,sign=pnl>=0?'+':'';return '$'+fmt(eq,0)+' ('+sign+fmt(pnl,0)+' / '+sign+fmt(pct,2)+'%) · '+(paper.position_label||paper.position||'--');}}
 function updatePaperAccount(paper){{const el=document.getElementById('monitorPaperAccount');if(!el)return;if(!paper||paper.equity==null){{el.textContent='模拟账户：--';el.classList.remove('paper-up','paper-down');return;}}const pnl=Number(paper.pnl_usd)||0;el.textContent='模拟账户 '+formatPaperAccount(paper);el.classList.remove('paper-up','paper-down');el.classList.add(pnl>=0?'paper-up':'paper-down');}}
-function updateChartFooter(points){{const c=document.getElementById('monitorPointCount');if(!c)return;c.textContent='数据点：'+((points&&points.length)||0);}}
+function updateChartFooter(points){{const c=document.getElementById('monitorPointCount');if(!c)return;c.textContent='K线：'+((points&&points.length)||0);}}
 function parsePointTime(t){{const s=String(t||'');const m=s.match(/^(\\d{{4}})-(\\d{{2}})-(\\d{{2}})[ T](\\d{{2}}):(\\d{{2}})(?::(\\d{{2}}))?/);if(m)return new Date(Number(m[1]),Number(m[2])-1,Number(m[3]),Number(m[4]),Number(m[5]),Number(m[6]||0));const d=new Date(s);return Number.isFinite(d.getTime())?d:new Date();}}
 function formatPointTime(d){{const pad=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());}}
 function bucket1mTime(t){{const d=parsePointTime(t);d.setSeconds(0,0);return formatPointTime(d);}}
 function normalizeClientPoint(point,fallbackKind){{if(!point)return null;const price=Number(point.price);if(!Number.isFinite(price))return null;const normalized=Object.assign({{}},point);normalized.kind=normalized.kind||fallbackKind||'realtime';normalized.time=String(point.time||new Date().toLocaleString());if(normalized.kind!=='virtual')normalized.time=bucket1mTime(normalized.time);normalized.price=price;return normalized;}}
 function mergeClientPoints(existing,incoming,maxPoints){{const merged=[],indexByTime={{}};[...(existing||[]),...(incoming||[])].forEach(point=>{{const normalized=normalizeClientPoint(point,'realtime');if(!normalized)return;const key=normalized.time||'';if(key&&Object.prototype.hasOwnProperty.call(indexByTime,key)){{merged[indexByTime[key]]=Object.assign({{}},merged[indexByTime[key]],normalized);return;}}if(key)indexByTime[key]=merged.length;merged.push(normalized);}});merged.sort((a,b)=>parsePointTime(a.time).getTime()-parsePointTime(b.time).getTime());return merged.slice(-Math.max(2,maxPoints||20000));}}
-function setMonitorSeries(points){{const series=mergeClientPoints([],points||[],20000);monitorSeriesByInst[monitorInst]=series;monitorPayload={{points:series}};return series;}}
-function appendMonitorPoints(points){{const series=mergeClientPoints(monitorSeriesByInst[monitorInst]||[],points||[],20000);monitorSeriesByInst[monitorInst]=series;monitorPayload={{points:series}};return series;}}
-function drawMonitorSeries(metaText){{const series=monitorSeriesByInst[monitorInst]||[];if(series.length){{drawChart('monitorChart',series,document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));document.getElementById('monitorTitle').textContent=monitorInst+' 实时走势';const m=document.getElementById('monitorMeta');if(m&&metaText)m.textContent=metaText;return true;}}return false;}}
-	function snapshotHtml(point,title){{if(!point)return '<strong>Snapshot</strong><div class="snapshot-grid"><span>价格</span><b>--</b><span>时间</span><b>--</b><span>评分</span><b>--</b><span>方向</span><b>--</b></div>';const hasMetrics=point.raw_total_score!==undefined&&point.raw_total_score!==null,kind=point.kind==='history'?(hasMetrics?'历史K线+日志指标':'历史K线'):'实时快照',dir=(point.raw_direction&&point.final_direction&&point.raw_direction!==point.final_direction)?(point.raw_direction+' → '+point.final_direction):(point.final_direction||point.direction||'--'),scoreText='综合 '+fmtScore(point.score)+' / 观察 '+fmtScore(point.raw_total_score)+' / 交易 '+fmtScore(point.final_trade_score),riskText=(point.market_risk_level||point.risk_level||'--')+' / '+(point.trade_action_level||'--'),lsAvail=point.long_short_available===false?'不可用':'可用',longShort=fmt(Number(point.long_ratio)*100,1)+'/'+fmt(Number(point.short_ratio)*100,1)+'% ('+lsAvail+')',warmup='OI '+fmtBool(point.oi_warmup_ready)+' / 费率 '+fmtBool(point.funding_warmup_ready),volumeText=fmt(point.volume_multiplier,2)+'x / 阈值 '+fmt(point.volume_threshold_used,2)+'x / '+displayValue(point.volume_direction)+'/'+displayValue(point.volume_trend),bookText=fmtSignedPct(Number(point.order_book_imbalance)*100,1)+' / top5 '+fmtSignedPct(Number(point.order_book_imbalance_5)*100,1)+' / spread '+fmt(point.spread_pct,4)+'%',qualityText=(point.data_quality_reliable===true?'可靠':(point.data_quality_reliable===false?'不足':'--'))+' / 15m确认K '+displayValue(point.data_quality_count),signals=compactList(point.signals,4),waitFor=compactList(point.wait_for,3);return '<strong>'+title+' · '+kind+'</strong><div class="snapshot-grid"><span>时间</span><b>'+compactTime(point.time)+'</b><span>价格</span><b>'+fmt(point.price,2)+'</b><span>分数</span><b>'+scoreText+'</b><span>方向</span><b>'+dir+'</b><span>模拟账户</span><b>'+(point.paper_equity!=null?formatPaperAccount({{equity:point.paper_equity,pnl_usd:point.paper_pnl_usd,pnl_pct:point.paper_pnl_pct,position_label:point.paper_position}}):'--')+'</b><span>市场/策略</span><b>'+displayValue(point.market_regime)+' / '+displayValue(point.strategy_template)+'</b><span>风险/动作</span><b>'+riskText+'</b><span>入场质量</span><b>'+displayValue(point.entry_quality)+' / '+fmtScore(point.entry_quality_score)+'</b><span>风控分</span><b>'+fmtScore(point.risk_control_score)+'</b><span>入场</span><b>'+displayValue(point.entry)+'</b><span>止损/止盈</span><b>'+displayValue(point.stop_loss)+' / '+displayValue(point.take_profit)+'</b><span>等待条件</span><b>'+waitFor+'</b><span>信号</span><b>'+signals+'</b><span>数据质量</span><b>'+qualityText+'</b><span>预热</span><b>'+warmup+'</b><span>OI</span><b>'+fmt(point.open_interest,2)+'</b><span>OI 15m</span><b>'+fmtPct(point.oi_change_pct_15m)+'</b><span>资金费率</span><b>'+fmt(point.funding_rate,6)+' / 变化 '+fmt(point.funding_change,6)+'</b><span>多头/空头</span><b>'+longShort+'</b><span>放量</span><b>'+volumeText+'</b><span>ATR 15m</span><b>'+fmt(point.atr_pct_15m,4)+'% / '+displayValue(point.volatility_regime)+'</b><span>盘口</span><b>'+bookText+'</b><span>分层</span><b>'+summarizeLayers(point.layer_scores)+'</b></div>';}}
-function updateSnapshotPanel(point,title){{const panel=document.getElementById('snapshotPanel');if(panel)panel.innerHTML=snapshotHtml(point,title||'Snapshot');}}
-function drawTimeAxis(x,W,H,p,points,cw){{if(!points||points.length<2)return;const maxLabels=Math.max(2,Math.min(8,Math.floor(W/150))),step=Math.max(1,Math.floor((points.length-1)/(maxLabels-1)));x.fillStyle='rgba(229,231,235,.9)';x.font='12px Segoe UI, Microsoft YaHei, Arial';x.textAlign='center';x.textBaseline='top';for(let i=0;i<points.length;i+=step){{const px=p.l+cw*i/(points.length-1);x.fillText(shortTime(points[i].time),px,H-24);}}const lastIndex=points.length-1;if((lastIndex%step)!==0){{x.fillText(shortTime(points[lastIndex].time),W-p.r,H-24);}}}}
+function setMonitorSeries(points){{return setMonitorCandles(points);}}
+function drawMonitorSeries(metaText){{return drawMonitorCandles(metaText);}}
+function drawMonitorCandles(metaText){{if(metaText)monitorMetaText=metaText;const series=currentMonitorSeries();if(!series.length)return false;drawCandleChart('monitorChart',series,document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));const t=document.getElementById('monitorTitle');if(t)t.textContent=monitorTitleText();const m=document.getElementById('monitorMeta');if(m&&monitorMetaText)m.textContent=monitorMetaText;return true;}}
+function formatDecisionSource(v){{const key=String(v||'').toLowerCase();if(key==='ai')return 'AI';if(key==='local')return '本地';if(key==='local_fallback')return '本地兜底';return displayValue(v);}}
+function formatPushRecommendation(v){{const text=String(v||'none').toLowerCase();return text==='none'?'none':text;}}
+function formatSnapshotDirection(point){{const finalDir=point.final_direction||point.direction||'--',localHint=point.local_hint_direction||point.raw_direction;if(localHint&&localHint!==finalDir)return escHtml(finalDir)+' (本地 '+escHtml(localHint)+')';return escHtml(finalDir);}}
+function formatTrend15m(point){{const profile=displayValue(point.trend_profile_15m),simple=displayValue(point.trend_simple_15m);if(profile!=='--'&&simple!=='--'&&profile!==simple)return escHtml(profile)+' · trends '+escHtml(simple);return escHtml(profile!=='--'?profile:simple);}}
+function candleChangeText(open,close){{const chg=close-open,pct=open?chg/open*100:0;return (chg>=0?'+':'')+fmt(chg,2)+' / '+(pct>=0?'+':'')+fmt(pct,2)+'%';}}
+function candleInfoHtml(point){{if(!point)return '<strong>选中K线</strong><div class="snapshot-grid"><span>时间</span><b>--</b></div>';const o=candleOhlc(point);if(!o)return '<strong>选中K线</strong><div class="snapshot-grid"><span>数据</span><b>--</b></div>';const bar=point.bar||monitorBar,up=o.close>=o.open,color=up?'#fb7185':'#22c55e',vol=point.volume!=null&&point.volume!==''?fmt(point.volume,2):'--',confirmed=String(point.confirmed)==='1'?'已确认':(String(point.confirmed)==='0'?'未确认':'--'),amp=o.low?((o.high-o.low)/o.low*100):0;return '<strong>选中K线 · '+escHtml(bar)+'</strong><div class="snapshot-grid"><span>时间</span><b>'+compactTime(point.time)+'</b><span>开盘</span><b>'+fmt(o.open,2)+'</b><span>最高</span><b>'+fmt(o.high,2)+'</b><span>最低</span><b>'+fmt(o.low,2)+'</b><span>收盘</span><b style="color:'+color+'">'+fmt(o.close,2)+'</b><span>涨跌</span><b style="color:'+color+'">'+candleChangeText(o.open,o.close)+'</b><span>振幅</span><b>'+fmt(amp,2)+'%</b><span>成交量</span><b>'+vol+'</b><span>状态</span><b>'+confirmed+'</b></div>';}}
+function analysisSnapshotHtml(point){{if(!point)return '<strong>最新快照</strong><div class="snapshot-grid"><span>状态</span><b>启动监控后显示分析结果</b><span>提示</span><b>点击 K 线查看 OHLC</b></div>';const hasMetrics=point.raw_total_score!==undefined&&point.raw_total_score!==null,kind=point.kind==='realtime'?'实时分析':(hasMetrics?'历史回放':'日志快照'),localRef=hasMetrics?('观察 '+fmtScore(point.raw_total_score)+' / 本地 '+fmtScore(point.local_final_trade_score??point.final_trade_score)):'--',qualityText=(point.data_quality_reliable===true?'可靠':(point.data_quality_reliable===false?'不足':'--'))+' / 15m K '+displayValue(point.data_quality_count),warmup='OI '+fmtBool(point.oi_warmup_ready)+' / 费率 '+fmtBool(point.funding_warmup_ready),signals=compactList(point.signals,3),levels=displayValue(point.entry)+' · SL '+displayValue(point.stop_loss)+' · TP '+displayValue(point.take_profit),summary=point.summary?String(point.summary).trim():'',aiFlag=point.ai_called===true?'是':(point.ai_called===false?'否':'--');let html='<strong>最新快照 · '+kind+'</strong><div class="snapshot-grid"><span>时间</span><b>'+compactTime(point.time)+'</b><span>价格</span><b>'+fmt(point.price,2)+'</b><span>方向</span><b>'+formatSnapshotDirection(point)+'</b><span>置信度</span><b>'+fmtScore(point.confidence??point.final_trade_score)+'</b><span>推送</span><b>'+formatPushRecommendation(point.push_recommendation||point.trade_action_level)+'</b><span>来源</span><b>'+formatDecisionSource(point.decision_source)+'</b><span>AI</span><b>'+aiFlag+'</b><span>触发</span><b>'+displayValue(point.trigger_level)+'</b><span>本地参考</span><b>'+localRef+'</b><span>15m趋势</span><b>'+formatTrend15m(point)+'</b><span>市场/策略</span><b>'+displayValue(point.market_regime)+' / '+displayValue(point.strategy_label||point.strategy_template)+'</b><span>风险</span><b>'+displayValue(point.risk_level)+'</b><span>入场/止损/止盈</span><b>'+levels+'</b><span>数据质量</span><b>'+qualityText+'</b><span>预热</span><b>'+warmup+'</b><span>触发信号</span><b>'+signals+'</b></div>';if(summary)html+='<div class="snapshot-note">'+escHtml(summary)+'</div>';return html;}}
+function refreshMonitorSnapshotPanel(){{const panel=document.getElementById('snapshotPanel');if(!panel)return;if(monitorSelectedKey){{const hit=monitorPlotPoints.find(function(o){{return (o.point.time||'')===monitorSelectedKey;}});if(hit){{panel.innerHTML=candleInfoHtml(hit.point);return;}}monitorSelectedKey='';}}panel.innerHTML=analysisSnapshotHtml(monitorLatestSnapshot);}}
+function drawMonitorTimeAxis(x,W,H,p,points,cw){{drawTimeAxis(x,W,H,p,points,cw,{{candleMode:true,bar:monitorBar}});}}
 function drawAccuracyTimeAxis(x,W,H,p,points,cw){{if(!points||points.length<2)return;const spanHours=accuracySpanHours(points),maxLabels=Math.max(2,Math.min(10,Math.floor(W/110))),step=Math.max(1,Math.floor((points.length-1)/(maxLabels-1)));x.fillStyle='rgba(229,231,235,.9)';x.font='12px Segoe UI, Microsoft YaHei, Arial';x.textAlign='center';x.textBaseline='top';for(let i=0;i<points.length;i+=step){{const px=p.l+cw*i/(points.length-1);x.fillText(accuracyTimeLabel(points[i].time,spanHours),px,H-24);}}const lastIndex=points.length-1;if((lastIndex%step)!==0){{x.fillText(accuracyTimeLabel(points[lastIndex].time,spanHours),W-p.r,H-24);}}}}
 function drawPriceAxis(x,W,H,p,mn,mx){{x.fillStyle='rgba(229,231,235,.82)';x.font='12px Segoe UI, Microsoft YaHei, Arial';x.textAlign='right';x.textBaseline='middle';for(let i=0;i<=4;i++){{const value=mx-(mx-mn)*i/4,y=p.t+(H-p.t-p.b)*i/4;x.fillText(value.toFixed(2),W-8,y);}}}}
-function clearChartMessage(text){{const c=document.getElementById('monitorChart'),l=document.getElementById('monitorLoading'),p=document.getElementById('monitorPrice'),m=document.getElementById('monitorMeta'),t=document.getElementById('monitorTitle');monitorSelectedKey='';monitorVisiblePoints=[];monitorPlotPoints=[];monitorLatestPoint=null;if(c){{const r=c.getBoundingClientRect(),x=c.getContext('2d');c.width=Math.max(1,r.width);c.height=Math.max(1,r.height);x.clearRect(0,0,r.width,r.height);}}if(l){{l.style.display='grid';l.textContent=text;}}if(p)p.innerHTML='<strong>--</strong><span>无数据</span>';if(m)m.textContent=text;if(t)t.textContent='未配置币种';updateChartFooter([]);updatePaperAccount(null);updateSnapshotPanel(null,'Snapshot');}}
-function drawChart(id,points,priceBox,metaBox,loading){{const c=document.getElementById(id);if(!c||!points||points.length<1)return;if(points.length===1)points=[points[0],{{time:points[0].time,price:points[0].price}}];monitorLatestPoint=points[points.length-1];points=visiblePoints(points);monitorVisiblePoints=points;updateChartFooter(points);if(loading)loading.style.display='none';const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=r.width*d;c.height=r.height*d;const x=c.getContext('2d');x.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,p={{l:34,r:74,t:18,b:58}},cw=W-p.l-p.r,ch=H-p.t-p.b,prices=points.map(q=>q.price);let mn=Math.min(...prices),mx=Math.max(...prices);const rawCenter=(mn+mx)/2,baseRg=Math.max(.01,(mx-mn)*1.16),center=rawCenter+monitorYPan,rg=baseRg/monitorYZoom;monitorYRange=rg;mn=center-rg/2;mx=center+rg/2;monitorPlotPoints=[];x.clearRect(0,0,W,H);x.strokeStyle='rgba(255,255,255,.12)';for(let i=0;i<=4;i++){{const y=p.t+ch*i/4;x.beginPath();x.moveTo(p.l,y);x.lineTo(W-p.r,y);x.stroke();}}x.beginPath();points.forEach((q,i)=>{{const px=p.l+cw*i/(points.length-1),py=p.t+ch-((q.price-mn)/rg)*ch;monitorPlotPoints.push({{x:px,y:py,point:q}});if(i===0)x.moveTo(px,py);else x.lineTo(px,py);}});const up=points[points.length-1].price>=points[0].price;x.strokeStyle=up?'#fb7185':'#22c55e';x.lineWidth=2;x.stroke();x.fillStyle=up?'rgba(251,113,133,.10)':'rgba(34,197,94,.08)';x.lineTo(W-p.r,H-p.b);x.lineTo(p.l,H-p.b);x.closePath();x.fill();drawTimeAxis(x,W,H,p,points,cw);drawPriceAxis(x,W,H,p,mn,mx);if(monitorSelectedKey){{const hit=monitorPlotPoints.find(o=>(o.point.time||'')===monitorSelectedKey);if(hit){{x.strokeStyle='rgba(255,255,255,.62)';x.setLineDash([4,5]);x.beginPath();x.moveTo(hit.x,p.t);x.lineTo(hit.x,H-p.b);x.stroke();x.beginPath();x.moveTo(p.l,hit.y);x.lineTo(W-p.r,hit.y);x.stroke();x.setLineDash([]);x.fillStyle='#60a5fa';x.beginPath();x.arc(hit.x,hit.y,5,0,7);x.fill();updateSnapshotPanel(hit.point,'选中点');}}else{{monitorSelectedKey='';updateSnapshotPanel(monitorLatestPoint,'最新快照');}}}}if(priceBox){{const first=points[0].price,last=points[points.length-1].price,chg=last-first,pct=first?chg/first*100:0;priceBox.classList.toggle('up',chg>=0);priceBox.classList.toggle('down',chg<0);priceBox.innerHTML='<strong>'+last.toFixed(2)+'</strong><span>'+(chg>=0?'+':'')+chg.toFixed(2)+' / '+(pct>=0?'+':'')+pct.toFixed(2)+'%</span>';}}if(!monitorSelectedKey)updateSnapshotPanel(monitorLatestPoint,'最新快照');if(metaBox)metaBox.textContent='更新：'+new Date().toLocaleTimeString();}}
-function drawVirtualMonitor(){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}drawChart('monitorChart',nextVirtualSeries(),document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));document.getElementById('monitorTitle').textContent=monitorInst+' 虚拟走势';const m=document.getElementById('monitorMeta');if(m)m.textContent='虚拟行情预览 · 点击开始监控后切换真实数据';}}
+function clearChartMessage(text){{const c=document.getElementById('monitorChart'),l=document.getElementById('monitorLoading'),p=document.getElementById('monitorPrice'),m=document.getElementById('monitorMeta'),t=document.getElementById('monitorTitle');monitorSelectedKey='';monitorVisiblePoints=[];monitorPlotPoints=[];monitorLatestPoint=null;monitorLatestSnapshot=null;if(c){{const r=c.getBoundingClientRect(),x=c.getContext('2d');c.width=Math.max(1,r.width);c.height=Math.max(1,r.height);x.clearRect(0,0,r.width,r.height);}}if(l){{l.style.display='grid';l.textContent=text;}}if(p)p.innerHTML='<strong>--</strong><span>无数据</span>';if(m)m.textContent=text;if(t)t.textContent='未配置币种';updateChartFooter([]);updatePaperAccount(null);refreshMonitorSnapshotPanel();}}
+function drawChart(id,points,priceBox,metaBox,loading){{const c=document.getElementById(id);if(!c||!points||points.length<1)return;if(points.length===1)points=[points[0],{{time:points[0].time,price:points[0].price}}];monitorLatestPoint=points[points.length-1];points=visiblePoints(points);monitorVisiblePoints=points;updateChartFooter(points);if(loading)loading.style.display='none';const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=r.width*d;c.height=r.height*d;const x=c.getContext('2d');x.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,p={{l:34,r:74,t:18,b:58}},cw=W-p.l-p.r,ch=H-p.t-p.b,prices=points.map(q=>q.price);let mn=Math.min(...prices),mx=Math.max(...prices);const rawCenter=(mn+mx)/2,baseRg=Math.max(.01,(mx-mn)*1.16),center=rawCenter+monitorYPan,rg=baseRg/monitorYZoom;monitorYRange=rg;mn=center-rg/2;mx=center+rg/2;monitorPlotPoints=[];x.clearRect(0,0,W,H);x.strokeStyle='rgba(255,255,255,.12)';for(let i=0;i<=4;i++){{const y=p.t+ch*i/4;x.beginPath();x.moveTo(p.l,y);x.lineTo(W-p.r,y);x.stroke();}}x.beginPath();points.forEach((q,i)=>{{const px=p.l+cw*i/(points.length-1),py=p.t+ch-((q.price-mn)/rg)*ch;monitorPlotPoints.push({{x:px,y:py,point:q}});if(i===0)x.moveTo(px,py);else x.lineTo(px,py);}});const up=points[points.length-1].price>=points[0].price;x.strokeStyle=up?'#fb7185':'#22c55e';x.lineWidth=2;x.stroke();x.fillStyle=up?'rgba(251,113,133,.10)':'rgba(34,197,94,.08)';x.lineTo(W-p.r,H-p.b);x.lineTo(p.l,H-p.b);x.closePath();x.fill();drawTimeAxis(x,W,H,p,points,cw);drawPriceAxis(x,W,H,p,mn,mx);if(monitorSelectedKey){{const hit=monitorPlotPoints.find(o=>(o.point.time||'')===monitorSelectedKey);if(hit){{x.strokeStyle='rgba(255,255,255,.62)';x.setLineDash([4,5]);x.beginPath();x.moveTo(hit.x,p.t);x.lineTo(hit.x,H-p.b);x.stroke();x.beginPath();x.moveTo(p.l,hit.y);x.lineTo(W-p.r,hit.y);x.stroke();x.setLineDash([]);x.fillStyle='#60a5fa';x.beginPath();x.arc(hit.x,hit.y,5,0,7);x.fill();}}else{{monitorSelectedKey='';}}}}refreshMonitorSnapshotPanel();if(priceBox){{const first=points[0].price,last=points[points.length-1].price,chg=last-first,pct=first?chg/first*100:0;priceBox.classList.toggle('up',chg>=0);priceBox.classList.toggle('down',chg<0);priceBox.innerHTML='<strong>'+last.toFixed(2)+'</strong><span>'+(chg>=0?'+':'')+chg.toFixed(2)+' / '+(pct>=0?'+':'')+pct.toFixed(2)+'%</span>';}}if(metaBox)metaBox.textContent='更新：'+new Date().toLocaleTimeString();}}
+function drawCandleChart(id,points,priceBox,metaBox,loading){{const c=document.getElementById(id);if(!c||!points||points.length<1)return;const normalized=points.map(function(pt){{const o=candleOhlc(pt);if(!o)return null;return Object.assign({{}},pt,{{open:o.open,high:o.high,low:o.low,close:o.close,price:o.close}});}}).filter(Boolean);if(normalized.length<1)return;if(normalized.length===1)normalized.push(Object.assign({{}},normalized[0]));monitorLatestPoint=normalized[normalized.length-1];points=visiblePoints(normalized);monitorVisiblePoints=points;updateChartFooter(points);if(loading)loading.style.display='none';const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=r.width*d;c.height=r.height*d;const x=c.getContext('2d');x.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,p={{l:34,r:74,t:18,b:58}},cw=W-p.l-p.r,ch=H-p.t-p.b;let mn=Infinity,mx=-Infinity;points.forEach(function(pt){{const o=candleOhlc(pt);if(!o)return;mn=Math.min(mn,o.low);mx=Math.max(mx,o.high);}});if(!Number.isFinite(mn)||!Number.isFinite(mx)){{mn=0;mx=1;}}const rawCenter=(mn+mx)/2,baseRg=Math.max(.01,(mx-mn)*1.12),center=rawCenter+monitorYPan,rg=Math.max(.01,baseRg/monitorYZoom);monitorYRange=rg;mn=center-rg/2;mx=center+rg/2;monitorPlotPoints=[];x.clearRect(0,0,W,H);x.strokeStyle='rgba(255,255,255,.12)';x.lineWidth=1;for(let i=0;i<=4;i++){{const y=p.t+ch*i/4;x.beginPath();x.moveTo(p.l,y);x.lineTo(W-p.r,y);x.stroke();}}const slotW=cw/points.length,bodyW=Math.max(2,Math.min(14,slotW*0.62));points.forEach(function(pt,i){{const o=candleOhlc(pt);if(!o)return;const cx=p.l+slotW*(i+0.5),yHigh=p.t+ch-((o.high-mn)/rg)*ch,yLow=p.t+ch-((o.low-mn)/rg)*ch,yOpen=p.t+ch-((o.open-mn)/rg)*ch,yClose=p.t+ch-((o.close-mn)/rg)*ch,up=o.close>=o.open,color=up?'#fb7185':'#22c55e';x.strokeStyle=color;x.lineWidth=1;x.beginPath();x.moveTo(cx,yHigh);x.lineTo(cx,yLow);x.stroke();const top=Math.min(yOpen,yClose),bodyH=Math.max(1,Math.abs(yClose-yOpen));x.fillStyle=color;x.fillRect(cx-bodyW/2,top,bodyW,bodyH);monitorPlotPoints.push({{x:cx,y:(yHigh+yLow)/2,point:pt}});}});drawMonitorTimeAxis(x,W,H,p,points,cw);drawPriceAxis(x,W,H,p,mn,mx);if(monitorSelectedKey){{const hit=monitorPlotPoints.find(function(o){{return (o.point.time||'')===monitorSelectedKey;}});if(hit){{x.strokeStyle='rgba(255,255,255,.62)';x.setLineDash([4,5]);x.beginPath();x.moveTo(hit.x,p.t);x.lineTo(hit.x,H-p.b);x.stroke();x.beginPath();x.moveTo(p.l,hit.y);x.lineTo(W-p.r,hit.y);x.stroke();x.setLineDash([]);x.fillStyle='#60a5fa';x.beginPath();x.arc(hit.x,hit.y,5,0,7);x.fill();}}else{{monitorSelectedKey='';}}}}refreshMonitorSnapshotPanel();if(priceBox){{const first=Number(points[0].close!=null?points[0].close:points[0].price),last=Number(points[points.length-1].close!=null?points[points.length-1].close:points[points.length-1].price),chg=last-first,pct=first?chg/first*100:0;priceBox.classList.toggle('up',chg>=0);priceBox.classList.toggle('down',chg<0);priceBox.innerHTML='<strong>'+last.toFixed(2)+'</strong><span>'+(chg>=0?'+':'')+chg.toFixed(2)+' / '+(pct>=0?'+':'')+pct.toFixed(2)+'%</span>';}}}}
+function drawVirtualMonitor(){{if(!isMonitorChartEnabled())return;if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}const candles=seriesToCandles(nextVirtualSeries());setMonitorCandles(candles);drawCandleChart('monitorChart',candles,document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));const t=document.getElementById('monitorTitle');if(t)t.textContent=monitorTitleText()+' · 虚拟';const m=document.getElementById('monitorMeta');if(m)m.textContent='虚拟 K 线预览 · 启动监控后切换 OKX 真实数据';}}
 function setMonitorButtonState(state,text){{const btn=document.getElementById('monitorToggleBtn'),meta=document.getElementById('monitorMeta');if(!btn)return;btn.classList.remove('is-running','is-starting');btn.disabled=false;if(state==='starting'){{btn.classList.add('is-starting');btn.textContent='启动中...';btn.disabled=true;if(meta)meta.textContent=text||'正在启动监控进程...';}}else if(state==='running'){{btn.classList.add('is-running');btn.textContent='停止监控';if(meta&&text)meta.textContent=text;}}else if(state==='stopping'){{btn.classList.add('is-starting');btn.textContent='停止中...';btn.disabled=true;if(meta)meta.textContent=text||'正在停止监控进程...';}}else{{btn.textContent='开始监控';if(meta&&text)meta.textContent=text;}}}}
 async function syncMonitorStatus(){{try{{const r=await fetch('/api/status',{{cache:'no-store'}}),p=await r.json();updateMonitorUptime(p);setMonitorButtonState(p.running?'running':'stopped',p.text||'');if(p.running&&!monitorWasRunning&&typeof switchAccuracyToLiveSession==='function')switchAccuracyToLiveSession();monitorWasRunning=!!p.running;return p;}}catch(e){{return null;}}}}
-function showRealtimeWaiting(clearChart){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}monitorLiveMode=true;const c=document.getElementById('monitorChart'),l=document.getElementById('monitorLoading'),m=document.getElementById('monitorMeta'),t=document.getElementById('monitorTitle'),p=document.getElementById('monitorPrice');if(clearChart&&c){{const r=c.getBoundingClientRect(),x=c.getContext('2d');c.width=Math.max(1,r.width);c.height=Math.max(1,r.height);x.clearRect(0,0,r.width,r.height);updateChartFooter([]);}}if(l){{l.style.display=clearChart?'grid':'none';l.textContent='监控已启动，正在等待真实价格数据...';}}if(m)m.textContent=clearChart?'实时监控已启动 · 等待第一条价格数据':'已获取最新价 · 等待完整分析数据';if(t)t.textContent=monitorInst+' 实时走势';if(clearChart&&p)p.innerHTML='<strong>--</strong><span>等待真实数据</span>';}}
-async function fetchMonitor(){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return null;}}try{{const r=await fetch('/api/monitor-data?inst_id='+encodeURIComponent(monitorInst),{{cache:'no-store'}}),p=await r.json();updatePaperAccount(p.paper_account||null);if(!r.ok||p.ok===false){{clearChartMessage(p.error||'当前币种未配置，不能读取监控数据');return p;}}if(!p.running){{monitorLiveMode=false;monitorSeriesByInst[monitorInst]=[];updatePaperAccount(null);drawVirtualMonitor();return p;}}monitorLiveMode=true;if(p.points&&p.points.length>0){{setMonitorSeries(p.points);const hasChart=p.source==='web-chart'||p.source==='signal-monitor-chart';document.getElementById('monitorTitle').textContent=monitorInst+(hasChart?' 1m K线走势':' 实时走势');const meta=p.source==='web-chart'?'Web获取1m K线 · 指标读取okx_signal_monitor.py日志':(p.source==='signal-monitor-chart'?'okx_signal_monitor.py 1m K线兜底 · 指标读取日志':'读取okx_signal_monitor.py实时日志 · 等待K线');drawMonitorSeries(meta+' · '+new Date().toLocaleTimeString());}}else if(!drawMonitorSeries('保留最近走势 · 等待K线/日志')){{showRealtimeWaiting(false);}}return p;}}catch(e){{if(monitorLiveMode){{if(!drawMonitorSeries('保留最近走势 · 等待K线/日志'))showRealtimeWaiting(false);}}else drawVirtualMonitor();return null;}}}}
+function showRealtimeWaiting(clearChart){{if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}monitorLiveMode=true;const c=document.getElementById('monitorChart'),l=document.getElementById('monitorLoading'),m=document.getElementById('monitorMeta'),t=document.getElementById('monitorTitle'),p=document.getElementById('monitorPrice');if(clearChart&&c){{const r=c.getBoundingClientRect(),x=c.getContext('2d');c.width=Math.max(1,r.width);c.height=Math.max(1,r.height);x.clearRect(0,0,r.width,r.height);updateChartFooter([]);}}if(l){{l.style.display=clearChart?'grid':'none';l.textContent='监控已启动，正在加载 '+monitorBar+' K 线...';}}if(m)m.textContent=clearChart?'实时监控已启动 · 等待 '+monitorBar+' K 线':'已连接 · 等待 K 线刷新';if(t)t.textContent=monitorTitleText();if(clearChart&&p)p.innerHTML='<strong>--</strong><span>等待 K 线</span>';}}
 function sleep(ms){{return new Promise(resolve=>setTimeout(resolve,ms));}}
-async function bootstrapMonitorChart(){{monitorLastTickerAt=0;for(let i=0;i<16;i++){{const payload=await fetchMonitor();if(payload&&(payload.source==='web-chart'||payload.source==='signal-monitor-chart')&&payload.points&&payload.points.length>0)break;await sleep(i<4?500:1000);}}}}
-function redrawMonitorCached(){{if(drawMonitorSeries())return;const series=virtualSeriesByInst[monitorInst]||[];if(series.length){{drawChart('monitorChart',series,document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));document.getElementById('monitorTitle').textContent=monitorInst+' 虚拟走势';}}else{{drawVirtualMonitor();}}}}
+async function fetchMonitor(){{if(!isMonitorChartEnabled())return null;if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return null;}}try{{const qs='inst_id='+encodeURIComponent(monitorInst)+'&bar='+encodeURIComponent(monitorBar);const r=await fetch('/api/monitor-candles?'+qs,{{cache:'no-store'}}),p=await r.json();updatePaperAccount(p.paper_account||null);monitorLatestSnapshot=p.latest_snapshot||null;if(!r.ok||p.ok===false){{clearChartMessage(p.error||'当前币种未配置，不能读取 K 线');return p;}}const metaPrefix=p.running?'OKX '+monitorBar+' · 指标来自日志':'OKX '+monitorBar+' · 预览';if(p.points&&p.points.length>0){{monitorLiveMode=!!p.running;setMonitorCandles(p.points);drawMonitorCandles(metaPrefix+' · '+new Date().toLocaleTimeString());return p;}}if(p.running){{monitorLiveMode=true;if(!drawMonitorCandles(metaPrefix+' · 等待 K 线'))showRealtimeWaiting(false);return p;}}monitorLiveMode=false;updatePaperAccount(null);drawVirtualMonitor();return p;}}catch(e){{if(monitorLiveMode){{if(!drawMonitorCandles('保留最近 K 线 · 等待刷新'))showRealtimeWaiting(false);}}else drawVirtualMonitor();return null;}}}}
+async function bootstrapMonitorChart(){{if(!isMonitorChartEnabled())return;monitorLastTickerAt=0;for(let i=0;i<12;i++){{const payload=await fetchMonitor();if(payload&&payload.points&&payload.points.length>0)break;await sleep(i<4?500:1000);}}}}
+function redrawMonitorCached(){{if(!isMonitorChartEnabled())return;const series=currentMonitorSeries();if(series.length){{drawCandleChart('monitorChart',series,document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));return;}}if(monitorLiveMode)return;drawVirtualMonitor();}}
+initMonitorChartToggle();
 bindMonitorTabs();
+bindMonitorBarTabs();
 const monitorToggleBtn=document.getElementById('monitorToggleBtn');
-if(monitorToggleBtn){{monitorToggleBtn.addEventListener('click',async()=>{{const status=await syncMonitorStatus();if(status&&status.running){{setMonitorButtonState('stopping','正在停止监控进程...');try{{await fetch('/stop#monitor',{{cache:'no-store'}});}}catch(e){{}}await syncMonitorStatus();monitorLiveMode=false;monitorViewStart=0;monitorViewEnd=1;monitorYZoom=1;monitorYPan=0;monitorSeriesByInst[monitorInst]=[];setMonitorButtonState('stopped','监控已停止，当前显示虚拟行情');drawVirtualMonitor();return;}}if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}setMonitorButtonState('starting','正在保存配置并启动监控...');monitorYPan=0;showRealtimeWaiting(true);try{{await autoSaveConfig();await fetch('/start#monitor',{{cache:'no-store'}});await syncMonitorStatus();switchAccuracyToLiveSession();bootstrapMonitorChart();}}catch(e){{setMonitorButtonState('stopped','启动监控失败');const l=document.getElementById('monitorLoading');if(l)l.textContent='启动监控失败：'+e;}}}});}}
+if(monitorToggleBtn){{monitorToggleBtn.addEventListener('click',async()=>{{const status=await syncMonitorStatus();if(status&&status.running){{setMonitorButtonState('stopping','正在停止监控进程...');try{{await fetch('/stop#monitor',{{cache:'no-store'}});}}catch(e){{}}await syncMonitorStatus();monitorLiveMode=false;monitorViewStart=0;monitorViewEnd=1;monitorYZoom=1;monitorYPan=0;monitorSeriesByInst[monitorInst]=[];setMonitorButtonState('stopped','监控已停止，当前显示虚拟行情');if(isMonitorChartEnabled())drawVirtualMonitor();else showMonitorChartOffState();return;}}if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}setMonitorButtonState('starting','正在保存配置并启动监控...');monitorYPan=0;if(isMonitorChartEnabled())showRealtimeWaiting(true);try{{await autoSaveConfig();await fetch('/start#monitor',{{cache:'no-store'}});await syncMonitorStatus();switchAccuracyToLiveSession();if(isMonitorChartEnabled())bootstrapMonitorChart();}}catch(e){{setMonitorButtonState('stopped','启动监控失败');const l=document.getElementById('monitorLoading');if(l)l.textContent='启动监控失败：'+e;}}}});}}
 let logCleared=false,consoleLogCleared=false;
-let analysisLogEnabled={json.dumps(bool(config.get("analysis_log_enabled")))};
-function syncAnalysisLogUi(){{const sw=document.getElementById('analysisLogSwitch'),hint=document.getElementById('analysisLogSwitchHint'),cfg=document.querySelector('.config-form input[name="analysis_log_enabled"]');if(sw)sw.checked=!!analysisLogEnabled;if(cfg)cfg.checked=!!analysisLogEnabled;if(hint)hint.textContent=(analysisLogEnabled?'已开启':'已关闭')+' · 保存后需重启监控';}}
-async function setAnalysisLogEnabled(enabled){{analysisLogEnabled=!!enabled;syncAnalysisLogUi();try{{await autoSaveConfig();refreshLogs(true);refreshConsoleLogs(true);}}catch(e){{analysisLogEnabled=!enabled;syncAnalysisLogUi();alert('保存日志开关失败：'+e);}}}}
-async function refreshLogs(force){{const box=document.getElementById('logWindow');if(!box)return;if(logCleared&&!force)return;try{{const r=await fetch('/api/logs',{{cache:'no-store'}}),p=await r.json();if(typeof p.enabled==='boolean'){{analysisLogEnabled=p.enabled;syncAnalysisLogUi();}}logCleared=false;box.value=p.text||'暂无日志。';box.scrollTop=box.scrollHeight;}}catch(e){{box.value='日志读取失败：'+e;}}}}
-async function refreshConsoleLogs(force){{const box=document.getElementById('consoleLogWindow');if(!box)return;if(consoleLogCleared&&!force)return;try{{const r=await fetch('/api/console-logs',{{cache:'no-store'}}),p=await r.json();if(typeof p.enabled==='boolean'){{analysisLogEnabled=p.enabled;syncAnalysisLogUi();}}consoleLogCleared=false;box.value=p.text||'暂无控制台日志。';box.scrollTop=box.scrollHeight;}}catch(e){{box.value='控制台日志读取失败：'+e;}}}}
+const LOGS_DISPLAY_KEY='okx_logs_display_enabled';
+function isLogsDisplayEnabled(){{const el=document.getElementById('logsDisplayToggle');return!!(el&&el.checked);}}
+function setLogsDisplayEnabled(enabled,options){{options=options||{{}};const toggle=document.getElementById('logsDisplayToggle');if(toggle)toggle.checked=!!enabled;updateLogsDisplayUI(!!options.fetchNow);}}
+function updateLogsDisplayUI(fetchNow){{const enabled=isLogsDisplayEnabled(),body=document.getElementById('logPanelBody'),label=document.getElementById('logsDisplayLabel'),offHint=document.getElementById('logsOffHint');if(body)body.hidden=!enabled;if(offHint)offHint.hidden=enabled;if(label)label.textContent=enabled?'显示已开启 · 自动刷新':'显示已关闭 · 按需打开';try{{localStorage.setItem(LOGS_DISPLAY_KEY,enabled?'1':'0');}}catch(e){{}}if(!enabled)return;if(fetchNow){{refreshLogs(true);refreshConsoleLogs(true);}}}}
+function initLogsDisplayToggle(){{const toggle=document.getElementById('logsDisplayToggle');if(!toggle)return;try{{toggle.checked=localStorage.getItem(LOGS_DISPLAY_KEY)==='1';}}catch(e){{}}updateLogsDisplayUI(false);toggle.addEventListener('change',function(){{updateLogsDisplayUI(true);}});}}
+initLogsDisplayToggle();
+function syncAnalysisLogUi(){{const hint=document.getElementById('analysisLogSwitchHint');if(hint&&window.latestLogSizeSummary)hint.textContent=window.latestLogSizeSummary+' · 修改后需重启监控';}}
+async function refreshLogs(force){{if(!isLogsDisplayEnabled()&&!force)return;const box=document.getElementById('logWindow');if(!box)return;if(logCleared&&!force)return;try{{const r=await fetch('/api/logs',{{cache:'no-store'}}),p=await r.json();if(p.log_size_summary){{window.latestLogSizeSummary=p.log_size_summary;syncAnalysisLogUi();}}logCleared=false;box.value=p.text||'暂无日志。';box.scrollTop=box.scrollHeight;}}catch(e){{box.value='日志读取失败：'+e;}}}}
+async function refreshConsoleLogs(force){{if(!isLogsDisplayEnabled()&&!force)return;const box=document.getElementById('consoleLogWindow');if(!box)return;if(consoleLogCleared&&!force)return;try{{const r=await fetch('/api/console-logs',{{cache:'no-store'}}),p=await r.json();if(p.log_size_summary){{window.latestLogSizeSummary=p.log_size_summary;syncAnalysisLogUi();}}consoleLogCleared=false;box.value=p.text||'暂无控制台日志。';box.scrollTop=box.scrollHeight;}}catch(e){{box.value='控制台日志读取失败：'+e;}}}}
+window.latestLogSizeSummary={json.dumps(log_size_summary_text(config), ensure_ascii=False)};
+syncAnalysisLogUi();
 function showConnectivityNotice(text, ok) {{
   const box = document.getElementById('connectivityTestNotice');
   if (!box) return;
@@ -2814,20 +4533,17 @@ function showConnectivityNotice(text, ok) {{
   box.className = ok ? 'notice' : 'notice notice-error';
   box.textContent = text;
 }}
-async function runConnectivityTest(kind) {{
-  const aiBtn = document.getElementById('testAiBtn');
+async function runConnectivityTest() {{
   const pushBtn = document.getElementById('testPushBtn');
-  const btn = kind === 'ai' ? aiBtn : pushBtn;
-  const label = kind === 'ai' ? '测试AI' : '测试微信推送';
-  if (btn) {{
-    btn.disabled = true;
-    btn.textContent = '测试中...';
+  const label = '测试微信推送';
+  if (pushBtn) {{
+    pushBtn.disabled = true;
+    pushBtn.textContent = '测试中...';
   }}
   showConnectivityNotice('正在保存配置并测试 ' + label + '...', true);
   try {{
     await autoSaveConfig();
-    const url = kind === 'ai' ? '/api/test-ai' : '/api/test-push';
-    const response = await fetch(url, {{ cache: 'no-store' }});
+    const response = await fetch('/api/test-push', {{ cache: 'no-store' }});
     const payload = await response.json();
     const message = payload.message || payload.error || '未知结果';
     showConnectivityNotice(message, !!payload.ok);
@@ -2837,25 +4553,182 @@ async function runConnectivityTest(kind) {{
     showConnectivityNotice(message, false);
     alert(message);
   }} finally {{
-    if (btn) {{
-      btn.disabled = false;
-      btn.textContent = label;
+    if (pushBtn) {{
+      pushBtn.disabled = false;
+      pushBtn.textContent = label;
     }}
   }}
 }}
-const testAiBtn = document.getElementById('testAiBtn');
-if (testAiBtn) {{
-  testAiBtn.addEventListener('click', function() {{ runConnectivityTest('ai'); }});
+let aiChatMessages = [];
+function aiChatHistoryPayload() {{
+  return aiChatMessages.filter(function(item) {{
+    return !item.pending && !item.error && (item.role === 'user' || item.role === 'assistant');
+  }}).map(function(item) {{
+    return {{ role: item.role, content: item.content }};
+  }});
 }}
+function formatAiChatUsage(usage) {{
+  if (!usage || typeof usage !== 'object') return '';
+  const prompt = usage.prompt_tokens;
+  const completion = usage.completion_tokens;
+  const total = usage.total_tokens;
+  if (prompt == null && completion == null && total == null) return '';
+  const parts = [];
+  if (prompt != null) parts.push('输入 ' + prompt);
+  if (completion != null) parts.push('输出 ' + completion);
+  if (total != null) parts.push('合计 ' + total);
+  return parts.join(' · ') + ' tokens';
+}}
+function renderAiChatMessages() {{
+  const box = document.getElementById('aiChatWindow');
+  if (!box) return;
+  if (!aiChatMessages.length) {{
+    box.innerHTML = '<div class="ai-chat-empty">输入下方消息开始与 AI 对话。可先点「连通性测试」验证配置是否可用。</div>';
+    return;
+  }}
+  box.innerHTML = aiChatMessages.map(function(item) {{
+    let cls = 'ai-chat-msg ';
+    if (item.pending) cls += 'pending';
+    else if (item.error) cls += 'error';
+    else cls += item.role === 'user' ? 'user' : 'assistant';
+    let body = escHtml(item.content);
+    if (item.role === 'assistant' && !item.pending && !item.error) {{
+      const usageText = formatAiChatUsage(item.usage);
+      if (usageText) body += '<div class="ai-chat-usage">' + escHtml(usageText) + '</div>';
+    }}
+    return '<div class="' + cls + '">' + body + '</div>';
+  }}).join('');
+  box.scrollTop = box.scrollHeight;
+}}
+async function sendAiChatMessage(textOverride) {{
+  const input = document.getElementById('aiChatInput');
+  const sendBtn = document.getElementById('aiChatSendBtn');
+  const pingBtn = document.getElementById('aiChatPingBtn');
+  const text = String(textOverride != null ? textOverride : (input ? input.value : '')).trim();
+  if (!text) return;
+  if (input && textOverride == null) input.value = '';
+  aiChatMessages.push({{ role: 'user', content: text }});
+  renderAiChatMessages();
+  if (sendBtn) {{ sendBtn.disabled = true; sendBtn.textContent = '发送中...'; }}
+  if (pingBtn) pingBtn.disabled = true;
+  aiChatMessages.push({{ role: 'assistant', content: '正在思考...', pending: true }});
+  renderAiChatMessages();
+  try {{
+    await autoSaveConfig();
+    const history = aiChatHistoryPayload().slice(0, -1);
+    const response = await fetch('/api/ai-chat', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ message: text, history: history }}),
+      cache: 'no-store'
+    }});
+    const payload = await response.json();
+    aiChatMessages.pop();
+    if (!response.ok || payload.ok === false) {{
+      aiChatMessages.push({{ role: 'assistant', content: payload.error || payload.message || '请求失败', error: true }});
+    }} else {{
+      aiChatMessages.push({{ role: 'assistant', content: payload.reply || '', usage: payload.usage || null }});
+    }}
+  }} catch (error) {{
+    aiChatMessages.pop();
+    aiChatMessages.push({{ role: 'assistant', content: String(error), error: true }});
+  }} finally {{
+    if (sendBtn) {{ sendBtn.disabled = false; sendBtn.textContent = '发送'; }}
+    if (pingBtn) pingBtn.disabled = false;
+    renderAiChatMessages();
+  }}
+}}
+async function runAiChatPing() {{
+  const pingBtn = document.getElementById('aiChatPingBtn');
+  if (pingBtn) {{ pingBtn.disabled = true; pingBtn.textContent = '测试中...'; }}
+  try {{
+    await sendAiChatMessage('请只回复：AI接口连通性测试成功。');
+  }} finally {{
+    if (pingBtn) {{ pingBtn.disabled = false; pingBtn.textContent = '连通性测试'; }}
+  }}
+}}
+const aiChatSendBtn = document.getElementById('aiChatSendBtn');
+if (aiChatSendBtn) aiChatSendBtn.addEventListener('click', function() {{ sendAiChatMessage(); }});
+const aiChatInput = document.getElementById('aiChatInput');
+if (aiChatInput) aiChatInput.addEventListener('keydown', function(event) {{
+  if (event.key === 'Enter' && !event.shiftKey) {{
+    event.preventDefault();
+    sendAiChatMessage();
+  }}
+}});
+const aiChatClearBtn = document.getElementById('aiChatClearBtn');
+if (aiChatClearBtn) aiChatClearBtn.addEventListener('click', function() {{
+  aiChatMessages = [];
+  renderAiChatMessages();
+}});
+const aiChatPingBtn = document.getElementById('aiChatPingBtn');
+if (aiChatPingBtn) aiChatPingBtn.addEventListener('click', function() {{ runAiChatPing(); }});
+renderAiChatMessages();
+function parseDownloadFilename(disposition, fallback) {{
+  if (!disposition) return fallback;
+  const match = /filename\\*?=(?:UTF-8''|")?([^";]+)/i.exec(disposition);
+  if (!match) return fallback;
+  try {{ return decodeURIComponent(match[1].replace(/"/g, '').trim()); }} catch (e) {{ return match[1].replace(/"/g, '').trim(); }}
+}}
+async function exportDiagnosticBundle() {{
+  const btn = document.getElementById('diagnosticExportBtn');
+  const hint = document.getElementById('diagnosticExportHint');
+  const label = '导出诊断包';
+  if (btn) {{ btn.disabled = true; btn.textContent = '打包中...'; }}
+  if (hint) hint.textContent = '正在收集日志与压测数据，请稍候...';
+  const body = {{}};
+  const chat = aiChatMessages.filter(function(item) {{
+    return !item.pending && (item.role === 'user' || item.role === 'assistant');
+  }}).map(function(item) {{
+    return {{ role: item.role, content: item.content, usage: item.usage || null, error: !!item.error }};
+  }});
+  if (chat.length) body.ai_chat = chat;
+  try {{
+    if (typeof buildAccuracyExportBundle === 'function' && accuracyLivePayload && accuracyView.points && accuracyView.points.length) {{
+      body.accuracy_snapshot = buildAccuracyExportBundle();
+    }}
+  }} catch (e) {{}}
+  try {{
+    const response = await fetch('/api/diagnostic-export', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(body),
+      cache: 'no-store'
+    }});
+    const ct = (response.headers.get('content-type') || '').toLowerCase();
+    if (!response.ok || ct.includes('application/json')) {{
+      let message = '导出失败';
+      try {{
+        const payload = await response.json();
+        message = payload.error || payload.message || message;
+      }} catch (e) {{}}
+      throw new Error(message);
+    }}
+    const blob = await response.blob();
+    const fallback = 'okx_diagnostic_' + new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '').replace(' ', '') + '.zip';
+    const filename = parseDownloadFilename(response.headers.get('Content-Disposition'), fallback);
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+    if (hint) hint.textContent = '已下载 ' + filename + '（约 ' + Math.max(1, Math.round(blob.size / 1024)) + ' KB）。请将此 ZIP 发给维护人员分析。';
+  }} catch (error) {{
+    if (hint) hint.textContent = '导出失败：' + error;
+    alert('导出诊断包失败：' + error);
+  }} finally {{
+    if (btn) {{ btn.disabled = false; btn.textContent = label; }}
+  }}
+}}
+const diagnosticExportBtn = document.getElementById('diagnosticExportBtn');
+if (diagnosticExportBtn) diagnosticExportBtn.addEventListener('click', function() {{ exportDiagnosticBundle(); }});
 const testPushBtn = document.getElementById('testPushBtn');
 if (testPushBtn) {{
-  testPushBtn.addEventListener('click', function() {{ runConnectivityTest('push'); }});
+  testPushBtn.addEventListener('click', function() {{ runConnectivityTest(); }});
 }}
-const analysisLogSwitch=document.getElementById('analysisLogSwitch');
-if(analysisLogSwitch){{analysisLogSwitch.addEventListener('change',function(){{setAnalysisLogEnabled(analysisLogSwitch.checked);}});}}
-syncAnalysisLogUi();
 const refreshLogBtn = document.getElementById('refreshLogBtn');
-if (refreshLogBtn) refreshLogBtn.addEventListener('click', function() {{ refreshLogs(true); refreshConsoleLogs(true); }});
+if (refreshLogBtn) refreshLogBtn.addEventListener('click', function() {{ setLogsDisplayEnabled(true, {{ fetchNow: true }}); }});
 const clearLogBtn = document.getElementById('clearLogBtn');
 if (clearLogBtn) {{
   clearLogBtn.addEventListener('click', function() {{
@@ -2906,21 +4779,44 @@ if (saveConsoleLogBtn) {{
   }});
 }}
 const monitorCanvas=document.getElementById('monitorChart');
-if(monitorCanvas){{monitorCanvas.addEventListener('wheel',function(event){{event.preventDefault();const rect=monitorCanvas.getBoundingClientRect(),focus=Math.min(1,Math.max(0,(event.clientX-rect.left)/Math.max(1,rect.width))),span=monitorViewEnd-monitorViewStart,zoom=(event.deltaY<0?0.82:1.22),newSpan=Math.min(1,Math.max(.06,span*zoom)),center=monitorViewStart+span*focus;let ns=center-newSpan*focus,ne=ns+newSpan;if(ns<0){{ne-=ns;ns=0;}}if(ne>1){{ns-=ne-1;ne=1;}}monitorViewStart=Math.max(0,ns);monitorViewEnd=Math.min(1,ne);monitorYZoom=Math.max(.45,Math.min(10,monitorYZoom*(event.deltaY<0?1.14:.88)));redrawMonitorCached();}},{{passive:false}});monitorCanvas.addEventListener('mousedown',function(event){{monitorDrag={{x:event.clientX,y:event.clientY,start:monitorViewStart,end:monitorViewEnd,yPan:monitorYPan,yRange:monitorYRange,moved:false}};monitorCanvas.classList.add('dragging');}});window.addEventListener('mousemove',function(event){{if(!monitorDrag)return;const rect=monitorCanvas.getBoundingClientRect(),span=monitorDrag.end-monitorDrag.start,dx=(event.clientX-monitorDrag.x)/Math.max(1,rect.width),dy=(event.clientY-monitorDrag.y)/Math.max(1,rect.height);if(Math.abs(event.clientX-monitorDrag.x)>3||Math.abs(event.clientY-monitorDrag.y)>3)monitorDrag.moved=true;let ns=monitorDrag.start-dx*span,ne=monitorDrag.end-dx*span;if(ns<0){{ne-=ns;ns=0;}}if(ne>1){{ns-=ne-1;ne=1;}}monitorViewStart=Math.max(0,ns);monitorViewEnd=Math.min(1,ne);monitorYPan=monitorDrag.yPan+dy*Math.max(.01,monitorDrag.yRange||monitorYRange);redrawMonitorCached();}});window.addEventListener('mouseup',function(){{if(monitorDrag){{setTimeout(function(){{monitorDrag=null;}},0);}}monitorCanvas.classList.remove('dragging');}});function selectNearestPoint(event,strict){{if(!monitorPlotPoints.length)return;const rect=monitorCanvas.getBoundingClientRect(),x=event.clientX-rect.left,y=event.clientY-rect.top;let best=null,bestDist=Infinity;monitorPlotPoints.forEach(o=>{{const dx=o.x-x,dy=o.y-y,dist=Math.sqrt(dx*dx+dy*dy);if(dist<bestDist){{best=o;bestDist=dist;}}}});if(best&&bestDist<(strict?42:34)){{monitorSelectedKey=best.point.time||'';updateSnapshotPanel(best.point,'选中点');redrawMonitorCached();}}else if(!strict){{monitorSelectedKey='';updateSnapshotPanel(monitorLatestPoint,'最新快照');redrawMonitorCached();}}}}monitorCanvas.addEventListener('click',function(event){{if(monitorDrag&&monitorDrag.moved)return;selectNearestPoint(event,false);}});monitorCanvas.addEventListener('dblclick',function(event){{selectNearestPoint(event,true);}});}}
-window.addEventListener('resize',()=>{{if(currentPage()==='monitor')redrawMonitorCached();else if(currentPage()==='tests')redrawAccuracyChart();}});
-setInterval(async()=>{{if(currentPage()!=='monitor')return;const status=await syncMonitorStatus();if(status&&status.running){{monitorLiveMode=true;const now=Date.now();if(now-monitorLastTickerAt>=5000){{monitorLastTickerAt=now;fetchMonitor();}}}}else{{monitorLiveMode=false;drawVirtualMonitor();}}}},1000);
-setInterval(()=>{{if(currentPage()==='tests'){{refreshReplayInfo().then(function(){{fetchAccuracy({{resetView:false}});}});}}}},3000);
-setInterval(()=>{{if(currentPage()==='logs'&&analysisLogEnabled){{refreshLogs(false);refreshConsoleLogs(false);}}}},3000);window.addEventListener('hashchange',()=>showPage(currentPage()));syncMonitorStatus();showPage(currentPage());
+if(monitorCanvas){{monitorCanvas.addEventListener('wheel',function(event){{event.preventDefault();const rect=monitorCanvas.getBoundingClientRect(),focus=Math.min(1,Math.max(0,(event.clientX-rect.left)/Math.max(1,rect.width))),span=monitorViewEnd-monitorViewStart,zoom=(event.deltaY<0?0.82:1.22),newSpan=Math.min(1,Math.max(.06,span*zoom)),center=monitorViewStart+span*focus;let ns=center-newSpan*focus,ne=ns+newSpan;if(ns<0){{ne-=ns;ns=0;}}if(ne>1){{ns-=ne-1;ne=1;}}monitorViewStart=Math.max(0,ns);monitorViewEnd=Math.min(1,ne);monitorYZoom=Math.max(.45,Math.min(10,monitorYZoom*(event.deltaY<0?1.14:.88)));redrawMonitorCached();}},{{passive:false}});monitorCanvas.addEventListener('mousedown',function(event){{monitorDrag={{x:event.clientX,y:event.clientY,start:monitorViewStart,end:monitorViewEnd,yPan:monitorYPan,yRange:monitorYRange,moved:false}};monitorCanvas.classList.add('dragging');}});window.addEventListener('mousemove',function(event){{if(!monitorDrag)return;const rect=monitorCanvas.getBoundingClientRect(),span=monitorDrag.end-monitorDrag.start,dx=(event.clientX-monitorDrag.x)/Math.max(1,rect.width),dy=(event.clientY-monitorDrag.y)/Math.max(1,rect.height);if(Math.abs(event.clientX-monitorDrag.x)>3||Math.abs(event.clientY-monitorDrag.y)>3)monitorDrag.moved=true;let ns=monitorDrag.start-dx*span,ne=monitorDrag.end-dx*span;if(ns<0){{ne-=ns;ns=0;}}if(ne>1){{ns-=ne-1;ne=1;}}monitorViewStart=Math.max(0,ns);monitorViewEnd=Math.min(1,ne);monitorYPan=monitorDrag.yPan+dy*Math.max(.01,monitorDrag.yRange||monitorYRange);redrawMonitorCached();}});window.addEventListener('mouseup',function(){{if(monitorDrag){{setTimeout(function(){{monitorDrag=null;}},0);}}monitorCanvas.classList.remove('dragging');}});function selectNearestPoint(event,strict){{if(!monitorPlotPoints.length)return;const rect=monitorCanvas.getBoundingClientRect(),x=event.clientX-rect.left,y=event.clientY-rect.top;let best=null,bestDist=Infinity;monitorPlotPoints.forEach(o=>{{const dx=o.x-x,dy=o.y-y,dist=Math.sqrt(dx*dx+dy*dy);if(dist<bestDist){{best=o;bestDist=dist;}}}});if(best&&bestDist<(strict?42:34)){{monitorSelectedKey=best.point.time||'';redrawMonitorCached();}}else if(!strict){{monitorSelectedKey='';redrawMonitorCached();}}}}monitorCanvas.addEventListener('click',function(event){{if(monitorDrag&&monitorDrag.moved)return;selectNearestPoint(event,false);}});monitorCanvas.addEventListener('dblclick',function(event){{selectNearestPoint(event,true);}});}}
+window.addEventListener('resize',()=>{{if(currentPage()==='monitor'&&isMonitorChartEnabled())redrawMonitorCached();else if(currentPage()==='tests')redrawAccuracyChart();}});
+setInterval(async()=>{{if(document.hidden||currentPage()!=='monitor')return;const status=await syncMonitorStatus();if(!isMonitorChartEnabled())return;if(status&&status.running){{monitorLiveMode=true;const now=Date.now();if(now-monitorLastTickerAt>=5000){{monitorLastTickerAt=now;fetchMonitor();}}}}else{{monitorLiveMode=false;drawVirtualMonitor();}}}},1000);
+setInterval(()=>{{if(document.hidden||currentPage()!=='tests')return;if(replayProgressTimer)return;if(!isAccuracyEnabled())return;refreshReplayInfo().then(function(){{fetchAccuracy({{resetView:false}});}});}},3000);
+setInterval(()=>{{if(document.hidden||currentPage()!=='logs')return;if(!isLogsDisplayEnabled())return;refreshLogs(false);refreshConsoleLogs(false);}},3000);window.addEventListener('hashchange',()=>showPage(currentPage()));
+function closePowerMenu(){{const menu=document.getElementById('powerMenu'),btn=document.getElementById('powerMenuBtn');if(menu)menu.hidden=true;if(btn)btn.setAttribute('aria-expanded','false');}}
+function togglePowerMenu(){{const menu=document.getElementById('powerMenu'),btn=document.getElementById('powerMenuBtn');if(!menu||!btn)return;const next=menu.hidden;menu.hidden=!next;btn.setAttribute('aria-expanded',next?'true':'false');}}
+function showPowerOverlay(message){{const overlay=document.createElement('div');overlay.className='power-overlay';overlay.id='powerOverlay';overlay.textContent=message||'正在处理…';document.body.appendChild(overlay);return overlay;}}
+async function waitForWebRestart(){{let tries=0,overlay=document.getElementById('powerOverlay');while(tries<120){{tries+=1;await new Promise(function(resolve){{setTimeout(resolve,1000);}});try{{const probe=await fetch('/api/status',{{cache:'no-store'}});if(probe.ok||probe.status===401){{if(overlay)overlay.textContent='服务已恢复，请手动刷新浏览器';return;}}}}catch(err){{}}try{{const loginProbe=await fetch('/login',{{cache:'no-store'}});if(loginProbe.ok){{if(overlay)overlay.textContent='服务已恢复，请手动刷新浏览器';return;}}}}catch(err){{}}}}if(overlay)overlay.textContent='重启超时，请手动刷新浏览器或重新打开控制台';}}
+async function runPowerAction(action){{const isRestart=action==='restart';if(!confirm(isRestart?POWER_CONFIRM_RESTART:POWER_CONFIRM_SHUTDOWN))return;closePowerMenu();try{{const response=await fetch('/api/power/'+action,{{method:'POST',cache:'no-store'}});let payload={{}};try{{payload=await response.json();}}catch(err){{payload={{}};}}if(!response.ok||payload.ok===false){{alert(payload.error||(isRestart?'重启失败':'关机失败'));return;}}showPowerOverlay(payload.message||(isRestart?'正在重启 Web 控制台…':'正在关闭 Web 控制台…'));if(isRestart){{waitForWebRestart();}}else{{setTimeout(function(){{try{{window.open('','_self');window.close();}}catch(err){{}}document.body.innerHTML='<div class="power-overlay" style="position:fixed;inset:0;display:grid;place-items:center;background:#0f172a;color:#e2e8f0;font-size:16px;font-weight:650;">'+POWER_SHUTDOWN_DONE+'</div>';}},1200);}}}}catch(err){{if(isRestart){{showPowerOverlay('正在重启 Web 控制台…');waitForWebRestart();}}else{{alert('关机请求失败：'+err);}}}}}}
+(function initPowerMenu(){{const btn=document.getElementById('powerMenuBtn'),row=document.querySelector('.sidebar-footer-power'),menu=document.getElementById('powerMenu'),restartBtn=document.getElementById('powerRestartBtn'),shutdownBtn=document.getElementById('powerShutdownBtn');function onPowerRowClick(event){{if(!menu||!row)return;if(menu.contains(event.target))return;if(event.target===restartBtn||event.target===shutdownBtn)return;event.stopPropagation();togglePowerMenu();}}if(row)row.addEventListener('click',onPowerRowClick);if(restartBtn)restartBtn.addEventListener('click',function(event){{event.stopPropagation();runPowerAction('restart');}});if(shutdownBtn)shutdownBtn.addEventListener('click',function(event){{event.stopPropagation();runPowerAction('shutdown');}});document.addEventListener('click',function(event){{if(!menu||menu.hidden)return;if(row&&row.contains(event.target))return;if(menu.contains(event.target))return;closePowerMenu();}});document.addEventListener('keydown',function(event){{if(event.key==='Escape')closePowerMenu();}});}})();
+syncMonitorStatus();showPage(currentPage());
 </script></body></html>"""
     return body.encode("utf-8")
 
 
 class Handler(BaseHTTPRequestHandler):
+    _request_slots = threading.BoundedSemaphore(WEB_MAX_CONCURRENT_REQUESTS)
+
     def log_message(self, fmt: str, *args: Any) -> None:
         return
 
+    def handle(self) -> None:
+        acquired = self._request_slots.acquire(timeout=30)
+        if not acquired:
+            try:
+                self.send_error(503, "Server busy")
+            except Exception:
+                pass
+            return
+        try:
+            super().handle()
+        finally:
+            self._request_slots.release()
+
     def is_authenticated(self) -> bool:
-        return parse_cookies(self.headers.get("Cookie", "")).get("okx_ai_session") in SESSIONS
+        token = parse_cookies(self.headers.get("Cookie", "")).get("okx_ai_session")
+        return is_valid_session(token)
 
     def send_html(self, content: bytes) -> None:
         self.send_response(200)
@@ -2929,11 +4825,29 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
-    def send_json(self, payload: Dict[str, Any], status: int = 200) -> None:
+    def send_json(self, payload: Dict[str, Any], status: int = 200, cookie: str = "") -> None:
         content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.end_headers()
+        self.wfile.write(content)
+
+    def send_bytes(
+        self,
+        content: bytes,
+        content_type: str,
+        *,
+        filename: str = "",
+        status: int = 200,
+    ) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        if filename:
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.end_headers()
         self.wfile.write(content)
 
@@ -2981,20 +4895,85 @@ class Handler(BaseHTTPRequestHandler):
             self.send_asset(path)
             return
         if path == "/login":
-            self.send_html(render_login())
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if params.get("auth_changed", [""])[0] == "1":
+                self.send_html(
+                    render_login(
+                        "登录账号已更新，监控与回放已停止。请使用新用户名和密码登录。",
+                        success=True,
+                    )
+                )
+            else:
+                self.send_html(render_login())
             return
         if path == "/logout":
             token = parse_cookies(self.headers.get("Cookie", "")).get("okx_ai_session")
-            if token in SESSIONS:
-                SESSIONS.remove(token)
+            revoke_session(token)
             self.redirect("/login", "okx_ai_session=; Path=/; Max-Age=0; HttpOnly")
             return
         if not self.require_auth(path):
             return
         if path == "/":
             self.send_html(render_page())
+        elif path == "/save-auth":
+            self.redirect("/#settings")
         elif path == "/api/status":
             self.send_json(monitor_status())
+        elif path == "/api/validate-inst-ids":
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            inst_id = normalize_inst_id(params.get("inst_id", [""])[0])
+            if inst_id:
+                candidate = [inst_id]
+            else:
+                candidate = parse_inst_ids_from_form(
+                    {
+                        "inst_ids": params.get("inst_ids", []),
+                        "custom_inst_ids": params.get("custom_inst_ids", []),
+                    }
+                )
+            if not candidate:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": "请输入或选择一个合约 ID。",
+                        "valid": [],
+                        "errors": [],
+                    },
+                    status=400,
+                )
+                return
+            valid, errors = validate_inst_ids(candidate)
+            if errors:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": format_inst_id_errors(errors),
+                        "valid": valid,
+                        "errors": errors,
+                    },
+                    status=400,
+                )
+                return
+            self.send_json({"ok": True, "valid": valid, "errors": [], "inst_id": valid[0] if len(valid) == 1 else ""})
+        elif path == "/api/monitor-candles":
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            inst_id = params.get("inst_id", ["BTC-USDT-SWAP"])[0]
+            bar = params.get("bar", ["1m"])[0]
+            configured = configured_instruments()
+            if inst_id not in configured:
+                self.send_json({"ok": False, "error": f"{inst_id} 未在配置中启用，不能读取 K 线。", "configured": configured}, status=400)
+                return
+            try:
+                cache_key = (
+                    f"monitor-candles:{inst_id}:{bar}:"
+                    f"{int(monitor_status()['running'])}:{MONITOR_LOG_START_AT}:"
+                    f"{log_file_cache_token(MONITOR_JSON_LOG_FILE)}"
+                )
+                self.send_json(
+                    cached_api_response(cache_key, lambda: read_monitor_candles(inst_id, bar))
+                )
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
         elif path == "/api/monitor-data":
             params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             inst_id = params.get("inst_id", ["BTC-USDT-SWAP"])[0]
@@ -3015,18 +4994,24 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=502)
         elif path == "/api/logs":
+            cfg = load_config()
             self.send_json({
                 "text": monitor_log_text(),
                 "running": bool(monitor_status()["running"]),
-                "enabled": analysis_log_enabled(),
+                "enabled": True,
+                "log_size_summary": log_size_summary_text(cfg),
+                "log_max_mb": cfg.get("log_max_mb"),
+                "log_total_max_mb": cfg.get("log_total_max_mb"),
                 "default_path": str(MONITOR_JSON_LOG_FILE),
                 "start_at": MONITOR_LOG_START_AT,
             })
         elif path == "/api/console-logs":
+            cfg = load_config()
             self.send_json({
                 "text": monitor_console_log_text(),
                 "running": bool(monitor_status()["running"]),
-                "enabled": analysis_log_enabled(),
+                "enabled": True,
+                "log_size_summary": log_size_summary_text(cfg),
                 "default_path": str(MONITOR_PROCESS_LOG_FILE),
                 "start_at": MONITOR_LOG_START_AT,
             })
@@ -3052,14 +5037,24 @@ class Handler(BaseHTTPRequestHandler):
             if "max_points" in params:
                 max_points = max(100, min(50000, int(params.get("max_points", [str(max_points)])[0])))
             try:
+                accuracy_log_path = REPLAY_ANALYSIS_LOG_FILE if scope == "replay" else MONITOR_JSON_LOG_FILE
+                cache_key = (
+                    f"accuracy:{inst_id}:{horizon}:{scope}:{retention_hours}:"
+                    f"{interval_seconds}:{max_points}:"
+                    f"{MONITOR_LOG_START_AT}:{REPLAY_LOG_START_AT}:"
+                    f"{log_file_cache_token(accuracy_log_path)}"
+                )
                 self.send_json(
-                    accuracy_report(
-                        inst_id,
-                        horizon,
-                        max_points=max_points,
-                        scope=scope,
-                        retention_hours=retention_hours,
-                        interval_seconds=interval_seconds,
+                    cached_api_response(
+                        cache_key,
+                        lambda: accuracy_report(
+                            inst_id,
+                            horizon,
+                            max_points=max_points,
+                            scope=scope,
+                            retention_hours=retention_hours,
+                            interval_seconds=interval_seconds,
+                        ),
                     )
                 )
             except Exception as exc:
@@ -3075,6 +5070,12 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/test-push":
             result = test_push_connection()
             self.send_json(result, status=200 if result.get("ok") else 400)
+        elif path == "/api/diagnostic-export":
+            try:
+                content, filename, manifest = create_diagnostic_zip()
+                self.send_bytes(content, "application/zip", filename=filename)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
         elif path == "/config-json":
             content = f"<pre>{esc(active_config_file().read_text(encoding='utf-8-sig'))}</pre>".encode("utf-8")
             self.send_html(content)
@@ -3095,6 +5096,13 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length).decode("utf-8")
+        if path == "/api/tray/shutdown":
+            client_host = self.client_address[0]
+            if client_host not in ("127.0.0.1", "::1"):
+                self.send_json({"ok": False, "error": "forbidden"}, status=403)
+                return
+            self.send_json(request_power_shutdown())
+            return
         if path == "/api/config/import":
             if not self.require_auth(path):
                 return
@@ -3109,7 +5117,7 @@ class Handler(BaseHTTPRequestHandler):
             auth = load_auth()
             if form.get("username") == auth.get("username") and form.get("password") == auth.get("password"):
                 token = secrets.token_urlsafe(32)
-                SESSIONS.add(token)
+                register_session(token)
                 self.redirect("/", f"okx_ai_session={token}; Path=/; HttpOnly; SameSite=Lax")
             else:
                 self.send_html(render_login("用户名或密码错误。"))
@@ -3127,10 +5135,44 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=400)
             return
+        if path == "/api/add-inst-id":
+            try:
+                config = load_config()
+                inst_id = validate_single_inst_id(
+                    str(form.get("inst_id", "")),
+                    known_inst_ids=visible_inst_pool(config),
+                )
+                self.send_json({"ok": True, "inst_id": inst_id, "is_preset": inst_id in PRESET_INSTRUMENTS})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        if path == "/api/power/restart":
+            self.send_json(request_power_restart())
+            return
+        if path == "/api/power/shutdown":
+            self.send_json(request_power_shutdown())
+            return
         if path == "/api/config/save":
             try:
                 saved_path = update_from_form(form)
                 self.send_json({"ok": True, "path": str(saved_path), "inst_ids": configured_instruments()})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        if path == "/api/save-auth":
+            try:
+                message, saved_path = update_auth_from_form(form)
+                token = parse_cookies(self.headers.get("Cookie", "")).get("okx_ai_session")
+                clear_session_token(token)
+                self.send_json(
+                    {
+                        "ok": True,
+                        "message": message,
+                        "path": str(saved_path),
+                        "redirect": "/login?auth_changed=1",
+                    },
+                    cookie="okx_ai_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax",
+                )
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=400)
             return
@@ -3155,12 +5197,38 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=400)
             return
+        if path == "/api/ai-chat":
+            try:
+                payload = json.loads(raw or "{}")
+                result = call_ai_chat(
+                    str(payload.get("message", "")),
+                    payload.get("history") if isinstance(payload.get("history"), list) else None,
+                )
+                self.send_json(result, status=200 if result.get("ok") else 400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        if path == "/api/diagnostic-export":
+            try:
+                payload = json.loads(raw or "{}") if raw else {}
+                extras = {}
+                if isinstance(payload.get("ai_chat"), list):
+                    extras["ai_chat"] = payload["ai_chat"]
+                if isinstance(payload.get("accuracy_snapshot"), dict):
+                    extras["accuracy_snapshot"] = payload["accuracy_snapshot"]
+                content, filename, manifest = create_diagnostic_zip(extras)
+                self.send_bytes(content, "application/zip", filename=filename)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
         if path == "/save-auth":
-            auth = load_auth()
-            username = str(form.get("auth_username", auth.get("username", "admin"))).strip() or "admin"
-            password = str(form.get("auth_password", "")).strip() or auth.get("password", "admin123")
-            save_auth(username, password)
-            self.send_html(render_page())
+            try:
+                update_auth_from_form(form)
+                token = parse_cookies(self.headers.get("Cookie", "")).get("okx_ai_session")
+                clear_session_token(token)
+                self.redirect("/login?auth_changed=1", "okx_ai_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+            except Exception as exc:
+                self.send_html(render_page(f"保存账号失败：{exc}"))
             return
         try:
             env_path = update_from_form(form)
@@ -3174,23 +5242,60 @@ class Handler(BaseHTTPRequestHandler):
             self.send_html(render_page(f"配置已保存。{note}"))
 
 
+class PanelHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+
 def main() -> int:
+    global WEB_SERVER
+    cleanup_stale_child_processes()
+    restore_restart_sessions()
     try:
-        server = ThreadingHTTPServer((HOST, PORT), Handler)
+        server = PanelHTTPServer((HOST, PORT), Handler)
     except OSError as exc:
         print(f"配置页面启动失败: {exc}")
         print(f"可能是端口 {PORT} 被占用。可以设置 WEB_CONTROL_PANEL_PORT 后重试。")
         return 1
+    WEB_SERVER = server
     url = f"http://{HOST}:{PORT}"
     print(f"配置页面已启动: {url}")
     print("如果浏览器没有自动打开，请手动访问该地址；按 Ctrl+C 停止。")
-    if HOST in ("127.0.0.1", "localhost"):
-        threading = __import__("threading")
-        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    if HOST in ("127.0.0.1", "localhost") and should_auto_open_browser():
+        browser_timer = threading.Timer(0.6, lambda: webbrowser.open(url))
+        browser_timer.daemon = True
+        browser_timer.start()
+    stopped_by_user = False
+
+    def _request_stop(signum: int, frame: Any) -> None:
+        nonlocal stopped_by_user
+        if stopped_by_user:
+            return
+        stopped_by_user = True
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGINT, _request_stop)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _request_stop)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
+        stopped_by_user = True
+    finally:
+        server.server_close()
+        WEB_SERVER = None
+    if stopped_by_user:
+        try:
+            stop_all_background_services(fast=True)
+        except Exception:
+            pass
         print("\n配置页面已停止。")
+        os._exit(130)
+    if WEB_POWER_RESTART:
+        print("\n配置页面正在重启…")
+        os._exit(EXIT_CODE_TRAY_RESTART if launched_by_tray() else 0)
+    if WEB_POWER_SHUTDOWN:
+        print("\n配置页面已关闭。")
+        os._exit(EXIT_CODE_TRAY_SHUTDOWN if launched_by_tray() else 0)
     return 0
 
 

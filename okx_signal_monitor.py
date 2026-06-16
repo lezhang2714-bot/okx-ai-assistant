@@ -3,7 +3,7 @@
 OKX AI short-term trading assistant V1.
 
 Scope:
-    - Monitor BTC-USDT-SWAP and ETH-USDT-SWAP only.
+    - Monitor OKX USDT perpetual swaps (default BTC/ETH; configurable via Web or --inst-ids).
     - Provide analysis and suggestions only.
     - No auto order, no martingale, no grid.
 
@@ -20,12 +20,15 @@ Production tuning:
     export RETRY_TIMES=3
     export PUSH_COOLDOWN_SECONDS=900
     export LOG_MAX_BYTES=524288000
+    export LOG_TOTAL_MAX_BYTES=1572864000
     export VOLUME_MULTIPLIER=2.0
     export OI_CHANGE_PCT_15M=5.0
     export AI_REQUEST_TIMEOUT=30
     export AI_CIRCUIT_FAIL_THRESHOLD=3
     export AI_CIRCUIT_COOLDOWN_SECONDS=120
     export AI_PROBE_INTERVAL_SECONDS=60
+    export AI_ABNORMAL_ALERT_SECONDS=300
+    export AI_ABNORMAL_ALERT_COOLDOWN_SECONDS=3600
     export AI_CALL_MIN_INTERVAL_SECONDS=60
     export CONSOLE_VERBOSE=1
 """
@@ -33,7 +36,9 @@ Production tuning:
 import argparse
 import json
 import os
+import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -51,8 +56,10 @@ except ImportError:
     MarketData = None
     PublicData = None
 
-# AI短线助手V1的固定范围：只做BTC/ETH USDT永续，不做现货和其他币种。
-SUPPORTED_INSTRUMENTS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
+# 默认快捷合约；Web 控制台与 --inst-ids 可配置其他 OKX USDT 永续。
+PRESET_INSTRUMENTS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
+SUPPORTED_INSTRUMENTS = PRESET_INSTRUMENTS
+INST_ID_PATTERN = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+-SWAP$")
 
 # 多周期K线用于判断短线趋势结构：
 # 1m/3m负责入场节奏，5m/15m负责短线方向，1H/4H负责上级环境。
@@ -65,16 +72,25 @@ DEFAULT_AI_MODEL = "gpt-5.5"
 OKX_BASE_URL = "https://www.okx.com"
 DEFAULT_RETRY_TIMES = 3
 DEFAULT_RETRY_BACKOFF_SECONDS = 1.5
+DEFAULT_OKX_CIRCUIT_FAIL_THRESHOLD = 5
+DEFAULT_OKX_CIRCUIT_COOLDOWN_SECONDS = 90
+DEFAULT_REPLAY_DATASET_MAX_BYTES = 500 * 1024 * 1024
+DEFAULT_REPLAY_DATASET_TOTAL_MAX_BYTES = 1500 * 1024 * 1024
 DEFAULT_AI_REQUEST_TIMEOUT = 30.0
 DEFAULT_AI_PROBE_TIMEOUT = 10.0
 DEFAULT_AI_CIRCUIT_FAIL_THRESHOLD = 3
 DEFAULT_AI_CIRCUIT_COOLDOWN_SECONDS = 120
 DEFAULT_AI_PROBE_INTERVAL_SECONDS = 60
+DEFAULT_AI_ABNORMAL_ALERT_SECONDS = 300
+DEFAULT_AI_ABNORMAL_ALERT_COOLDOWN_SECONDS = 3600
 DEFAULT_AI_RATE_LIMIT_BACKOFF_SECONDS = 30.0
 DEFAULT_PUSH_COOLDOWN_SECONDS = 900
 DEFAULT_AI_CALL_MIN_INTERVAL_SECONDS = 60
 # 500MB；12h 写入量约 177MB，留足余量避免过早轮转导致 Web 图表/压测丢数据。
 DEFAULT_LOG_MAX_BYTES = 500 * 1024 * 1024
+# 默认总容量 1.5GB（约 3 个 500MB 分卷）；超过后删除最旧分卷。
+DEFAULT_LOG_TOTAL_MAX_BYTES = 1500 * 1024 * 1024
+MIN_LOG_MAX_BYTES = 50 * 1024 * 1024
 WECHAT_PUSH_MAX_DESP = 28000
 TRADE_TRIGGER_SIGNALS = frozenset(
     {"volume_spike", "structure_break", "oi_change", "order_book_imbalance", "macd_momentum_change"}
@@ -111,8 +127,281 @@ REPLAY_DATASET_VERSION = "1.0"
 SIGNAL_PERFORMANCE_FILE = LOG_DIR / "signal_performance.jsonl"
 SIGNAL_PERFORMANCE_MAX_BYTES = 10 * 1024 * 1024
 SIGNAL_PERFORMANCE_LOAD_BYTES = 2 * 1024 * 1024
+AI_TOKEN_STATS_FILE = LOG_DIR / "ai_session_tokens.json"
 PAPER_INITIAL_CAPITAL = 10000.0
 PAPER_ACCOUNT_FILE = LOG_DIR / "paper_account.json"
+
+
+def default_ai_token_stats(started_at: str = "") -> Dict[str, Any]:
+    return {
+        "started_at": started_at or now_text(),
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "calls": 0,
+    }
+
+
+def load_ai_token_stats(path: Path = AI_TOKEN_STATS_FILE) -> Dict[str, Any]:
+    if not path.exists():
+        return default_ai_token_stats()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return default_ai_token_stats()
+    if not isinstance(data, dict):
+        return default_ai_token_stats()
+    stats = default_ai_token_stats(str(data.get("started_at") or ""))
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens", "calls"):
+        try:
+            stats[key] = max(0, int(data.get(key, 0)))
+        except (TypeError, ValueError):
+            stats[key] = 0
+    if stats["total_tokens"] <= 0:
+        stats["total_tokens"] = stats["prompt_tokens"] + stats["completion_tokens"]
+    return stats
+
+
+def save_ai_token_stats(stats: Dict[str, Any], path: Path = AI_TOKEN_STATS_FILE) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = default_ai_token_stats(str(stats.get("started_at") or ""))
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens", "calls"):
+        try:
+            payload[key] = max(0, int(stats.get(key, 0)))
+        except (TypeError, ValueError):
+            payload[key] = 0
+    if payload["total_tokens"] <= 0:
+        payload["total_tokens"] = payload["prompt_tokens"] + payload["completion_tokens"]
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def reset_ai_token_stats(path: Path = AI_TOKEN_STATS_FILE, started_at: str = "") -> Dict[str, Any]:
+    stats = default_ai_token_stats(started_at or now_text())
+    save_ai_token_stats(stats, path)
+    return stats
+
+
+def accumulate_ai_token_stats(usage: Optional[Dict[str, int]], path: Path = AI_TOKEN_STATS_FILE) -> Dict[str, Any]:
+    if not usage:
+        return load_ai_token_stats(path)
+    prompt = max(0, int(usage.get("prompt_tokens") or 0))
+    completion = max(0, int(usage.get("completion_tokens") or 0))
+    total = max(0, int(usage.get("total_tokens") or 0))
+    if total <= 0:
+        total = prompt + completion
+    if total <= 0 and prompt <= 0 and completion <= 0:
+        return load_ai_token_stats(path)
+    stats = load_ai_token_stats(path)
+    stats["prompt_tokens"] = int(stats.get("prompt_tokens", 0)) + prompt
+    stats["completion_tokens"] = int(stats.get("completion_tokens", 0)) + completion
+    stats["total_tokens"] = int(stats.get("total_tokens", 0)) + total
+    stats["calls"] = int(stats.get("calls", 0)) + 1
+    save_ai_token_stats(stats, path)
+    return stats
+
+
+def analysis_log_backup_path(active_path: Path, index: int) -> Path:
+    return active_path.with_suffix(active_path.suffix + f".{index}")
+
+
+def list_analysis_log_segments(active_path: Path) -> List[Path]:
+    """Return log segments oldest-first: [.N, ..., .1, active]."""
+    backups: List[Path] = []
+    index = 1
+    while True:
+        backup = analysis_log_backup_path(active_path, index)
+        if backup.exists():
+            backups.append(backup)
+            index += 1
+        else:
+            break
+    backups.reverse()
+    if active_path.exists():
+        return backups + [active_path]
+    return backups
+
+
+def analysis_log_total_bytes(active_path: Path) -> int:
+    total = 0
+    for path in list_analysis_log_segments(active_path):
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _shift_analysis_log_backups(active_path: Path) -> None:
+    index = 1
+    while analysis_log_backup_path(active_path, index).exists():
+        index += 1
+    for slot in range(index - 1, 0, -1):
+        src = analysis_log_backup_path(active_path, slot)
+        dst = analysis_log_backup_path(active_path, slot + 1)
+        if dst.exists():
+            dst.unlink()
+        src.replace(dst)
+
+
+def _rotate_analysis_log_active(active_path: Path) -> None:
+    active_path.parent.mkdir(parents=True, exist_ok=True)
+    backup1 = analysis_log_backup_path(active_path, 1)
+    if backup1.exists():
+        _shift_analysis_log_backups(active_path)
+    if active_path.exists():
+        active_path.replace(backup1)
+
+
+def _prune_analysis_log_segments(active_path: Path, log_total_max_bytes: int) -> None:
+    while analysis_log_total_bytes(active_path) > log_total_max_bytes:
+        segments = list_analysis_log_segments(active_path)
+        if not segments:
+            return
+        oldest = segments[0]
+        if len(segments) == 1 and oldest.resolve() == active_path.resolve():
+            return
+        try:
+            oldest.unlink()
+        except OSError as exc:
+            console_debug(f"log prune failed: {exc}")
+            return
+
+
+def rotate_analysis_log_if_needed(
+    active_path: Path,
+    log_max_bytes: int,
+    log_total_max_bytes: int,
+) -> None:
+    log_max_bytes = max(int(log_max_bytes), MIN_LOG_MAX_BYTES)
+    log_total_max_bytes = max(int(log_total_max_bytes), log_max_bytes)
+    try:
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        if active_path.exists() and active_path.stat().st_size >= log_max_bytes:
+            _rotate_analysis_log_active(active_path)
+        _prune_analysis_log_segments(active_path, log_total_max_bytes)
+    except Exception as exc:
+        console_debug(f"log rotation failed: {exc}")
+
+
+def replay_dataset_backup_path(active_path: Path, index: int) -> Path:
+    return active_path.with_name(f"{active_path.name}.{index}")
+
+
+def list_replay_dataset_segments(active_path: Path) -> List[Path]:
+    backups: List[Path] = []
+    index = 1
+    while True:
+        backup = replay_dataset_backup_path(active_path, index)
+        if backup.exists():
+            backups.append(backup)
+            index += 1
+        else:
+            break
+    backups.reverse()
+    if active_path.exists():
+        return backups + [active_path]
+    return backups
+
+
+def replay_dataset_total_bytes(active_path: Path) -> int:
+    total = 0
+    for path in list_replay_dataset_segments(active_path):
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _shift_replay_dataset_backups(active_path: Path) -> None:
+    index = 1
+    while replay_dataset_backup_path(active_path, index).exists():
+        index += 1
+    for slot in range(index - 1, 0, -1):
+        src = replay_dataset_backup_path(active_path, slot)
+        dst = replay_dataset_backup_path(active_path, slot + 1)
+        if dst.exists():
+            dst.unlink()
+        src.replace(dst)
+
+
+def rotate_replay_dataset_if_needed(
+    active_path: Path,
+    max_bytes: int = DEFAULT_REPLAY_DATASET_MAX_BYTES,
+    total_max_bytes: int = DEFAULT_REPLAY_DATASET_TOTAL_MAX_BYTES,
+) -> None:
+    max_bytes = max(int(max_bytes), 50 * 1024 * 1024)
+    total_max_bytes = max(int(total_max_bytes), max_bytes)
+    try:
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        if active_path.exists() and active_path.stat().st_size >= max_bytes:
+            backup1 = replay_dataset_backup_path(active_path, 1)
+            if backup1.exists():
+                _shift_replay_dataset_backups(active_path)
+            active_path.replace(backup1)
+        while replay_dataset_total_bytes(active_path) > total_max_bytes:
+            segments = list_replay_dataset_segments(active_path)
+            if not segments:
+                return
+            oldest = segments[0]
+            if len(segments) == 1 and oldest.resolve() == active_path.resolve():
+                return
+            oldest.unlink()
+    except Exception as exc:
+        console_debug(f"replay dataset rotation failed: {exc}")
+
+
+def tail_analysis_log_text(active_path: Path, max_bytes: int) -> str:
+    if max_bytes <= 0 or not active_path.parent.exists():
+        return ""
+    segments = list_analysis_log_segments(active_path)
+    if not segments:
+        return ""
+    remaining = max_bytes
+    chunks: List[str] = []
+    for path in reversed(segments):
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size <= remaining:
+            chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+            remaining -= size
+            if remaining <= 0:
+                break
+            continue
+        with path.open("rb") as file:
+            file.seek(size - remaining)
+            chunks.append(file.read().decode("utf-8", errors="replace"))
+        remaining = 0
+        break
+    chunks.reverse()
+    return "".join(chunks)
+
+
+def iter_analysis_log_lines(
+    active_path: Path,
+    *,
+    read_full: bool = False,
+    max_tail_bytes: int = None,
+):
+    if max_tail_bytes is None:
+        max_tail_bytes = DEFAULT_LOG_TOTAL_MAX_BYTES
+    if not read_full:
+        for line in tail_analysis_log_text(active_path, max_tail_bytes).splitlines():
+            stripped = line.strip()
+            if stripped:
+                yield stripped
+        return
+    for path in list_analysis_log_segments(active_path):
+        try:
+            with path.open("r", encoding="utf-8-sig") as file:
+                for line in file:
+                    stripped = line.strip()
+                    if stripped:
+                        yield stripped
+        except OSError:
+            continue
 
 
 def console_verbose_enabled() -> bool:
@@ -522,8 +811,11 @@ class RuntimeConfig:
     # 单个日志文件最大字节数，超过后轮转成 .1 文件。
     log_max_bytes: int = DEFAULT_LOG_MAX_BYTES
 
+    # 全部分卷合计上限，超过后删除最旧分卷。
+    log_total_max_bytes: int = DEFAULT_LOG_TOTAL_MAX_BYTES
+
     # 是否写入 JSON 分析日志与每轮控制台摘要；回放模式不受此开关影响。
-    analysis_log_enabled: bool = False
+    analysis_log_enabled: bool = True
 
 
 def now_text() -> str:
@@ -886,6 +1178,8 @@ def okx_data(response: Dict[str, Any]) -> List[Any]:
 def retry_call(label: str, func: Any, retry_times: int, retry_backoff: float) -> Any:
     # 所有外部网络调用统一走这里，避免单次网络抖动导致整轮分析失败。
     last_error: Optional[Exception] = None
+    retry_times = max(1, min(int(retry_times), 5))
+    retry_backoff = max(0.1, min(float(retry_backoff), 5.0))
     for attempt in range(1, retry_times + 1):
         try:
             return func()
@@ -893,10 +1187,50 @@ def retry_call(label: str, func: Any, retry_times: int, retry_backoff: float) ->
             last_error = exc
             if attempt >= retry_times:
                 break
-            sleep_seconds = retry_backoff * attempt
+            sleep_seconds = min(retry_backoff * attempt, 15.0)
             console_debug(f"[{now_text()}] {label} failed, retry {attempt}/{retry_times}: {exc}")
             time.sleep(sleep_seconds)
     raise RuntimeError(f"{label} failed after {retry_times} retries: {last_error}")
+
+
+_okx_circuit_open_until = 0.0
+_okx_consecutive_failures = 0
+_okx_circuit_lock = threading.Lock()
+
+
+def _check_okx_circuit() -> None:
+    if time.time() < _okx_circuit_open_until:
+        remaining = max(1, int(_okx_circuit_open_until - time.time()))
+        raise RuntimeError(f"OKX circuit open, retry after {remaining}s")
+
+
+def _record_okx_success() -> None:
+    global _okx_consecutive_failures
+    with _okx_circuit_lock:
+        _okx_consecutive_failures = 0
+
+
+def _record_okx_failure() -> None:
+    global _okx_consecutive_failures, _okx_circuit_open_until
+    threshold = max(2, env_int("OKX_CIRCUIT_FAIL_THRESHOLD", DEFAULT_OKX_CIRCUIT_FAIL_THRESHOLD))
+    cooldown = max(30, env_int("OKX_CIRCUIT_COOLDOWN_SECONDS", DEFAULT_OKX_CIRCUIT_COOLDOWN_SECONDS))
+    with _okx_circuit_lock:
+        _okx_consecutive_failures += 1
+        if _okx_consecutive_failures >= threshold:
+            _okx_circuit_open_until = time.time() + cooldown
+            _okx_consecutive_failures = 0
+            console_warn(f"[{now_text()}] OKX circuit opened for {cooldown}s after repeated failures")
+
+
+def okx_retry_call(label: str, func: Any, retry_times: int, retry_backoff: float) -> Any:
+    _check_okx_circuit()
+    try:
+        result = retry_call(label, func, retry_times, retry_backoff)
+        _record_okx_success()
+        return result
+    except Exception:
+        _record_okx_failure()
+        raise
 
 
 RETRYABLE_AI_ERROR_NAMES = {
@@ -985,7 +1319,7 @@ def http_get_json(
         with response:
             return json.loads(response.read().decode("utf-8"))
 
-    return retry_call(path, request, retry_times, retry_backoff)
+    return okx_retry_call(path, request, retry_times, retry_backoff)
 
 
 def okx_public_get(
@@ -1314,6 +1648,29 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def format_duration_zh(seconds: float) -> str:
+    total = int(max(0, seconds))
+    if total < 60:
+        return f"{total} 秒"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes} 分 {secs} 秒" if secs else f"{minutes} 分钟"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours} 小时 {minutes} 分" if minutes else f"{hours} 小时"
+    days, hours = divmod(hours, 24)
+    return f"{days} 天 {hours} 小时" if hours else f"{days} 天"
+
+
+AI_ABNORMAL_KIND_LABELS = {
+    "request_failed": "AI 请求失败",
+    "circuit_open": "AI 熔断中",
+    "probe_failed": "AI 探活失败",
+    "config_missing": "AI 密钥未配置",
+    "package_missing": "openai 包未安装",
+}
+
+
 class OkxAiShortTermAssistant:
     """OKX短线助手主类。
 
@@ -1329,6 +1686,7 @@ class OkxAiShortTermAssistant:
         ai_enabled: bool,
         push_enabled: bool,
         push_score: int,
+        short_push_score: int,
         dry_run_ai: bool,
         config: SignalConfig,
         runtime_config: RuntimeConfig,
@@ -1339,6 +1697,7 @@ class OkxAiShortTermAssistant:
         self.ai_enabled = ai_enabled
         self.push_enabled = push_enabled
         self.push_score = push_score
+        self.short_push_score = short_push_score
         self.dry_run_ai = dry_run_ai
         self.config = config
         self.runtime_config = runtime_config
@@ -1384,6 +1743,11 @@ class OkxAiShortTermAssistant:
         self.ai_fail_streak = 0
         self.ai_circuit_open_until = 0.0
         self.ai_last_probe_at = 0.0
+        self.ai_abnormal_since = 0.0
+        self.ai_abnormal_kind = ""
+        self.ai_last_failure_reason = ""
+        self.ai_abnormal_alert_at = 0.0
+        self._last_runtime_cache_prune_at = 0.0
         self.last_ai_call_at: Dict[str, float] = {}
         self.last_ai_fingerprint: Dict[str, str] = {}
 
@@ -1445,6 +1809,12 @@ class OkxAiShortTermAssistant:
     ) -> None:
         if not self.record_replay_file:
             return
+        rotate_replay_dataset_if_needed(self.record_replay_file)
+        try:
+            if not self.record_replay_file.exists() or self.record_replay_file.stat().st_size == 0:
+                self._record_replay_meta_written = False
+        except OSError:
+            self._record_replay_meta_written = False
         self._ensure_replay_meta()
         frame = {
             "type": "frame",
@@ -2696,7 +3066,7 @@ class OkxAiShortTermAssistant:
         levels = self._scalp_levels(snapshot, direction) if trade_allowed and direction in ("做多", "做空") else {"entry": "-", "stop_loss": "-", "take_profit": "-"}
         action = "急速异动" if direction in ("做多", "做空") else "观望"
         trade_score = scalp_score if trade_allowed and direction in ("做多", "做空") else 0
-        if trade_allowed and scalp_score >= self.push_score and direction in ("做多", "做空"):
+        if trade_allowed and scalp_score >= self.trade_push_score(direction) and direction in ("做多", "做空"):
             action = "可短打"
         return {
             "mode": "scalp",
@@ -2744,6 +3114,99 @@ class OkxAiShortTermAssistant:
     def _ai_rate_limit_backoff(self) -> float:
         return max(5.0, env_float("AI_RATE_LIMIT_BACKOFF_SECONDS", DEFAULT_AI_RATE_LIMIT_BACKOFF_SECONDS))
 
+    def _ai_abnormal_alert_after(self) -> int:
+        return max(60, env_int("AI_ABNORMAL_ALERT_SECONDS", DEFAULT_AI_ABNORMAL_ALERT_SECONDS))
+
+    def _ai_abnormal_alert_cooldown(self) -> int:
+        return max(300, env_int("AI_ABNORMAL_ALERT_COOLDOWN_SECONDS", DEFAULT_AI_ABNORMAL_ALERT_COOLDOWN_SECONDS))
+
+    def _mark_ai_abnormal(self, kind: str, reason: str) -> None:
+        if not self.ai_enabled or self.dry_run_ai:
+            return
+        cleaned = clip_push_text(reason, 800)
+        if not self.ai_abnormal_since:
+            self.ai_abnormal_since = time.time()
+        self.ai_abnormal_kind = kind or self.ai_abnormal_kind or "request_failed"
+        if cleaned:
+            self.ai_last_failure_reason = cleaned
+
+    def _clear_ai_abnormal(self) -> None:
+        self.ai_abnormal_since = 0.0
+        self.ai_abnormal_kind = ""
+        self.ai_last_failure_reason = ""
+
+    def _check_ai_startup_config(self) -> None:
+        if not self.ai_enabled or self.dry_run_ai or self.replay_mode:
+            return
+        try:
+            from openai import OpenAI  # noqa: F401
+        except ImportError:
+            self._mark_ai_abnormal("package_missing", "openai package is not installed")
+            return
+        api_key, _, _ = self._ai_env_config()
+        if not api_key:
+            self._mark_ai_abnormal("config_missing", "AI_API_KEY or OPENAI_API_KEY is not configured")
+
+    def _build_ai_abnormal_alert_content(self) -> Tuple[str, str]:
+        _, base_url, model = self._ai_env_config()
+        circuit_state = self._ai_circuit_state()
+        circuit_labels = {"closed": "正常", "open": "熔断开启", "half_open": "探活中"}
+        kind_label = AI_ABNORMAL_KIND_LABELS.get(self.ai_abnormal_kind, self.ai_abnormal_kind or "AI 异常")
+        duration = format_duration_zh(time.time() - self.ai_abnormal_since) if self.ai_abnormal_since else "-"
+        reason = self.ai_last_failure_reason or "未知错误"
+        title = f"[AI异常] {kind_label}"
+        lines = [
+            f"## OKX AI 功能异常告警 · {now_text()}",
+            "",
+            "### 异常概况",
+            f"- 异常类型：{kind_label}",
+            f"- 持续时长：{duration}",
+            f"- 熔断状态：{circuit_labels.get(circuit_state, circuit_state)}",
+            f"- 连续失败：{self.ai_fail_streak} 次",
+            f"- 当前模型：{model or '-'}",
+            f"- 接口地址：{base_url or '-'}",
+            "",
+            "### 失败原因",
+            reason,
+            "",
+            "### 当前影响",
+            "- 监控仍在运行，已自动切换为本地规则兜底分析",
+            "- AI 恢复后将自动重新启用深分析",
+            "",
+            "### 建议排查",
+            "- 检查 AI_API_KEY / OPENAI_API_KEY 是否正确",
+            "- 检查 AI_BASE_URL 与网络连通性",
+            "- 查看控制台日志与 JSON 分析日志中的 analysis.error 字段",
+        ]
+        return title[:120], self._join_wechat_desp(lines)
+
+    def _maybe_push_ai_abnormal_alert(self) -> None:
+        if not self.ai_enabled or self.dry_run_ai or self.replay_mode:
+            return
+        if not self.ai_abnormal_since:
+            return
+        now = time.time()
+        if now - self.ai_abnormal_since < self._ai_abnormal_alert_after():
+            return
+        if self.ai_abnormal_alert_at and now - self.ai_abnormal_alert_at < self._ai_abnormal_alert_cooldown():
+            return
+        send_key = os.getenv("WECHAT_SEND_KEY", "").strip()
+        if not send_key:
+            console_debug(f"[{now_text()}] AI abnormal alert skipped: WECHAT_SEND_KEY is not configured")
+            return
+        title, desp = self._build_ai_abnormal_alert_content()
+        try:
+            http_post_json(
+                f"https://sctapi.ftqq.com/{send_key}.send",
+                {"title": title, "desp": desp},
+                self.runtime_config.retry_times,
+                self.runtime_config.retry_backoff,
+            )
+            self.ai_abnormal_alert_at = now
+            console_info(f"[{now_text()}] AI abnormal alert sent to WeChat")
+        except Exception as exc:
+            console_warn(f"[{now_text()}] AI abnormal alert failed: {exc}")
+
     def _ai_env_config(self) -> Tuple[str, str, str]:
         api_key = (os.getenv("AI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
         base_url = os.getenv("AI_BASE_URL", "https://www.right.codes/codex/v1").strip()
@@ -2784,10 +3247,11 @@ class OkxAiShortTermAssistant:
         return "half_open"
 
     def _record_ai_success(self) -> None:
-        if self.ai_fail_streak or self.ai_circuit_open_until:
+        if self.ai_fail_streak or self.ai_circuit_open_until or self.ai_abnormal_since:
             console_info(f"[{now_text()}] AI connection recovered, circuit closed")
         self.ai_fail_streak = 0
         self.ai_circuit_open_until = 0.0
+        self._clear_ai_abnormal()
 
     def _record_ai_failure(self, exc: Exception) -> None:
         threshold = self._ai_circuit_fail_threshold()
@@ -2795,8 +3259,10 @@ class OkxAiShortTermAssistant:
             self.ai_fail_streak = threshold
         else:
             self.ai_fail_streak += 1
+        self._mark_ai_abnormal("request_failed", str(exc))
         if self.ai_fail_streak >= threshold:
             self.ai_circuit_open_until = time.time() + self._ai_circuit_cooldown()
+            self.ai_abnormal_kind = "circuit_open"
             console_warn(
                 f"[{now_text()}] AI circuit opened for {self._ai_circuit_cooldown()}s "
                 f"after failure: {exc}"
@@ -2839,113 +3305,8 @@ class OkxAiShortTermAssistant:
                 continue
         return result or None
 
-    def _json_char_len(self, value: Any) -> int:
-        return len(json.dumps(value, ensure_ascii=False))
-
-    def _payload_char_sections(self, payload: Dict[str, Any]) -> Dict[str, int]:
-        market = payload.get("market_data", {})
-        candles = market.get("candles", {})
-        derivatives = market.get("derivatives", {})
-        candle_chars = {
-            f"candles.{bar}": self._json_char_len(candles.get(bar, []))
-            for bar in ("1m", "3m", "5m", "15m", "1H", "4H")
-            if bar in candles
-        }
-        sections: Dict[str, int] = {
-            "market": self._json_char_len(market.get("market", {})),
-            **candle_chars,
-            "background_profiles": self._json_char_len(market.get("background_profiles", {})),
-            "oi_history": self._json_char_len(derivatives.get("oi_history", [])),
-            "funding_history": self._json_char_len(derivatives.get("funding_history", [])),
-            "derivatives_core": self._json_char_len(
-                {
-                    k: v
-                    for k, v in derivatives.items()
-                    if k not in {"oi_history", "funding_history"}
-                }
-            ),
-            "order_book": self._json_char_len(market.get("order_book", {})),
-            "volatility+thresholds": self._json_char_len(
-                {
-                    "volatility": market.get("volatility", {}),
-                    "dynamic_thresholds": market.get("dynamic_thresholds", {}),
-                    "instrument_profile": market.get("instrument_profile", {}),
-                }
-            ),
-            "trigger_context": self._json_char_len(payload.get("trigger_context", {})),
-            "analysis_config": self._json_char_len(payload.get("analysis_config", {})),
-            "payload_meta": self._json_char_len(payload.get("payload_meta", {})),
-        }
-        return {key: value for key, value in sections.items() if value > 0}
-
-    def _estimate_tokens_by_char_share(self, char_sections: Dict[str, int], token_budget: int) -> Dict[str, int]:
-        total_chars = sum(char_sections.values())
-        if token_budget <= 0 or total_chars <= 0:
-            return {key: 0 for key in char_sections}
-        allocated = {
-            key: max(0, round(token_budget * chars / total_chars))
-            for key, chars in char_sections.items()
-        }
-        drift = token_budget - sum(allocated.values())
-        if drift and allocated:
-            top_key = max(allocated, key=allocated.get)
-            allocated[top_key] = max(0, allocated[top_key] + drift)
-        return allocated
-
-    def _log_ai_prompt_token_breakdown(
-        self,
-        inst_id: str,
-        payload: Dict[str, Any],
-        prompt: str,
-        usage: Optional[Dict[str, int]],
-    ) -> None:
-        prompt_tokens = int((usage or {}).get("prompt_tokens") or 0)
-        if prompt_tokens <= 0:
-            return
-
-        payload_text = json.dumps(payload, ensure_ascii=False)
-        marker = "输入数据："
-        marker_idx = prompt.rfind(marker)
-        instruction_chars = marker_idx + len(marker) if marker_idx >= 0 else max(0, len(prompt) - len(payload_text))
-        prompt_chars = max(len(prompt), 1)
-        instruction_tokens = max(0, round(prompt_tokens * instruction_chars / prompt_chars))
-        payload_token_budget = max(0, prompt_tokens - instruction_tokens)
-
-        payload_sections = self._payload_char_sections(payload)
-        payload_tokens = self._estimate_tokens_by_char_share(payload_sections, payload_token_budget)
-        grouped: Dict[str, int] = {"instruction": instruction_tokens}
-        for key, tokens in payload_tokens.items():
-            if key.startswith("candles."):
-                grouped["candles"] = grouped.get("candles", 0) + tokens
-            elif key.startswith("trend_profiles."):
-                grouped["background_profiles"] = grouped.get("background_profiles", 0) + tokens
-            else:
-                grouped[key] = grouped.get(key, 0) + tokens
-
-        console_info(f"[{now_text()}] {inst_id} AI prompt breakdown (est by char share of prompt={prompt_tokens}):")
-        for name, tokens in sorted(grouped.items(), key=lambda item: item[1], reverse=True):
-            pct = tokens / prompt_tokens * 100 if prompt_tokens else 0.0
-            console_info(f"  {name}: ~{tokens} tok ({pct:.1f}%)")
-
-        if console_verbose_enabled():
-            candle_parts = []
-            for bar in ("1m", "3m", "5m", "15m", "1H", "4H"):
-                key = f"candles.{bar}"
-                if key in payload_tokens:
-                    candle_parts.append(f"{bar}~{payload_tokens[key]}")
-            if candle_parts:
-                console_debug(f"  candles detail: {', '.join(candle_parts)}")
-            profile_parts = []
-            bg = payload.get("market_data", {}).get("background_profiles", {})
-            for bar in ("1m", "3m", "5m", "15m", "1H", "4H"):
-                if bar in bg:
-                    profile_parts.append(f"{bar}~profile")
-            if profile_parts:
-                console_debug(f"  background_profiles: {', '.join(profile_parts)}")
-            console_debug(
-                f"  size: payload {len(payload_text.encode('utf-8')) / 1024:.1f} KB | "
-                f"prompt {len(prompt.encode('utf-8')) / 1024:.1f} KB"
-            )
+    def _accumulate_ai_usage(self, usage: Optional[Dict[str, int]]) -> None:
+        accumulate_ai_token_stats(usage)
 
     def _log_ai_token_usage(
         self,
@@ -2956,6 +3317,7 @@ class OkxAiShortTermAssistant:
         if not usage:
             console_debug(f"[{now_text()}] {inst_id} AI tokens: usage not returned by API")
             return
+        self._accumulate_ai_usage(usage)
         console_info(
             f"[{now_text()}] {inst_id} AI tokens: "
             f"prompt={usage.get('prompt_tokens', '-')} "
@@ -2998,24 +3360,26 @@ class OkxAiShortTermAssistant:
 
         raise RuntimeError(f"ai-chat failed after {retry_times} retries: {last_error}")
 
-    def _probe_ai_connection(self, model: str) -> bool:
+    def _probe_ai_connection(self, model: str) -> Tuple[bool, str]:
         api_key, base_url, _ = self._ai_env_config()
         if not api_key:
-            return False
+            return False, "AI_API_KEY or OPENAI_API_KEY is not configured"
         try:
             client = self._get_ai_client(api_key, base_url)
-            client.chat.completions.create(
+            response = client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": "ping"}],
                 max_tokens=5,
                 temperature=0.0,
                 timeout=self._ai_probe_timeout(),
             )
-            return True
+            self._accumulate_ai_usage(self._extract_ai_usage(response))
+            return True, ""
         except Exception as exc:
+            reason = str(exc)
             console_debug(f"[{now_text()}] AI probe failed: {exc}")
             self._reset_ai_client()
-            return False
+            return False, reason
 
     def _maybe_probe_ai_connection(self, model: str) -> bool:
         now = time.time()
@@ -3023,11 +3387,13 @@ class OkxAiShortTermAssistant:
             return False
         self.ai_last_probe_at = now
         console_debug(f"[{now_text()}] AI circuit probing...")
-        if self._probe_ai_connection(model):
+        ok, reason = self._probe_ai_connection(model)
+        if ok:
             self._record_ai_success()
             return True
         self.ai_fail_streak = self._ai_circuit_fail_threshold()
         self.ai_circuit_open_until = time.time() + self._ai_circuit_cooldown()
+        self._mark_ai_abnormal("probe_failed", reason or "AI probe failed")
         return False
 
     def _build_ai_success_result(
@@ -3180,6 +3546,12 @@ class OkxAiShortTermAssistant:
             "signal_types": [item.get("type", "") for item in signals],
         }
 
+    def trade_push_score(self, direction: str) -> int:
+        """trade 推送门槛：做多用 push_score，做空用 short_push_score。"""
+        if direction == "做空":
+            return max(0, min(100, int(self.short_push_score)))
+        return max(0, min(100, int(self.push_score)))
+
     def _local_push_recommendation(self, score: Dict[str, Any], signals: List[Dict[str, Any]]) -> str:
         kind = self._push_kind(score, signals)
         return kind or "none"
@@ -3223,7 +3595,7 @@ class OkxAiShortTermAssistant:
         ):
             return "spike"
 
-        if direction in ("做多", "做空") and confidence >= self.push_score:
+        if direction in ("做多", "做空") and confidence >= self.trade_push_score(direction):
             return "trade"
 
         signal_types = {item.get("type", "") for item in signals}
@@ -3287,7 +3659,7 @@ class OkxAiShortTermAssistant:
             if direction in ("做多", "做空") and push_recommendation == "none":
                 direction = "观望"
 
-        if parsed.get("risk_level") == "高" and confidence < max(50, self.push_score - 10) and push_recommendation == "trade":
+        if parsed.get("risk_level") == "高" and confidence < max(50, self.trade_push_score(direction) - 10) and push_recommendation == "trade":
             push_recommendation = "watch"
 
         reasons = parsed.get("reasons") if isinstance(parsed.get("reasons"), list) else []
@@ -3358,7 +3730,7 @@ class OkxAiShortTermAssistant:
                 return ""
             if final_decision.get("direction") not in ("做多", "做空"):
                 return ""
-            if final_decision.get("confidence", 0) < self.push_score:
+            if final_decision.get("confidence", 0) < self.trade_push_score(final_decision.get("direction", "")):
                 return ""
             return "trade"
 
@@ -3383,6 +3755,7 @@ class OkxAiShortTermAssistant:
         try:
             from openai import OpenAI  # noqa: F401
         except ImportError:
+            self._mark_ai_abnormal("package_missing", "openai package is not installed")
             return {
                 "provider": "local",
                 "content": "openai package is not installed; fallback to local analysis.",
@@ -3391,6 +3764,7 @@ class OkxAiShortTermAssistant:
 
         api_key, base_url, model = self._ai_env_config()
         if not api_key:
+            self._mark_ai_abnormal("config_missing", "AI_API_KEY or OPENAI_API_KEY is not configured")
             return {
                 "provider": "local",
                 "content": "AI_API_KEY or OPENAI_API_KEY is not configured; fallback to local analysis.",
@@ -3401,6 +3775,10 @@ class OkxAiShortTermAssistant:
         if circuit_state == "open":
             self._maybe_probe_ai_connection(model)
             if self._ai_circuit_state() != "closed":
+                self._mark_ai_abnormal(
+                    "circuit_open",
+                    self.ai_last_failure_reason or "AI circuit open; using local analysis until probe succeeds.",
+                )
                 return self._ai_fallback_result(
                     snapshot,
                     signals,
@@ -3410,14 +3788,12 @@ class OkxAiShortTermAssistant:
                 )
 
         prompt = self._ai_prompt(snapshot, signals, score, trigger)
-        payload = self._ai_payload(snapshot, signals, score, trigger)
         try:
             client = self._get_ai_client(api_key, base_url)
             response = self._chat_completion_with_retry(client, model, prompt)
             output_text = response.choices[0].message.content
             usage = self._extract_ai_usage(response)
             self._log_ai_token_usage(snapshot["inst_id"], model, usage)
-            self._log_ai_prompt_token_breakdown(snapshot["inst_id"], payload, prompt, usage)
             self._record_ai_success()
             return self._build_ai_success_result(
                 base_url,
@@ -3583,6 +3959,26 @@ class OkxAiShortTermAssistant:
                 time.sleep(replay_interval)
         console_info(f"[{now_text()}] replay finished: {total} frames")
 
+    def _prune_runtime_caches(self) -> None:
+        now = time.time()
+        push_keep = max(3600.0, float(self.runtime_config.push_cooldown_seconds) * 2)
+        for key, last_at in list(self.last_push_at.items()):
+            if now - last_at > push_keep:
+                self.last_push_at.pop(key, None)
+        for key, last_at in list(self.last_signal_track_at.items()):
+            if now - last_at > 7200:
+                self.last_signal_track_at.pop(key, None)
+        if len(self.signal_performance) > 500:
+            overflow = len(self.signal_performance) - 500
+            for key in list(self.signal_performance.keys())[:overflow]:
+                self.signal_performance.pop(key, None)
+        cache_keep = max(CACHE_TTL_SECONDS.values()) * 4
+        for key, (saved_at, _) in list(self.cache.items()):
+            if now - saved_at > cache_keep:
+                self.cache.pop(key, None)
+        if len(self.pending_signal_reviews) > 300:
+            self.pending_signal_reviews = self.pending_signal_reviews[-300:]
+
     def run_once(self) -> None:
         # 定时执行：遍历所有支持币种，完成数据采集、阈值检测、综合评分、AI分析、微信推送、日志存储等全部功能。
         for inst_id in self.instruments:
@@ -3590,10 +3986,18 @@ class OkxAiShortTermAssistant:
                 self._process_inst(inst_id)
             except Exception as exc:
                 console_warn(f"[{self._now_text()}] {inst_id} collect/analyze failed: {exc}")
+        if not self.replay_mode:
+            self._maybe_push_ai_abnormal_alert()
+        now = time.time()
+        if now - self._last_runtime_cache_prune_at >= 300:
+            self._prune_runtime_caches()
+            self._last_runtime_cache_prune_at = now
 
     def run_forever(self, runtime: int) -> None:
         # 主循环：默认永久运行；runtime>0时，到指定秒数自动退出，用于实现定时任务。
         self.reset_paper_accounts(session_label="live")
+        reset_ai_token_stats(started_at=now_text())
+        self._check_ai_startup_config()
         log_note = f"json_log={LOG_FILE}" if self.runtime_config.analysis_log_enabled else "json_log=off"
         console_info(
             f"[{now_text()}] monitor start: {', '.join(self.instruments)} "
@@ -3788,7 +4192,7 @@ class OkxAiShortTermAssistant:
             direction in ("做多", "做空")
             and price > 0
             and push_recommendation in ("trade", "spike")
-            and confidence >= max(70, self.push_score - 10)
+            and confidence >= max(70, self.trade_push_score(direction) - 10)
         ):
             signal_types = ",".join(sorted(item.get("type", "") for item in signals if item.get("type"))) or "score-only"
             strategy = snapshot.get("market_context", {}).get("strategy_template", "unknown")
@@ -3988,7 +4392,7 @@ class OkxAiShortTermAssistant:
 
     def _okx_call(self, label: str, func: Any) -> Any:
         # OKX HTTP调用统一套重试，降低临时网络故障影响。
-        return retry_call(
+        return okx_retry_call(
             label,
             func,
             self.runtime_config.retry_times,
@@ -4629,7 +5033,7 @@ class OkxAiShortTermAssistant:
         # 交易动作等级：描述当前是否适合执行。观望不是“低风险”，而是“无交易动作”。
         if direction == "观望" or final_trade_score <= 0:
             return "观望"
-        if entry_plan.get("quality") == "breakout_valid" and final_trade_score >= self.push_score:
+        if entry_plan.get("quality") == "breakout_valid" and final_trade_score >= self.trade_push_score(direction):
             return "可关注"
         if final_trade_score >= 70:
             return "等待确认"
@@ -4640,7 +5044,12 @@ class OkxAiShortTermAssistant:
         scalp_view = score.get("strategy_views", {}).get("scalp", {})
         if self.config.signal_spike_enabled and scalp_view.get("action_level") in ("急速异动", "可短打") and scalp_view.get("score", 0) >= self.config.spike_push_score:
             return "spike"
-        if self.config.signal_trade_enabled and score.get("final_trade_score", 0) >= self.push_score and score.get("direction") in ("做多", "做空"):
+        direction = score.get("direction", "观望")
+        if (
+            self.config.signal_trade_enabled
+            and direction in ("做多", "做空")
+            and score.get("final_trade_score", 0) >= self.trade_push_score(direction)
+        ):
             return "trade"
         watch_signals = {"funding_hot", "rsi_extreme", "rsi_divergence", "boll_squeeze", "long_short_extreme"}
         if self.config.signal_watch_enabled and score.get("raw_total_score", 0) >= self.config.watch_push_score and signal_types.intersection(watch_signals):
@@ -4844,7 +5253,8 @@ class OkxAiShortTermAssistant:
                 "confirm_bars": profile.get("confirm_bars", []),
                 "background_bars": profile.get("background_bars", []),
                 "push_thresholds": {
-                    "trade": self.push_score,
+                    "trade_long": self.push_score,
+                    "trade_short": self.short_push_score,
                     "watch": self.config.watch_push_score,
                     "spike": self.config.spike_push_score,
                 },
@@ -4985,8 +5395,9 @@ class OkxAiShortTermAssistant:
         bars_text = "、".join(included_bars) or "无"
         profile_only_text = "、".join(profile_only_bars) or "无"
         trigger_reasons_text = "、".join(str(x) for x in (trigger.get("reasons") or [])) or "无"
+        instruments_text = "、".join(self.instruments) if self.instruments else "BTC-USDT-SWAP"
         return (
-            "你是欧易OKX USDT永续合约多策略分析助手，只分析BTC-USDT-SWAP和ETH-USDT-SWAP。"
+            f"你是欧易OKX USDT永续合约多策略分析助手，当前监控 {instruments_text}。"
             "你的输出会写入本地日志，并可能经微信推送给人工复核；"
             "字段 push_recommendation 会参与是否推送。\n\n"
             "【角色】\n"
@@ -4997,7 +5408,8 @@ class OkxAiShortTermAssistant:
             f"- 原因: {trigger_reasons_text}\n"
             f"- 主策略: {config.get('strategy_label', profile.get('label', '短线'))} "
             f"({config.get('strategy_mode', 'short')})\n"
-            f"- 推送阈值 confidence: trade≥{thresholds.get('trade', self.push_score)}, "
+            f"- 推送阈值 confidence: 做多 trade≥{thresholds.get('trade_long', self.push_score)}, "
+            f"做空 trade≥{thresholds.get('trade_short', self.short_push_score)}, "
             f"watch≥{thresholds.get('watch', self.config.watch_push_score)}, "
             f"spike≥{thresholds.get('spike', self.config.spike_push_score)}\n"
             f"- 原始K线周期: {bars_text}\n"
@@ -5021,7 +5433,8 @@ class OkxAiShortTermAssistant:
             "无明确可执行结构时 direction=观望。\n"
             "6. 评估 data_quality（预热、缺失、冲突），再定 risk_level 与 confidence。\n"
             "7. push_recommendation：默认 none。"
-            f"trade=做多/做空且 confidence≥{thresholds.get('trade', self.push_score)} 且价位可执行；"
+            f"trade=做多且 confidence≥{thresholds.get('trade_long', self.push_score)}，"
+            f"或做空且 confidence≥{thresholds.get('trade_short', self.short_push_score)}，且价位可执行；"
             f"watch=观望且 confidence≥{thresholds.get('watch', self.config.watch_push_score)} 且值得提醒；"
             f"spike=L3/急速异动且 direction 为做多/做空且 confidence≥{thresholds.get('spike', self.config.spike_push_score)}。"
             "data_quality.overall=数据不足/不可信 时通常 none，最多 watch。\n\n"
@@ -5322,7 +5735,7 @@ class OkxAiShortTermAssistant:
             "",
             "### 一、当前配置",
             f"- 主策略：{strategy_label} | 确认严格度：{risk_preference}",
-            f"- 本次推送：{push_kind_label} | 门槛 trade {self.push_score} · watch {self.config.watch_push_score} · spike {self.config.spike_push_score}",
+            f"- 本次推送：{push_kind_label} | 门槛 做多 {self.push_score} · 做空 {self.short_push_score} · watch {self.config.watch_push_score} · spike {self.config.spike_push_score}",
             f"- AI 分析：{'已启用' if self.ai_enabled else '未启用'} | 轮询：{self.interval}秒",
             "",
             "### 二、触发原因",
@@ -5473,18 +5886,12 @@ class OkxAiShortTermAssistant:
             self._log_push_event(snapshot, signals, final_decision, push_kind, f"failed: {exc}")
 
     def _rotate_log_if_needed(self) -> None:
-        # 简单日志轮转：超过大小就把当前日志替换为 .1。
-        # 生产版可以接入logrotate或保留多份历史文件。
-        try:
-            LOG_DIR.mkdir(parents=True, exist_ok=True)
-            if not LOG_FILE.exists() or LOG_FILE.stat().st_size < self.runtime_config.log_max_bytes:
-                return
-            backup = LOG_FILE.with_suffix(LOG_FILE.suffix + ".1")
-            if backup.exists():
-                backup.unlink()
-            LOG_FILE.replace(backup)
-        except Exception as exc:
-            console_debug(f"log rotation failed: {exc}")
+        log_path = self.replay_log_file if self.replay_mode else LOG_FILE
+        rotate_analysis_log_if_needed(
+            log_path,
+            self.runtime_config.log_max_bytes,
+            self.runtime_config.log_total_max_bytes,
+        )
 
     def _log_console_summary(
         self,
@@ -5541,11 +5948,15 @@ def short_count_greater(trends: Dict[str, str]) -> bool:
 
 
 def _assistant_from_user_config(config: Dict[str, Any]) -> OkxAiShortTermAssistant:
-    inst_ids = config.get("inst_ids") or list(SUPPORTED_INSTRUMENTS)
+    inst_ids = config.get("inst_ids") or list(PRESET_INSTRUMENTS)
     if isinstance(inst_ids, str):
         inst_ids = [inst_ids]
-    instruments = [item for item in inst_ids if item in SUPPORTED_INSTRUMENTS] or list(SUPPORTED_INSTRUMENTS)
+    try:
+        instruments = validate_instruments(order_configured_instruments(inst_ids))
+    except ValueError:
+        instruments = list(PRESET_INSTRUMENTS)
     push_score = int(config.get("push_score", DEFAULT_PUSH_SCORE))
+    short_push_score = int(config.get("short_push_score", push_score))
     watch_push_score = int(config.get("watch_push_score", 65))
     spike_push_score = int(config.get("spike_push_score", 62))
     return OkxAiShortTermAssistant(
@@ -5555,6 +5966,7 @@ def _assistant_from_user_config(config: Dict[str, Any]) -> OkxAiShortTermAssista
         ai_enabled=bool(config.get("ai_enabled", True)),
         push_enabled=True,
         push_score=push_score,
+        short_push_score=short_push_score,
         dry_run_ai=bool(config.get("dry_run_ai", False)),
         config=SignalConfig(
             volume_multiplier=float(config.get("volume_multiplier", 2.0)),
@@ -5580,8 +5992,12 @@ def _assistant_from_user_config(config: Dict[str, Any]) -> OkxAiShortTermAssista
             retry_times=int(config.get("retry_times", DEFAULT_RETRY_TIMES)),
             retry_backoff=float(config.get("retry_backoff", DEFAULT_RETRY_BACKOFF_SECONDS)),
             push_cooldown_seconds=int(config.get("push_cooldown_seconds", DEFAULT_PUSH_COOLDOWN_SECONDS)),
-            log_max_bytes=int(config.get("log_max_bytes", DEFAULT_LOG_MAX_BYTES)),
-            analysis_log_enabled=bool(config.get("analysis_log_enabled", False)),
+            log_max_bytes=max(int(config.get("log_max_bytes", DEFAULT_LOG_MAX_BYTES)), MIN_LOG_MAX_BYTES),
+            log_total_max_bytes=max(
+                int(config.get("log_total_max_bytes", DEFAULT_LOG_TOTAL_MAX_BYTES)),
+                max(int(config.get("log_max_bytes", DEFAULT_LOG_MAX_BYTES)), MIN_LOG_MAX_BYTES),
+            ),
+            analysis_log_enabled=bool(config.get("analysis_log_enabled", True)),
         ),
     )
 
@@ -5594,10 +6010,8 @@ def build_wechat_push_format_preview(config: Optional[Dict[str, Any]] = None) ->
     strategy_mode = str(config.get("strategy_mode", "short"))
     strategy_label = STRATEGY_PROFILES.get(strategy_mode, STRATEGY_PROFILES["short"])["label"]
     risk_preference = str(config.get("risk_preference", "standard"))
-    inst_ids = config.get("inst_ids") or ["BTC-USDT-SWAP"]
-    if isinstance(inst_ids, str):
-        inst_ids = [inst_ids]
-    inst_id = next((item for item in inst_ids if item in SUPPORTED_INSTRUMENTS), "BTC-USDT-SWAP")
+    inst_ids = order_configured_instruments(config.get("inst_ids") or ["BTC-USDT-SWAP"])
+    inst_id = inst_ids[0] if inst_ids else "BTC-USDT-SWAP"
     preview_time = now_text()
 
     mock_parsed: Dict[str, Any] = {
@@ -5722,13 +6136,85 @@ def build_wechat_push_format_preview(config: Optional[Dict[str, Any]] = None) ->
     )
 
 
+def normalize_inst_id(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def parse_inst_id_tokens(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        chunks = [str(item) for item in raw]
+    else:
+        chunks = re.split(r"[\s,;，；]+", str(raw))
+    seen = set()
+    ordered: List[str] = []
+    for chunk in chunks:
+        inst_id = normalize_inst_id(chunk)
+        if not inst_id or inst_id in seen:
+            continue
+        seen.add(inst_id)
+        ordered.append(inst_id)
+    return ordered
+
+
+def order_configured_instruments(inst_ids: Any) -> List[str]:
+    normalized = parse_inst_id_tokens(inst_ids)
+    if not normalized:
+        return []
+    selected = set(normalized)
+    ordered = [inst for inst in PRESET_INSTRUMENTS if inst in selected]
+    for inst_id in normalized:
+        if inst_id not in ordered:
+            ordered.append(inst_id)
+    return ordered
+
+
+def is_valid_inst_id_format(inst_id: str) -> bool:
+    return bool(INST_ID_PATTERN.match(normalize_inst_id(inst_id)))
+
+
+def okx_swap_instrument_exists(inst_id: str) -> bool:
+    inst_id = normalize_inst_id(inst_id)
+    if not is_valid_inst_id_format(inst_id):
+        return False
+    query = urllib.parse.urlencode({"instType": "SWAP", "instId": inst_id})
+    request = urllib.request.Request(
+        f"{OKX_BASE_URL}/api/v5/public/instruments?{query}",
+        headers={"Accept": "application/json", "User-Agent": "okx-ai-assistant/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+        if str(payload.get("code")) != "0":
+            return False
+        rows = payload.get("data") or []
+        return any(str(row.get("instId", "")).upper() == inst_id for row in rows if isinstance(row, dict))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, TypeError, ValueError):
+        return False
+
+
+def validate_instruments(instruments: List[str]) -> List[str]:
+    ordered = order_configured_instruments(instruments)
+    if not ordered:
+        return list(PRESET_INSTRUMENTS)
+    invalid_format = [inst for inst in ordered if not is_valid_inst_id_format(inst)]
+    if invalid_format:
+        raise ValueError(f"Invalid instrument format: {', '.join(invalid_format)}")
+    invalid_okx = [inst for inst in ordered if not okx_swap_instrument_exists(inst)]
+    if invalid_okx:
+        raise ValueError(f"OKX swap instrument not found: {', '.join(invalid_okx)}")
+    return ordered
+
+
 def parse_instruments(value: str) -> List[str]:
-    # V1只允许客户需求中的两个永续合约，避免误传现货或其他合约。
-    instruments = [item.strip().upper() for item in value.split(",") if item.strip()]
-    unsupported = [item for item in instruments if item not in SUPPORTED_INSTRUMENTS]
-    if unsupported:
-        raise argparse.ArgumentTypeError(f"Unsupported instruments: {unsupported}. V1 only supports {SUPPORTED_INSTRUMENTS}")
-    return instruments or list(SUPPORTED_INSTRUMENTS)
+    try:
+        instruments = parse_inst_id_tokens(value)
+        if not instruments:
+            return list(PRESET_INSTRUMENTS)
+        return validate_instruments(instruments)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def parse_args() -> argparse.Namespace:
@@ -5737,8 +6223,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--inst-ids",
         type=parse_instruments,
-        default=parse_instruments(os.getenv("OKX_INST_IDS", ",".join(SUPPORTED_INSTRUMENTS))),
-        help="Comma-separated instruments. V1: BTC-USDT-SWAP,ETH-USDT-SWAP",
+        default=parse_instruments(os.getenv("OKX_INST_IDS", ",".join(PRESET_INSTRUMENTS))),
+        help="Comma-separated OKX USDT swap instIds, e.g. BTC-USDT-SWAP,SOL-USDT-SWAP",
     )
     parser.add_argument("--interval", type=int, default=int(os.getenv("OKX_INTERVAL", str(DEFAULT_INTERVAL_SECONDS))))
     parser.add_argument("--runtime", type=int, default=int(os.getenv("OKX_RUNTIME", "0")))
@@ -5747,10 +6233,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run-ai", action="store_true", default=os.getenv("AI_DRY_RUN", "0") == "1")
     parser.add_argument("--push", action="store_true", default=os.getenv("PUSH_ENABLED", "0") == "1")
     parser.add_argument("--push-score", type=int, default=int(os.getenv("PUSH_SCORE", str(DEFAULT_PUSH_SCORE))))
+    parser.add_argument(
+        "--short-push-score",
+        type=int,
+        default=int(os.getenv("SHORT_PUSH_SCORE", os.getenv("PUSH_SCORE", str(DEFAULT_PUSH_SCORE)))),
+        help="Trade push threshold for short direction (defaults to --push-score)",
+    )
     parser.add_argument("--retry-times", type=int, default=env_int("RETRY_TIMES", DEFAULT_RETRY_TIMES))
     parser.add_argument("--retry-backoff", type=float, default=env_float("RETRY_BACKOFF_SECONDS", DEFAULT_RETRY_BACKOFF_SECONDS))
     parser.add_argument("--push-cooldown", type=int, default=env_int("PUSH_COOLDOWN_SECONDS", DEFAULT_PUSH_COOLDOWN_SECONDS))
     parser.add_argument("--log-max-bytes", type=int, default=env_int("LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES))
+    parser.add_argument(
+        "--log-total-max-bytes",
+        type=int,
+        default=env_int("LOG_TOTAL_MAX_BYTES", DEFAULT_LOG_TOTAL_MAX_BYTES),
+        help="Total size cap for all rotated analysis log segments",
+    )
     parser.add_argument("--volume-multiplier", type=float, default=env_float("VOLUME_MULTIPLIER", 2.0))
     parser.add_argument("--oi-change-pct-15m", type=float, default=env_float("OI_CHANGE_PCT_15M", 5.0))
     parser.add_argument("--funding-threshold", type=float, default=env_float("FUNDING_ABS_THRESHOLD", 0.0008))
@@ -5788,7 +6286,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--analysis-log",
         action="store_true",
-        default=os.getenv("ANALYSIS_LOG_ENABLED", "0") == "1",
+        default=os.getenv("ANALYSIS_LOG_ENABLED", "1") == "1",
         help="Write JSON analysis log and per-round console summaries during live monitoring",
     )
     parser.add_argument("--no-analysis-log", action="store_false", dest="analysis_log")
@@ -5807,6 +6305,7 @@ def main() -> int:
         ai_enabled=args.ai,
         push_enabled=args.push,
         push_score=args.push_score,
+        short_push_score=args.short_push_score,
         dry_run_ai=args.dry_run_ai,
         config=SignalConfig(
             volume_multiplier=args.volume_multiplier,
@@ -5832,7 +6331,8 @@ def main() -> int:
             retry_times=max(args.retry_times, 1),
             retry_backoff=max(args.retry_backoff, 0.1),
             push_cooldown_seconds=max(args.push_cooldown, 0),
-            log_max_bytes=max(args.log_max_bytes, 1024 * 1024),
+            log_max_bytes=max(args.log_max_bytes, MIN_LOG_MAX_BYTES),
+            log_total_max_bytes=max(args.log_total_max_bytes, max(args.log_max_bytes, MIN_LOG_MAX_BYTES)),
             analysis_log_enabled=bool(args.analysis_log),
         ),
     )

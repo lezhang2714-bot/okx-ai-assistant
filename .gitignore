@@ -1,4 +1,6 @@
 build/
+output/
+release_staging/
 local_state/
 __pycache__/
 *.py[cod]
