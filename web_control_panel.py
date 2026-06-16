@@ -20,7 +20,7 @@ import webbrowser
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -61,9 +61,11 @@ try:
     REPLAY_DATASET_FILE = _monitor_boot.REPLAY_DATASET_FILE
     REPLAY_LOG_FILE = _monitor_boot.REPLAY_LOG_FILE
     replay_dataset_stats = _monitor_boot.replay_dataset_stats
+    DEFAULT_LOG_MAX_BYTES = int(_monitor_boot.DEFAULT_LOG_MAX_BYTES)
 except Exception:
     REPLAY_DATASET_FILE = LOG_DIR / "replay_dataset.jsonl"
     REPLAY_LOG_FILE = LOG_DIR / "replay_analysis.jsonl"
+    DEFAULT_LOG_MAX_BYTES = 500 * 1024 * 1024
 
     def replay_dataset_stats(path):  # type: ignore
         return {"exists": False, "lines": 0, "bytes": 0}
@@ -177,7 +179,7 @@ def default_config() -> Dict[str, Any]:
         "retry_times": 3,
         "retry_backoff": 1.5,
         "push_cooldown_seconds": 900,
-        "log_max_bytes": 10485760,
+        "log_max_bytes": DEFAULT_LOG_MAX_BYTES,
     }
 
 
@@ -466,7 +468,7 @@ def build_monitor_args(config: Dict[str, Any]) -> List[str]:
         "--push-cooldown",
         str(config.get("push_cooldown_seconds", 900)),
         "--log-max-bytes",
-        str(config.get("log_max_bytes", 10485760)),
+        str(config.get("log_max_bytes", DEFAULT_LOG_MAX_BYTES)),
         "--volume-multiplier",
         str(config.get("volume_multiplier", 2.0)),
         "--oi-change-pct-15m",
@@ -1069,8 +1071,10 @@ def tail_text(path: Path, max_bytes: int = 160000) -> str:
         return file.read().decode("utf-8", errors="replace")
 
 
-def iter_json_log_lines(path: Path, *, read_full: bool = False, max_tail_bytes: int = 40 * 1024 * 1024):
+def iter_json_log_lines(path: Path, *, read_full: bool = False, max_tail_bytes: int = None):
     """Stream JSONL lines. Replay logs are one session and must be read in full."""
+    if max_tail_bytes is None:
+        max_tail_bytes = DEFAULT_LOG_MAX_BYTES
     if not path.exists():
         return
     try:
@@ -1096,7 +1100,7 @@ def monitor_log_text() -> str:
     if not MONITOR_LOG_START_AT:
         return "等待启动监控。本窗口只显示本次启动后的 JSON 分析日志，供图表与压测使用。"
     lines = []
-    for line in tail_text(MONITOR_JSON_LOG_FILE, 40 * 1024 * 1024).splitlines():
+    for line in tail_text(MONITOR_JSON_LOG_FILE, DEFAULT_LOG_MAX_BYTES).splitlines():
         try:
             item = json.loads(line)
         except json.JSONDecodeError:
@@ -1128,7 +1132,7 @@ def read_monitor_points(inst_id: str, max_points: int = 20000) -> Dict[str, Any]
     running = bool(monitor_status()["running"])
     log_enabled = analysis_log_enabled()
     if log_enabled:
-        for line in tail_text(MONITOR_JSON_LOG_FILE, 40 * 1024 * 1024).splitlines():
+        for line in tail_text(MONITOR_JSON_LOG_FILE, DEFAULT_LOG_MAX_BYTES).splitlines():
             try:
                 item = json.loads(line)
             except json.JSONDecodeError:
@@ -1267,7 +1271,7 @@ def read_accuracy_items(
         log_size = log_path.stat().st_size if log_path.exists() else 0
     except OSError:
         log_size = 0
-    read_full = log_path.resolve() == REPLAY_ANALYSIS_LOG_FILE.resolve() or log_size <= 200 * 1024 * 1024
+    read_full = log_path.resolve() == REPLAY_ANALYSIS_LOG_FILE.resolve() or log_size <= DEFAULT_LOG_MAX_BYTES
     items = []
     price_by_time: Dict[str, Tuple[datetime, float]] = {}
     for line in iter_json_log_lines(log_path, read_full=read_full):
@@ -1479,6 +1483,43 @@ def future_price_path(points: List[Tuple[datetime, float]], start: datetime, hor
     return path, mature
 
 
+def extend_price_points_for_live_validation(
+    price_points: List[Tuple[datetime, float]],
+    *,
+    session_scope: bool,
+    replay_scope: bool,
+) -> List[Tuple[datetime, float]]:
+    # 实时压测：验证窗口已过后，用最新日志价作为“当前价”补齐，避免必须等下一条日志才成熟。
+    if replay_scope or not session_scope or not price_points:
+        return price_points
+    latest_time, latest_price = price_points[-1]
+    now = datetime.now()
+    if now <= latest_time:
+        return price_points
+    return price_points + [(now, latest_price)]
+
+
+def next_pending_maturity_seconds(
+    items: List[Dict[str, Any]],
+    price_points: List[Tuple[datetime, float]],
+    horizon_seconds: int,
+) -> int:
+    now = datetime.now()
+    wait_seconds: Optional[int] = None
+    for item in items:
+        try:
+            item_time = parse_history_time(str(item.get("time", "")))
+        except Exception:
+            continue
+        _, mature = future_price_path(price_points, item_time, horizon_seconds)
+        if mature:
+            continue
+        target = datetime.fromtimestamp(item_time.timestamp() + horizon_seconds)
+        remaining = int(max(0, (target - now).total_seconds()))
+        wait_seconds = remaining if wait_seconds is None else min(wait_seconds, remaining)
+    return wait_seconds or 0
+
+
 def price_crosses_range(prev_price: float, price: float, low: float, high: float) -> bool:
     if low <= price <= high:
         return True
@@ -1611,6 +1652,7 @@ def empty_accuracy_summary() -> Dict[str, Any]:
         "total": 0,
         "raw_log_total": 0,
         "pending_total": 0,
+        "next_pending_seconds": 0,
         "mature_rate_pct": 0.0,
         "reliability_score": 0.0,
         "reliability_level": "样本不足",
@@ -1761,6 +1803,12 @@ def accuracy_report(
         log_file=log_file,
         retention_hours=retention_hours,
     )
+    price_points = extend_price_points_for_live_validation(
+        price_points,
+        session_scope=session_scope,
+        replay_scope=replay_scope,
+    )
+    next_pending_seconds = next_pending_maturity_seconds(items, price_points, horizon_seconds)
     paper_by_time, paper_final = simulate_paper_account_series(items)
     rows = []
     raw_log_total = 0
@@ -1921,6 +1969,7 @@ def accuracy_report(
             "total": total,
             "raw_log_total": raw_log_total,
             "pending_total": pending_total,
+            "next_pending_seconds": next_pending_seconds,
             "mature_rate_pct": mature_rate_pct,
             "reliability_score": reliability_score,
             "reliability_level": reliability_label,
@@ -2673,7 +2722,7 @@ const importConfigBtn = document.getElementById('importConfigBtn');
 	function accuracyTimeLabel(t,spanHours){{if(spanHours>=4)return compactTime(t);return shortTime(t);}}
 	function syncAccuracyPoints(points,options){{const opts=options||{{}},clean=(points||[]).filter(o=>Number.isFinite(Number(o&&o.price))),hadFullView=accuracyView.start<=0.001&&accuracyView.end>=0.999;if(opts.resetView){{accuracyView.points=clean;resetAccuracyView();return;}}const followLatest=accuracyView.followLatest!==false&&accuracyView.end>=0.995;accuracyView.points=clean;if(clean.length>2&&(followLatest||hadFullView)){{accuracyView.start=0;accuracyView.end=1;accuracyView.followLatest=true;}}else if(followLatest&&clean.length>2){{const span=Math.max(0.001,accuracyView.end-accuracyView.start);accuracyView.end=1;accuracyView.start=Math.max(0,1-span);}}}}
 	function redrawAccuracyChart(){{drawAccuracyChart();}}
-	async function fetchAccuracy(options){{options=options||{{}};if(fetchAccuracyInFlight&&!options.force)return fetchAccuracyInFlight;const run=async()=>{{const canvas=document.getElementById('accuracyChart');if(!canvas)return;const resetView=!!options.resetView||accuracyQuerySignature()!==accuracyQueryKey;if(accuracyImportedMode&&!options.resetView)return;if(options.resetView)setAccuracyImportedMode(false,'');const inst=(document.getElementById('accuracyInst')||{{}}).value||'BTC-USDT-SWAP',h=(document.getElementById('accuracyHorizon')||{{}}).value||'5',scope=(document.getElementById('accuracyScope')||{{}}).value||'session',retention=accuracyRetentionHours(),interval=configuredMonitorInterval(),note=document.getElementById('accuracyNote');const queryKey=accuracyQuerySignature();accuracyQueryKey=queryKey;try{{if(note&&resetView)note.textContent='正在统计实时预测压测...';const qs='inst_id='+encodeURIComponent(inst)+'&horizon='+encodeURIComponent(h)+'&scope='+encodeURIComponent(scope)+'&retention_hours='+encodeURIComponent(retention)+'&interval_seconds='+encodeURIComponent(interval);const r=await fetch('/api/accuracy-data?'+qs,{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'统计失败');accuracyLivePayload=p;const s=p.summary||{{}};updateAccuracySummary(s);syncAccuracyPoints(p.points||[],{{resetView:resetView}});redrawAccuracyChart();if(p.replay_pending){{if(note)note.textContent=p.hint||'请先点击下方「开始回放」；切换「回放会话」不会自动启动回放。';return;}}const maxPts=p.max_points||0,intervalSec=p.interval_seconds||interval,retainH=p.retention_hours||retention;let noteExtra='';if(p.scope==='replay'&&(s.total??0)===0&&((s.raw_log_total??0)>0||(s.pending_total??0)>0))noteExtra=' · 回放日志已有数据，验证窗口成熟后曲线才会加点';else if(p.scope==='replay'&&(s.raw_log_total??0)===0)noteExtra=' · 回放进行中，请稍候';else if(p.scope==='session'&&(s.total??0)===0&&((s.raw_log_total??0)>0||(s.pending_total??0)>0))noteExtra=' · 监控日志已有数据，验证窗口成熟后曲线才会加点';else if(p.scope==='session'&&(s.raw_log_total??0)===0)noteExtra=' · 监控刚启动，请等待几轮轮询';if(note)note.textContent=(p.scope==='replay'?'回放会话':p.scope==='session'?'本次启动后':'全部历史')+' · 模拟 '+formatPaperSummary(s)+' · 综合 '+fmt(s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,1)+'% · 窗口 '+formatHorizonLabel(p.horizon_seconds||h)+((p.time_start&&p.time_end)?(' · 范围 '+compactTime(p.time_start)+' ~ '+compactTime(p.time_end)):'')+' · '+(p.chart_points||accuracyView.points.length||0)+'点 · 双击重置缩放'+noteExtra;}}catch(e){{updateAccuracySummary({{}});syncAccuracyPoints([],{{resetView:true}});redrawAccuracyChart();if(note)note.textContent='预测压测统计失败：'+e;}}}};fetchAccuracyInFlight=run();try{{await fetchAccuracyInFlight;}}finally{{fetchAccuracyInFlight=null;}}}}
+	async function fetchAccuracy(options){{options=options||{{}};if(fetchAccuracyInFlight&&!options.force)return fetchAccuracyInFlight;const run=async()=>{{const canvas=document.getElementById('accuracyChart');if(!canvas)return;const resetView=!!options.resetView||accuracyQuerySignature()!==accuracyQueryKey;if(accuracyImportedMode&&!options.resetView)return;if(options.resetView)setAccuracyImportedMode(false,'');const inst=(document.getElementById('accuracyInst')||{{}}).value||'BTC-USDT-SWAP',h=(document.getElementById('accuracyHorizon')||{{}}).value||'5',scope=(document.getElementById('accuracyScope')||{{}}).value||'session',retention=accuracyRetentionHours(),interval=configuredMonitorInterval(),note=document.getElementById('accuracyNote');const queryKey=accuracyQuerySignature();accuracyQueryKey=queryKey;try{{if(note&&resetView)note.textContent='正在统计实时预测压测...';const qs='inst_id='+encodeURIComponent(inst)+'&horizon='+encodeURIComponent(h)+'&scope='+encodeURIComponent(scope)+'&retention_hours='+encodeURIComponent(retention)+'&interval_seconds='+encodeURIComponent(interval);const r=await fetch('/api/accuracy-data?'+qs,{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'统计失败');accuracyLivePayload=p;const s=p.summary||{{}};updateAccuracySummary(s);syncAccuracyPoints(p.points||[],{{resetView:resetView}});redrawAccuracyChart();if(p.replay_pending){{if(note)note.textContent=p.hint||'请先点击下方「开始回放」；切换「回放会话」不会自动启动回放。';return;}}const maxPts=p.max_points||0,intervalSec=p.interval_seconds||interval,retainH=p.retention_hours||retention;let noteExtra='';if(p.scope==='replay'&&(s.total??0)===0&&((s.raw_log_total??0)>0||(s.pending_total??0)>0))noteExtra=' · 回放日志已有数据，验证窗口成熟后曲线才会加点';else if(p.scope==='replay'&&(s.raw_log_total??0)===0)noteExtra=' · 回放进行中，请稍候';else if(p.scope==='session'&&(s.raw_log_total??0)===0)noteExtra=' · 监控刚启动，请等待几轮轮询';else if((s.pending_total??0)>0&&(s.next_pending_seconds??0)>0)noteExtra=' · 还有 '+s.pending_total+' 条待验证，最近约 '+s.next_pending_seconds+' 秒后可加点';else if((s.pending_total??0)>0)noteExtra=' · 还有 '+s.pending_total+' 条待验证，点「刷新压测」即可尝试更新';if(note)note.textContent=(p.scope==='replay'?'回放会话':p.scope==='session'?'本次启动后':'全部历史')+' · 模拟 '+formatPaperSummary(s)+' · 综合 '+fmt(s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,1)+'% · 窗口 '+formatHorizonLabel(p.horizon_seconds||h)+((p.time_start&&p.time_end)?(' · 范围 '+compactTime(p.time_start)+' ~ '+compactTime(p.time_end)):'')+' · '+(p.chart_points||accuracyView.points.length||0)+'点 · 双击重置缩放'+noteExtra;}}catch(e){{updateAccuracySummary({{}});syncAccuracyPoints([],{{resetView:true}});redrawAccuracyChart();if(note)note.textContent='预测压测统计失败：'+e;}}}};fetchAccuracyInFlight=run();try{{await fetchAccuracyInFlight;}}finally{{fetchAccuracyInFlight=null;}}}}
 	function switchAccuracyToLiveSession(){{const scopeEl=document.getElementById('accuracyScope');if(scopeEl&&scopeEl.value!=='session'){{accuracyScopeSyncing=true;scopeEl.value='session';accuracyScopeSyncing=false;}}setAccuracyImportedMode(false,'');accuracyQueryKey='';fetchAccuracy({{resetView:true}});}}
 	function switchAccuracyToReplaySession(){{const scopeEl=document.getElementById('accuracyScope');if(scopeEl&&scopeEl.value!=='replay'){{accuracyScopeSyncing=true;scopeEl.value='replay';accuracyScopeSyncing=false;}}setAccuracyImportedMode(false,'');accuracyQueryKey='';}}
 	function syncAccuracyScopeWithReplay(info){{if(!info||!info.replay_running)return false;const scopeEl=document.getElementById('accuracyScope');if(!scopeEl||scopeEl.value==='replay')return false;switchAccuracyToReplaySession();return true;}}
@@ -2687,7 +2736,7 @@ const importConfigBtn = document.getElementById('importConfigBtn');
 	const accuracyScopeEl=document.getElementById('accuracyScope');if(accuracyScopeEl)accuracyScopeEl.addEventListener('change',onAccuracyScopeChange);
 	function formatHorizonLabel(sec){{const n=Number(sec)||0;if(n>=60&&n%60===0)return (n/60)+'分钟';return n+'秒';}}
 	function formatPaperSummary(s){{if(!s||s.paper_equity==null)return '--';const pnl=Number(s.paper_pnl_usd)||0,pct=Number(s.paper_pnl_pct)||0,sign=pnl>=0?'+':'';return '$'+fmt(s.paper_equity,0)+' ('+sign+fmt(pnl,0)+' / '+sign+fmt(pct,2)+'%) · '+(s.paper_position_label||'--');}}
-	function updateAccuracySummary(s){{const box=document.getElementById('accuracySummary');if(!box)return;s=s||{{}};const pred=s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,tradeTotal=s.trade_signal_total??0,tradeDir=s.trade_direction_accuracy_pct,tradePlan=s.trade_signal_accuracy_pct,watchTotal=s.watch_total??0,watchPct=s.watch_reasonable_pct,watchMiss=s.watch_missed_pct,resolved=s.trade_resolved_total??0,execLine=tradeTotal>=5?(fmt(s.entry_touch_pct,1)+'% / '+fmt(s.no_fill_pct,1)+'%'):'样本不足',paperPts=s.paper_log_points??0;const vals=[['模拟账户($10k)',formatPaperSummary(s)+' / '+(s.paper_trade_count??0)+'笔 · '+paperPts+'轮','paper'],['综合预测准确度',pred!=null?fmt(pred,1)+'% / '+(s.decision_total??s.total??0):'--','primary'],['可靠性等级',(s.reliability_level||'--')+' / '+(s.reliability_score!=null?fmt(s.reliability_score,1):'--')],['已验证/日志',(s.total??0)+' / '+(s.raw_log_total??s.total??0)],['观望准确度',watchPct!=null?fmt(watchPct,1)+'% / '+watchTotal:'--'],['观望错失率',watchMiss!=null?fmt(watchMiss,1)+'% / '+watchTotal:'--'],['交易方向命中',tradeDir!=null?fmt(tradeDir,1)+'% / '+tradeTotal:'--'],['交易执行合理率',tradePlan!=null?fmt(tradePlan,1)+'% / '+tradeTotal:'--'],['验证窗口',formatHorizonLabel(s.horizon_seconds)+' · 阈值 '+fmt(s.threshold_pct,3)+'%'],['入场触达/未成交',execLine]];if(resolved>=3)vals.push(['止盈/止损/胜率',fmt(s.take_profit_pct,1)+'% / '+fmt(s.stop_hit_pct,1)+'% / '+fmt(s.trade_win_rate_pct,1)+'% ('+resolved+')']);box.innerHTML=vals.map(v=>'<div class="'+(v[2]==='paper'?'accuracy-paper-primary':(v[2]==='primary'?'accuracy-primary':''))+'"><span>'+v[0]+'</span><b>'+v[1]+'</b></div>').join('');}}
+	function updateAccuracySummary(s){{const box=document.getElementById('accuracySummary');if(!box)return;s=s||{{}};const pred=s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,tradeTotal=s.trade_signal_total??0,tradeDir=s.trade_direction_accuracy_pct,tradePlan=s.trade_signal_accuracy_pct,watchTotal=s.watch_total??0,watchPct=s.watch_reasonable_pct,watchMiss=s.watch_missed_pct,resolved=s.trade_resolved_total??0,pending=s.pending_total??0,nextPending=s.next_pending_seconds??0,execLine=tradeTotal>=5?(fmt(s.entry_touch_pct,1)+'% / '+fmt(s.no_fill_pct,1)+'%'):'样本不足',paperPts=s.paper_log_points??0,verifiedLine=(s.total??0)+' / '+(s.raw_log_total??s.total??0)+(pending>0?(' · '+pending+'待'):'');const vals=[['模拟账户($10k)',formatPaperSummary(s)+' / '+(s.paper_trade_count??0)+'笔 · '+paperPts+'轮','paper'],['综合预测准确度',pred!=null?fmt(pred,1)+'% / '+(s.decision_total??s.total??0):'--','primary'],['可靠性等级',(s.reliability_level||'--')+' / '+(s.reliability_score!=null?fmt(s.reliability_score,1):'--')],['已验证/日志',verifiedLine],['待验证',pending>0?(nextPending>0?('约'+nextPending+'秒后下一条'):'窗口已够，刷新即验证'):'--'],['观望准确度',watchPct!=null?fmt(watchPct,1)+'% / '+watchTotal:'--'],['观望错失率',watchMiss!=null?fmt(watchMiss,1)+'% / '+watchTotal:'--'],['交易方向命中',tradeDir!=null?fmt(tradeDir,1)+'% / '+tradeTotal:'--'],['交易执行合理率',tradePlan!=null?fmt(tradePlan,1)+'% / '+tradeTotal:'--'],['验证窗口',formatHorizonLabel(s.horizon_seconds)+' · 阈值 '+fmt(s.threshold_pct,3)+'%'],['入场触达/未成交',execLine]];if(resolved>=3)vals.push(['止盈/止损/胜率',fmt(s.take_profit_pct,1)+'% / '+fmt(s.stop_hit_pct,1)+'% / '+fmt(s.trade_win_rate_pct,1)+'% ('+resolved+')']);box.innerHTML=vals.map(v=>'<div class="'+(v[2]==='paper'?'accuracy-paper-primary':(v[2]==='primary'?'accuracy-primary':''))+'"><span>'+v[0]+'</span><b>'+v[1]+'</b></div>').join('');}}
 	function drawAccuracyChart(points){{if(Array.isArray(points))syncAccuracyPoints(points,{{resetView:true}});const c=document.getElementById('accuracyChart');if(!c)return;accuracyPlotPoints=[];const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=Math.max(1,r.width*d);c.height=Math.max(1,r.height*d);const ctx=c.getContext('2d');ctx.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,pad={{l:58,r:52,t:24,b:40}},cw=W-pad.l-pad.r,ch=H-pad.t-pad.b;ctx.clearRect(0,0,W,H);ctx.fillStyle='#0f172a';ctx.fillRect(0,0,W,H);let clean=visibleAccuracyPoints();if(!clean.length){{updateAccuracyPointPanel(null);ctx.fillStyle='rgba(203,213,225,.82)';ctx.textAlign='center';ctx.textBaseline='middle';ctx.font='13px Segoe UI, Microsoft YaHei';const scopeNow=(document.getElementById('accuracyScope')||{{}}).value||'session',emptyMsg=scopeNow==='replay'?'回放会话暂无数据：请先点击下方「开始回放」，切换范围不会自动启动回放':(scopeNow==='all'?'全部历史暂无已验证点：请确认日志中有该币种数据':'暂无可验证样本：live 监控请启动后选「本次启动后」；离线回放请点「开始回放」后选「回放会话」');ctx.fillText(emptyMsg,W/2,H/2);return;}}const visibleCount=clean.length,totalCount=(accuracyView.points||[]).length;if(clean.length===1)clean=[clean[0],Object.assign({{}},clean[0])];const priceVals=clean.map(o=>Number(o.price)),mn=Math.min(...priceVals),mx=Math.max(...priceVals),basePriceRg=Math.max((mx||1)*0.001,(mx-mn)*1.16,0.01);let pred=0;const predVals=clean.map(o=>{{pred+=accuracyDirectionValue(o);return pred;}}),pmn=Math.min(...predVals),pmx=Math.max(...predVals),basePredRg=Math.max(1,(pmx-pmn)*1.16,1);const yZoom=Math.max(0.35,accuracyView.yZoom||1),yPan=accuracyView.yPan||0,normTop=0.5+yPan+0.5/yZoom,normBottom=0.5+yPan-0.5/yZoom,priceSpan=Math.max(0.000001,basePriceRg),predSpan=Math.max(0.000001,basePredRg),priceAxisBottom=mn+normBottom*priceSpan,priceAxisTop=mn+normTop*priceSpan,predAxisBottom=pmn+normBottom*predSpan,predAxisTop=pmn+normTop*predSpan;accuracyView.priceRg=priceSpan/yZoom;const pricePlotRg=Math.max(0.000001,priceAxisTop-priceAxisBottom),predPlotRg=Math.max(0.000001,predAxisTop-predAxisBottom),priceFlat=Math.abs(mx-mn)<1e-9,predFlat=Math.abs(pmx-pmn)<1e-9,bothFlat=priceFlat&&predFlat,priceY=o=>{{let norm=priceFlat?0.5:(Number(o.price)-priceAxisBottom)/pricePlotRg;return pad.t+ch-norm*ch-(bothFlat?16:0);}},predValY=val=>{{let norm=predFlat?0.5:(val-predAxisBottom)/predPlotRg;return pad.t+ch-norm*ch+(bothFlat?16:0);}},stepFull=cw/Math.max(1,clean.length-1),xAtFull=i=>pad.l+stepFull*i;const drawBudget=accuracyLinePointBudget(cw,clean.length),showMarkers=accuracyShowPointMarkers(cw,clean.length),decimated=decimateAccuracySeries(clean,predVals,drawBudget),drawPts=decimated.points,drawPred=decimated.predVals,stepDraw=cw/Math.max(1,drawPts.length-1),xAtDraw=i=>pad.l+stepDraw*i,denseMode=drawPts.length<clean.length,priceLineWidth=denseMode?1.5:2.6,predLineWidth=denseMode?1.1:2;ctx.strokeStyle='rgba(148,163,184,.22)';ctx.lineWidth=1;for(let i=0;i<=4;i++){{const y=pad.t+ch*i/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke();}}drawAccuracyLeftAxis(ctx,pad,W,H,priceAxisBottom,priceAxisTop);drawAccuracyRightAxis(ctx,pad,W,H,predAxisBottom,predAxisTop);drawAccuracyTimeAxis(ctx,W,H,pad,clean,cw);ctx.beginPath();drawPts.forEach((o,i)=>{{const px=xAtDraw(i),py=predValY(drawPred[i]);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);}});ctx.strokeStyle='rgba(251,191,36,.92)';ctx.lineWidth=predLineWidth;ctx.stroke();ctx.beginPath();drawPts.forEach((o,i)=>{{const px=xAtDraw(i),py=priceY(o);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);}});ctx.strokeStyle='rgba(96,165,250,.95)';ctx.lineWidth=priceLineWidth;ctx.stroke();const paperEq=clean.map(o=>Number(o.paper_equity)).filter(v=>Number.isFinite(v));if(paperEq.length>=2){{const pMn=Math.min(...paperEq),pMx=Math.max(...paperEq),pRg=Math.max(0.01,pMx-pMn),paperY=v=>pad.t+ch-((v-pMn)/pRg)*ch;let started=false;ctx.beginPath();clean.forEach((o,i)=>{{const pe=Number(o.paper_equity);if(!Number.isFinite(pe))return;const px=xAtFull(i),py=paperY(pe);if(!started){{ctx.moveTo(px,py);started=true;}}else ctx.lineTo(px,py);}});if(started){{ctx.strokeStyle='rgba(74,222,128,.92)';ctx.lineWidth=denseMode?1.2:2;ctx.stroke();}}}}const markerPriceRadius=showMarkers?(visibleCount>160?1.6:2.8):0,markerPredRadius=showMarkers?(visibleCount>160?1.4:2.4):0;clean.forEach((o,i)=>{{const px=xAtFull(i),pyPrice=priceY(o),pyPred=predValY(predVals[i]),selected=(o.time||'')===accuracyView.selectedKey;accuracyPlotPoints.push({{x:px,yPrice:pyPrice,yPred:pyPred,predVal:predVals[i],point:o}});if(!showMarkers&&!selected)return;const pr=selected?4.2:(markerPriceRadius||2.8),qr=selected?3.8:(markerPredRadius||2.4);ctx.lineWidth=selected?1.5:1;ctx.strokeStyle='rgba(15,23,42,.85)';ctx.fillStyle=selected?'#22d3ee':(o.hit?'#34d399':'#fb7185');ctx.beginPath();ctx.arc(px,pyPrice,pr,0,Math.PI*2);ctx.fill();ctx.stroke();ctx.strokeStyle='rgba(15,23,42,.85)';ctx.fillStyle=selected?'#fde047':'#fbbf24';ctx.beginPath();ctx.arc(px,pyPred,qr,0,Math.PI*2);ctx.fill();ctx.stroke();}});let selectedPlot=null;if(accuracyView.selectedKey){{selectedPlot=accuracyPlotPoints.find(o=>(o.point.time||'')===accuracyView.selectedKey)||null;if(selectedPlot){{drawAccuracyCrosshair(ctx,pad,W,H,selectedPlot);updateAccuracyPointPanel(selectedPlot.point);}}else{{accuracyView.selectedKey='';updateAccuracyPointPanel(null);}}}}else{{updateAccuracyPointPanel(null);}}ctx.fillStyle='rgba(226,232,240,.92)';ctx.font='12px Segoe UI, Microsoft YaHei';ctx.textAlign='left';ctx.textBaseline='top';ctx.fillText('蓝线：价格',pad.l,pad.t+4);ctx.fillStyle='#4ade80';ctx.fillText('绿线：模拟账户',pad.l+72,pad.t+4);ctx.fillStyle='#fbbf24';ctx.fillText('黄线：预测方向',pad.l+168,pad.t+4);ctx.fillStyle=denseMode?'#fcd34d':'rgba(203,213,225,.72)';ctx.fillText(' · 绘制 '+drawPts.length+'/'+visibleCount+(denseMode?' 已抽稀':' 全量'),pad.l+248,pad.t+4);ctx.textAlign='right';ctx.fillStyle='rgba(203,213,225,.68)';ctx.textBaseline='top';ctx.fillText('总计 '+totalCount+' 点 · 滚轮缩放 · 拖动平移 · 点击选点',W-pad.r,H-26);}}
 	function setupAccuracyChartInteractions(){{const c=document.getElementById('accuracyChart');if(!c||c.dataset.panZoomBound)return;c.dataset.panZoomBound='1';c.addEventListener('wheel',e=>{{if(!accuracyView.points.length)return;e.preventDefault();const rect=c.getBoundingClientRect(),mx=(e.clientX-rect.left)/Math.max(1,rect.width),factor=e.deltaY>0?1.18:0.85,n=accuracyView.points.length;if(e.shiftKey||n<=2){{accuracyView.yZoom=clamp(accuracyView.yZoom/factor,0.35,12);}}else{{const span=accuracyView.end-accuracyView.start,newSpan=clamp(span*factor,accuracyMinTimeSpan(),1),anchor=accuracyView.start+span*mx;accuracyView.start=clamp(anchor-newSpan*mx,0,1-newSpan);accuracyView.end=accuracyView.start+newSpan;}}accuracyView.followLatest=accuracyView.end>=0.995;drawAccuracyChart();}},{{passive:false}});c.addEventListener('mousedown',e=>{{accuracyView.drag={{x:e.clientX,y:e.clientY,start:accuracyView.start,end:accuracyView.end,yPan:accuracyView.yPan,moved:false}};c.classList.add('dragging');}});window.addEventListener('mousemove',e=>{{const g=accuracyView.drag;if(!g)return;const rect=c.getBoundingClientRect(),dx=(e.clientX-g.x)/Math.max(1,rect.width),dy=(e.clientY-g.y)/Math.max(1,rect.height),span=g.end-g.start;if(Math.abs(e.clientX-g.x)>3||Math.abs(e.clientY-g.y)>3)g.moved=true;let ns=clamp(g.start-dx*span,0,1-span),ne=ns+span;accuracyView.start=ns;accuracyView.end=ne;accuracyView.yPan=clamp(g.yPan+dy*1.35,-3,3);accuracyView.followLatest=accuracyView.end>=0.995;drawAccuracyChart();}});window.addEventListener('mouseup',()=>{{if(accuracyView.drag){{setTimeout(function(){{accuracyView.drag=null;}},0);}}c.classList.remove('dragging');}});c.addEventListener('click',e=>{{if(accuracyView.drag&&accuracyView.drag.moved)return;selectAccuracyPoint(e,false);}});c.addEventListener('dblclick',e=>{{if(accuracyView.drag&&accuracyView.drag.moved)return;resetAccuracyView();drawAccuracyChart();}});}}
 	setupAccuracyChartInteractions();

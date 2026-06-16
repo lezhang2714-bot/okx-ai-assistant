@@ -1,15 +1,15 @@
 {
-  "spike_push_score": 58,
-  "watch_push_score": 62,
+  "interval": 10,
+  "strategy_mode": "short",
+  "analysis_log_enabled": true,
   "ai_enabled": true,
+  "watch_push_score": 80,
+  "risk_preference": "aggressive",
+  "spike_push_score": 80,
+  "push_score": 80,
+  "record_replay_enabled": true,
+  "push_enabled": true,
   "inst_ids": [
     "BTC-USDT-SWAP"
-  ],
-  "push_score": 70,
-  "record_replay_enabled": false,
-  "analysis_log_enabled": true,
-  "strategy_mode": "short",
-  "push_enabled": true,
-  "risk_preference": "aggressive",
-  "interval": 5
+  ]
 }

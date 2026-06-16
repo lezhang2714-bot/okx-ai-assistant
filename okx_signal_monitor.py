@@ -19,7 +19,7 @@ Optional push:
 Production tuning:
     export RETRY_TIMES=3
     export PUSH_COOLDOWN_SECONDS=900
-    export LOG_MAX_BYTES=10485760
+    export LOG_MAX_BYTES=524288000
     export VOLUME_MULTIPLIER=2.0
     export OI_CHANGE_PCT_15M=5.0
     export AI_REQUEST_TIMEOUT=30
@@ -73,7 +73,8 @@ DEFAULT_AI_PROBE_INTERVAL_SECONDS = 60
 DEFAULT_AI_RATE_LIMIT_BACKOFF_SECONDS = 30.0
 DEFAULT_PUSH_COOLDOWN_SECONDS = 900
 DEFAULT_AI_CALL_MIN_INTERVAL_SECONDS = 60
-DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024
+# 500MB；12h 写入量约 177MB，留足余量避免过早轮转导致 Web 图表/压测丢数据。
+DEFAULT_LOG_MAX_BYTES = 500 * 1024 * 1024
 WECHAT_PUSH_MAX_DESP = 28000
 TRADE_TRIGGER_SIGNALS = frozenset(
     {"volume_spike", "structure_break", "oi_change", "order_book_imbalance", "macd_momentum_change"}
@@ -219,16 +220,16 @@ def format_ai_analysis_lines(
                 parts.append(f"{label}={value}")
         lines.append(f"  AI结论: {' | '.join(parts)}")
 
-        audit = parsed.get("rule_audit") if isinstance(parsed.get("rule_audit"), dict) else {}
+        audit = parsed_data_quality(parsed)
         audit_overall = audit.get("overall")
         if audit_overall:
-            lines.append(f"  AI审计: {audit_overall}")
+            lines.append(f"  数据质量: {audit_overall}")
 
         reasons = parsed.get("reasons")
         if isinstance(reasons, list) and reasons:
             lines.append(f"  AI理由: {_clip_console_text('; '.join(str(item) for item in reasons[:3]), 180)}")
 
-        suggestion = parsed.get("suggestion") or parsed.get("score_comment")
+        suggestion = parsed.get("suggestion") or parsed_analysis_note(parsed)
         if suggestion:
             lines.append(f"  AI建议: {_clip_console_text(suggestion, 180)}")
         return lines
@@ -321,6 +322,158 @@ STRATEGY_PROFILES = {
         "holding_time": "数小时-数天",
     },
 }
+
+# AI payload：按策略裁剪 K 线根数；信号/触发可强制纳入周期。
+AI_SIGNAL_BAR_MAP = {
+    "volume_spike": ("1m",),
+    "structure_break": ("5m", "15m"),
+    "boll_squeeze": ("15m",),
+    "rsi_divergence": ("15m",),
+    "rsi_extreme": ("15m",),
+    "macd_momentum_change": ("15m",),
+    "oi_change": (),
+    "funding_hot": (),
+    "funding_fast_change": (),
+    "long_short_extreme": (),
+    "order_book_imbalance": (),
+}
+AI_CANDLE_LIMITS: Dict[str, Dict[str, int]] = {
+    "scalp": {"1m": 30, "3m": 28, "5m": 20, "15m": 16, "1H": 12},
+    "short": {"3m": 16, "5m": 20, "15m": 16, "1H": 12, "4H": 12},
+    "swing": {"15m": 16, "1H": 16, "4H": 16},
+}
+AI_SIGNAL_CANDLE_LIMITS = {"1m": 20, "3m": 16, "5m": 20, "15m": 16, "1H": 12, "4H": 12}
+AI_HISTORY_LIMITS = {"scalp": 90, "short": 120, "swing": 150}
+AI_DATA_QUALITY_UNTRUSTED = frozenset({"不可信", "数据不足", "insufficient"})
+
+
+def compact_background_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+    if not profile:
+        return {"note": "profile_only", "trend": "unknown"}
+    rsi = profile.get("rsi") if isinstance(profile.get("rsi"), dict) else {}
+    adx = profile.get("adx") if isinstance(profile.get("adx"), dict) else {}
+    return {
+        "note": "profile_only",
+        "trend": profile.get("trend", "unknown"),
+        "breakout": profile.get("breakout", "none"),
+        "rsi_14": rsi.get("14"),
+        "adx": adx.get("adx"),
+        "ema_slope_pct": profile.get("ema_slope_pct"),
+    }
+
+
+def parsed_data_quality(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    data_quality = parsed.get("data_quality")
+    if isinstance(data_quality, dict):
+        return data_quality
+    rule_audit = parsed.get("rule_audit")
+    if isinstance(rule_audit, dict):
+        return rule_audit
+    return {}
+
+
+def parsed_analysis_note(parsed: Dict[str, Any]) -> str:
+    for key in ("analysis_note", "score_comment"):
+        value = parsed.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def data_quality_untrusted(parsed: Dict[str, Any]) -> bool:
+    overall = str(parsed_data_quality(parsed).get("overall", "") or "")
+    return overall in AI_DATA_QUALITY_UNTRUSTED or overall in {"不可信", "insufficient"}
+
+
+def normalize_ai_parsed(parsed: Optional[Dict[str, Any]], score: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    if not isinstance(parsed, dict):
+        return None
+    score = score or {}
+    normalized = dict(parsed)
+
+    if not normalized.get("analysis_note") and normalized.get("score_comment"):
+        normalized["analysis_note"] = normalized["score_comment"]
+
+    if not isinstance(normalized.get("data_quality"), dict):
+        if isinstance(normalized.get("rule_audit"), dict):
+            audit = dict(normalized["rule_audit"])
+            overall = str(audit.get("overall", "") or "").strip()
+            legacy_overall = {
+                "规则结果可信": "充足",
+                "可信": "充足",
+                "部分可信": "部分可用",
+                "不可信": "数据不足",
+            }
+            if overall in legacy_overall:
+                audit["overall"] = legacy_overall[overall]
+            elif not overall:
+                audit["overall"] = "部分可用"
+            if not isinstance(audit.get("warnings"), list):
+                audit["warnings"] = [str(audit["warnings"])] if audit.get("warnings") else []
+            normalized["data_quality"] = audit
+
+    data_quality = normalized.get("data_quality")
+    if not isinstance(data_quality, dict):
+        normalized["data_quality"] = {"overall": "部分可用", "warnings": []}
+    else:
+        if not str(data_quality.get("overall", "") or "").strip():
+            data_quality["overall"] = "部分可用"
+        if not isinstance(data_quality.get("warnings"), list):
+            data_quality["warnings"] = [str(data_quality["warnings"])] if data_quality.get("warnings") else []
+
+    confidence = normalized.get("confidence")
+    if confidence is None:
+        direction = normalized.get("direction", "观望")
+        if direction in ("做多", "做空"):
+            confidence = score.get("final_trade_score", score.get("raw_total_score", 0))
+        else:
+            confidence = score.get("raw_total_score", 0)
+    if isinstance(confidence, str):
+        try:
+            confidence = int(round(float(confidence.strip())))
+        except ValueError:
+            confidence = 0
+    elif isinstance(confidence, float):
+        confidence = int(round(confidence))
+    elif not isinstance(confidence, int):
+        confidence = 0
+    normalized["confidence"] = max(0, min(100, int(confidence or 0)))
+
+    push_rec = str(normalized.get("push_recommendation", "") or "").strip().lower()
+    if push_rec not in ("none", "watch", "trade", "spike"):
+        push_rec = "none"
+    normalized["push_recommendation"] = push_rec
+
+    trend = normalized.get("trend")
+    if isinstance(trend, str):
+        normalized["trend"] = {"summary": trend, "timeframes": {}, "conflict": ""}
+    elif not isinstance(trend, dict):
+        normalized["trend"] = {"summary": "", "timeframes": {}, "conflict": ""}
+    else:
+        trend.setdefault("summary", "")
+        if not isinstance(trend.get("timeframes"), dict):
+            trend["timeframes"] = {}
+        trend.setdefault("conflict", "")
+
+    reasons = normalized.get("reasons")
+    if isinstance(reasons, str):
+        normalized["reasons"] = [reasons] if reasons.strip() else []
+    elif not isinstance(reasons, list):
+        normalized["reasons"] = []
+
+    if normalized.get("direction") not in ("做多", "做空", "观望"):
+        normalized["direction"] = "观望"
+    if normalized.get("risk_level") not in ("低", "中", "高"):
+        normalized["risk_level"] = "中"
+
+    for key in ("entry", "stop_loss", "take_profit"):
+        value = normalized.get(key)
+        if value in (None, ""):
+            normalized[key] = "-"
+
+    normalized.setdefault("risk", "")
+    normalized.setdefault("suggestion", "")
+    return normalized
 
 
 @dataclass
@@ -2669,6 +2822,148 @@ class OkxAiShortTermAssistant:
             result["error"] = str(exc)
         return result
 
+    def _extract_ai_usage(self, response: Any) -> Optional[Dict[str, int]]:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+        result: Dict[str, int] = {}
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = getattr(usage, key, None)
+            if value is None and isinstance(usage, dict):
+                value = usage.get(key)
+            if value is None:
+                continue
+            try:
+                result[key] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return result or None
+
+    def _json_char_len(self, value: Any) -> int:
+        return len(json.dumps(value, ensure_ascii=False))
+
+    def _payload_char_sections(self, payload: Dict[str, Any]) -> Dict[str, int]:
+        market = payload.get("market_data", {})
+        candles = market.get("candles", {})
+        derivatives = market.get("derivatives", {})
+        candle_chars = {
+            f"candles.{bar}": self._json_char_len(candles.get(bar, []))
+            for bar in ("1m", "3m", "5m", "15m", "1H", "4H")
+            if bar in candles
+        }
+        sections: Dict[str, int] = {
+            "market": self._json_char_len(market.get("market", {})),
+            **candle_chars,
+            "background_profiles": self._json_char_len(market.get("background_profiles", {})),
+            "oi_history": self._json_char_len(derivatives.get("oi_history", [])),
+            "funding_history": self._json_char_len(derivatives.get("funding_history", [])),
+            "derivatives_core": self._json_char_len(
+                {
+                    k: v
+                    for k, v in derivatives.items()
+                    if k not in {"oi_history", "funding_history"}
+                }
+            ),
+            "order_book": self._json_char_len(market.get("order_book", {})),
+            "volatility+thresholds": self._json_char_len(
+                {
+                    "volatility": market.get("volatility", {}),
+                    "dynamic_thresholds": market.get("dynamic_thresholds", {}),
+                    "instrument_profile": market.get("instrument_profile", {}),
+                }
+            ),
+            "trigger_context": self._json_char_len(payload.get("trigger_context", {})),
+            "analysis_config": self._json_char_len(payload.get("analysis_config", {})),
+            "payload_meta": self._json_char_len(payload.get("payload_meta", {})),
+        }
+        return {key: value for key, value in sections.items() if value > 0}
+
+    def _estimate_tokens_by_char_share(self, char_sections: Dict[str, int], token_budget: int) -> Dict[str, int]:
+        total_chars = sum(char_sections.values())
+        if token_budget <= 0 or total_chars <= 0:
+            return {key: 0 for key in char_sections}
+        allocated = {
+            key: max(0, round(token_budget * chars / total_chars))
+            for key, chars in char_sections.items()
+        }
+        drift = token_budget - sum(allocated.values())
+        if drift and allocated:
+            top_key = max(allocated, key=allocated.get)
+            allocated[top_key] = max(0, allocated[top_key] + drift)
+        return allocated
+
+    def _log_ai_prompt_token_breakdown(
+        self,
+        inst_id: str,
+        payload: Dict[str, Any],
+        prompt: str,
+        usage: Optional[Dict[str, int]],
+    ) -> None:
+        prompt_tokens = int((usage or {}).get("prompt_tokens") or 0)
+        if prompt_tokens <= 0:
+            return
+
+        payload_text = json.dumps(payload, ensure_ascii=False)
+        marker = "输入数据："
+        marker_idx = prompt.rfind(marker)
+        instruction_chars = marker_idx + len(marker) if marker_idx >= 0 else max(0, len(prompt) - len(payload_text))
+        prompt_chars = max(len(prompt), 1)
+        instruction_tokens = max(0, round(prompt_tokens * instruction_chars / prompt_chars))
+        payload_token_budget = max(0, prompt_tokens - instruction_tokens)
+
+        payload_sections = self._payload_char_sections(payload)
+        payload_tokens = self._estimate_tokens_by_char_share(payload_sections, payload_token_budget)
+        grouped: Dict[str, int] = {"instruction": instruction_tokens}
+        for key, tokens in payload_tokens.items():
+            if key.startswith("candles."):
+                grouped["candles"] = grouped.get("candles", 0) + tokens
+            elif key.startswith("trend_profiles."):
+                grouped["background_profiles"] = grouped.get("background_profiles", 0) + tokens
+            else:
+                grouped[key] = grouped.get(key, 0) + tokens
+
+        console_info(f"[{now_text()}] {inst_id} AI prompt breakdown (est by char share of prompt={prompt_tokens}):")
+        for name, tokens in sorted(grouped.items(), key=lambda item: item[1], reverse=True):
+            pct = tokens / prompt_tokens * 100 if prompt_tokens else 0.0
+            console_info(f"  {name}: ~{tokens} tok ({pct:.1f}%)")
+
+        if console_verbose_enabled():
+            candle_parts = []
+            for bar in ("1m", "3m", "5m", "15m", "1H", "4H"):
+                key = f"candles.{bar}"
+                if key in payload_tokens:
+                    candle_parts.append(f"{bar}~{payload_tokens[key]}")
+            if candle_parts:
+                console_debug(f"  candles detail: {', '.join(candle_parts)}")
+            profile_parts = []
+            bg = payload.get("market_data", {}).get("background_profiles", {})
+            for bar in ("1m", "3m", "5m", "15m", "1H", "4H"):
+                if bar in bg:
+                    profile_parts.append(f"{bar}~profile")
+            if profile_parts:
+                console_debug(f"  background_profiles: {', '.join(profile_parts)}")
+            console_debug(
+                f"  size: payload {len(payload_text.encode('utf-8')) / 1024:.1f} KB | "
+                f"prompt {len(prompt.encode('utf-8')) / 1024:.1f} KB"
+            )
+
+    def _log_ai_token_usage(
+        self,
+        inst_id: str,
+        model: str,
+        usage: Optional[Dict[str, int]],
+    ) -> None:
+        if not usage:
+            console_debug(f"[{now_text()}] {inst_id} AI tokens: usage not returned by API")
+            return
+        console_info(
+            f"[{now_text()}] {inst_id} AI tokens: "
+            f"prompt={usage.get('prompt_tokens', '-')} "
+            f"completion={usage.get('completion_tokens', '-')} "
+            f"total={usage.get('total_tokens', '-')} "
+            f"model={model}"
+        )
+
     def _chat_completion_with_retry(self, client: Any, model: str, prompt: str) -> Any:
         last_error: Optional[Exception] = None
         retry_times = self.runtime_config.retry_times
@@ -2743,10 +3038,18 @@ class OkxAiShortTermAssistant:
         snapshot: Dict[str, Any],
         signals: List[Dict[str, Any]],
         score: Dict[str, Any],
+        usage: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
-        parsed = extract_json_object(output_text)
+        parsed_raw = extract_json_object(output_text)
+        parsed = normalize_ai_parsed(parsed_raw, score)
         valid, errors = self._validate_ai_result(parsed)
-        return {
+        if not valid:
+            detail = "; ".join(errors[:6]) if errors else "unknown"
+            if parsed_raw is not None:
+                console_warn(f"[{now_text()}] AI validation failed after normalize: {detail}")
+            else:
+                console_warn(f"[{now_text()}] AI output is not valid JSON: {detail}")
+        result = {
             "provider": "deepseek" if "deepseek" in base_url else "openai",
             "model": model,
             "ai_status": "closed",
@@ -2756,6 +3059,9 @@ class OkxAiShortTermAssistant:
             "validation_errors": errors,
             "fallback": None if valid else self._local_analysis(snapshot, signals, score),
         }
+        if usage:
+            result["usage"] = usage
+        return result
 
     def _ai_call_min_interval(self) -> int:
         return max(15, env_int("AI_CALL_MIN_INTERVAL_SECONDS", DEFAULT_AI_CALL_MIN_INTERVAL_SECONDS))
@@ -2900,10 +3206,10 @@ class OkxAiShortTermAssistant:
 
         direction = parsed.get("direction", "观望")
         confidence = self._derive_confidence_from_parsed(parsed, score)
-        audit = parsed.get("rule_audit") if isinstance(parsed.get("rule_audit"), dict) else {}
+        audit = parsed_data_quality(parsed)
         audit_overall = str(audit.get("overall", ""))
 
-        if audit_overall == "不可信":
+        if audit_overall in AI_DATA_QUALITY_UNTRUSTED:
             signal_types = {item.get("type", "") for item in signals}
             if signal_types.intersection(WATCH_TRIGGER_SIGNALS) and confidence >= self.config.watch_push_score:
                 return "watch"
@@ -2969,12 +3275,12 @@ class OkxAiShortTermAssistant:
         trigger: Dict[str, Any],
     ) -> Dict[str, Any]:
         parsed = analysis.get("parsed") if isinstance(analysis.get("parsed"), dict) else {}
-        audit = parsed.get("rule_audit") if isinstance(parsed.get("rule_audit"), dict) else {}
+        audit = parsed_data_quality(parsed)
         direction = parsed.get("direction", "观望")
         confidence = self._derive_confidence_from_parsed(parsed, score)
         push_recommendation = self._derive_push_recommendation(parsed, score, signals, trigger)
 
-        if str(audit.get("overall", "")) == "不可信":
+        if data_quality_untrusted(parsed):
             if push_recommendation == "trade":
                 signal_types = {item.get("type", "") for item in signals}
                 push_recommendation = "watch" if signal_types.intersection(WATCH_TRIGGER_SIGNALS) else "none"
@@ -3003,7 +3309,7 @@ class OkxAiShortTermAssistant:
             "market_regime": score.get("market_regime"),
             "strategy_label": score.get("strategy_label"),
             "risk_preference": score.get("risk_preference"),
-            "score_comment": parsed.get("score_comment", ""),
+            "score_comment": parsed_analysis_note(parsed),
         }
 
     def merge_final_decision(
@@ -3104,12 +3410,24 @@ class OkxAiShortTermAssistant:
                 )
 
         prompt = self._ai_prompt(snapshot, signals, score, trigger)
+        payload = self._ai_payload(snapshot, signals, score, trigger)
         try:
             client = self._get_ai_client(api_key, base_url)
             response = self._chat_completion_with_retry(client, model, prompt)
             output_text = response.choices[0].message.content
+            usage = self._extract_ai_usage(response)
+            self._log_ai_token_usage(snapshot["inst_id"], model, usage)
+            self._log_ai_prompt_token_breakdown(snapshot["inst_id"], payload, prompt, usage)
             self._record_ai_success()
-            return self._build_ai_success_result(base_url, model, output_text, snapshot, signals, score)
+            return self._build_ai_success_result(
+                base_url,
+                model,
+                output_text,
+                snapshot,
+                signals,
+                score,
+                usage=usage,
+            )
         except Exception as exc:
             console_warn(f"[{now_text()}] AI request failed: {exc}")
             self._record_ai_failure(exc)
@@ -4329,8 +4647,90 @@ class OkxAiShortTermAssistant:
             return "watch"
         return ""
 
+    def _ai_forced_bars(self, signals: List[Dict[str, Any]], trigger: Dict[str, Any]) -> set:
+        forced: set = set()
+        signal_types = {item.get("type", "") for item in signals}
+        for signal_type in signal_types:
+            forced.update(AI_SIGNAL_BAR_MAP.get(signal_type, ()))
+        if trigger.get("level") == "L3" and "scalp_spike" in (trigger.get("reasons") or []):
+            forced.update({"1m", "3m", "5m", "15m"})
+        return forced
+
+    def _ai_relevant_bars(self, signals: List[Dict[str, Any]], trigger: Optional[Dict[str, Any]] = None) -> List[str]:
+        trigger = trigger or {}
+        mode = self._strategy_mode()
+        profile = self._strategy_profile(mode)
+        forced = self._ai_forced_bars(signals, trigger)
+        bars = set(profile["primary_bars"]) | set(profile["confirm_bars"]) | set(profile["background_bars"]) | forced
+        ignore = set(profile.get("ignore_bars") or [])
+        bars = bars - (ignore - forced)
+        ordered = [bar for bar in BAR_CHANNELS if bar in bars]
+        return ordered
+
+    def _ai_candle_limit(self, mode: str, bar: str, forced_bars: set) -> int:
+        limit = int(AI_CANDLE_LIMITS.get(mode, AI_CANDLE_LIMITS["short"]).get(bar, 0))
+        if limit <= 0 and bar in forced_bars:
+            limit = int(AI_SIGNAL_CANDLE_LIMITS.get(bar, 12))
+        return max(0, limit)
+
+    def _ai_history_limit(self) -> int:
+        mode = self._strategy_mode()
+        return int(AI_HISTORY_LIMITS.get(mode, AI_HISTORY_LIMITS["short"]))
+
+    def _ai_build_candles(
+        self,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        trigger: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Dict[str, List[Dict[str, Any]]], List[str], List[str]]:
+        trigger = trigger or {}
+        mode = self._strategy_mode()
+        forced = self._ai_forced_bars(signals, trigger)
+        relevant = self._ai_relevant_bars(signals, trigger)
+        candles: Dict[str, List[Dict[str, Any]]] = {}
+        profile_only: List[str] = []
+        all_bars = list(BAR_CHANNELS)
+        profiles = snapshot.get("trend_profiles", {})
+        for bar in all_bars:
+            if bar not in relevant:
+                continue
+            limit = self._ai_candle_limit(mode, bar, forced)
+            if limit > 0:
+                candles[bar] = compact_candles(snapshot["candles"].get(bar, []), limit)
+            elif bar in profiles:
+                profile_only.append(bar)
+        return candles, relevant, profile_only
+
+    def _ai_background_profiles(
+        self,
+        snapshot: Dict[str, Any],
+        profile_only_bars: List[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        profiles = snapshot.get("trend_profiles", {})
+        return {
+            bar: compact_background_profile(profiles.get(bar, {}))
+            for bar in profile_only_bars
+            if bar in profiles
+        }
+
+    def _ai_trigger_context(
+        self,
+        signals: List[Dict[str, Any]],
+        trigger: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        trigger = trigger or {}
+        return {
+            "level": trigger.get("level", "L0"),
+            "reasons": trigger.get("reasons", []),
+            "signals": [
+                {"type": item.get("type", ""), "desc": item.get("desc", "")}
+                for item in signals
+            ],
+            "note": "Trigger context only; not a trade recommendation.",
+        }
+
     def _validate_ai_result(self, parsed: Optional[Dict[str, Any]]) -> Tuple[bool, List[str]]:
-        # AI输出必须包含固定字段，否则不直接信任，转用本地规则兜底。
+        # AI输出必须包含固定字段；优先 data_quality，兼容旧 rule_audit。
         required = {
             "trend",
             "risk",
@@ -4340,8 +4740,8 @@ class OkxAiShortTermAssistant:
             "stop_loss",
             "take_profit",
             "risk_level",
-            "score_comment",
-            "rule_audit",
+            "confidence",
+            "push_recommendation",
             "reasons",
         }
         if not parsed:
@@ -4359,23 +4759,28 @@ class OkxAiShortTermAssistant:
             errors.append("risk_level must be 低/中/高")
 
         push_rec = parsed.get("push_recommendation")
-        if push_rec not in (None, "", "none", "watch", "trade", "spike"):
+        if push_rec not in ("none", "watch", "trade", "spike"):
             errors.append("push_recommendation must be none/watch/trade/spike")
 
         confidence = parsed.get("confidence")
-        if confidence is not None and not isinstance(confidence, (int, float)):
+        if not isinstance(confidence, (int, float)):
             errors.append("confidence must be a number")
 
         if not isinstance(parsed.get("reasons"), list):
             errors.append("reasons must be a list")
 
-        rule_audit = parsed.get("rule_audit")
-        if not isinstance(rule_audit, dict):
-            errors.append("rule_audit must be an object")
+        trend = parsed.get("trend")
+        if not isinstance(trend, dict):
+            errors.append("trend must be an object")
+
+        data_quality = parsed_data_quality(parsed)
+        if not data_quality:
+            errors.append("data_quality (or legacy rule_audit) must be an object")
         else:
-            for key in ("overall", "score_consistency", "warnings"):
-                if key not in rule_audit:
-                    errors.append(f"rule_audit missing {key}")
+            if not str(data_quality.get("overall", "") or "").strip():
+                errors.append("data_quality.overall is required")
+            if not isinstance(data_quality.get("warnings"), list):
+                errors.append("data_quality.warnings must be a list")
 
         return not errors, errors
 
@@ -4386,80 +4791,75 @@ class OkxAiShortTermAssistant:
         score: Dict[str, Any],
         trigger: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        # 发送给AI的数据分成三层：
-        # 1. raw_evidence：原始证据，让AI能复核趋势、放量、OI/funding变化。
-        # 2. computed_indicators：程序已经算好的指标。
-        # 3. rule_outputs：程序触发的信号和评分，让AI审查是否可信。
+        # 自主分析 payload：market_data 为主，trigger_context 仅说明为何调用 AI。
         inst_id = snapshot["inst_id"]
+        trigger = trigger or {}
+        mode = self._strategy_mode()
+        profile = self._strategy_profile(mode)
+        candles, included_bars, profile_only_bars = self._ai_build_candles(snapshot, signals, trigger)
+        history_limit = self._ai_history_limit()
+        volatility = snapshot.get("volatility", {})
         return {
             "instrument": inst_id,
             "snapshot_time": snapshot["time"],
-            "raw_evidence": {
+            "payload_meta": {
+                "included_bars": included_bars,
+                "raw_candle_bars": sorted(candles.keys()),
+                "profile_only_bars": profile_only_bars,
+                "note": "Analyze independently from market_data; trigger_context is not a trade recommendation.",
+            },
+            "market_data": {
                 "market": {
                     "current_price": snapshot["price"],
                     "best_bid": snapshot["best_bid"],
                     "best_ask": snapshot["best_ask"],
                 },
-                "candles": {
-                    "1m": compact_candles(snapshot["candles"]["1m"], 21),
-                    "3m": compact_candles(snapshot["candles"].get("3m", []), 40),
-                    "5m": compact_candles(snapshot["candles"]["5m"], 12),
-                    "15m": compact_candles(snapshot["candles"]["15m"], 12),
-                    "1H": compact_candles(snapshot["candles"]["1H"], 12),
-                    "4H": compact_candles(snapshot["candles"].get("4H", []), 12),
+                "candles": candles,
+                "background_profiles": self._ai_background_profiles(snapshot, profile_only_bars),
+                "derivatives": {
+                    "volume": snapshot["volume"],
+                    "open_interest": snapshot["open_interest"],
+                    "oi_change_pct_15m": snapshot["oi_change_pct_15m"],
+                    "oi_warmup_ready": snapshot["oi_warmup_ready"],
+                    "funding_rate": snapshot["funding_rate"],
+                    "funding_change_15m": snapshot["funding_change"],
+                    "funding_warmup_ready": snapshot["funding_warmup_ready"],
+                    "long_short_ratio": snapshot["long_short_ratio"],
+                    "oi_history": history_tail(self.oi_history[inst_id], history_limit),
+                    "funding_history": history_tail(self.funding_history[inst_id], history_limit),
                 },
-                "oi_history": history_tail(self.oi_history[inst_id], 180),
-                "funding_history": history_tail(self.funding_history[inst_id], 180),
-            },
-            "computed_indicators": {
-                "volume": snapshot["volume"],
-                "open_interest": snapshot["open_interest"],
-                "oi_change_pct_15m": snapshot["oi_change_pct_15m"],
-                "oi_warmup_ready": snapshot["oi_warmup_ready"],
-                "funding_rate": snapshot["funding_rate"],
-                "funding_change_15m": snapshot["funding_change"],
-                "funding_warmup_ready": snapshot["funding_warmup_ready"],
-                "long_short_ratio": snapshot["long_short_ratio"],
                 "order_book": snapshot.get("order_book", {}),
-                "trend_profiles": snapshot.get("trend_profiles", {}),
-                "volatility": snapshot.get("volatility", {}),
+                "volatility": volatility,
                 "dynamic_thresholds": snapshot.get("dynamic_thresholds", {}),
                 "instrument_profile": snapshot.get("instrument_profile", {}),
-                "market_context": snapshot.get("market_context", {}),
-                "signal_tracking": snapshot.get("signal_tracking", {}),
             },
-            "rule_thresholds": {
-                "volume_multiplier": self.config.volume_multiplier,
-                "oi_change_pct_15m": self.config.oi_change_pct_15m,
-                "funding_abs_threshold": self.config.funding_abs_threshold,
-                "funding_change_threshold": self.config.funding_change_threshold,
-                "long_short_extreme": self.config.long_short_extreme,
-                "push_score": self.push_score,
-                "watch_push_score": self.config.watch_push_score,
-                "spike_push_score": self.config.spike_push_score,
-                "strategy_mode": self._strategy_mode(),
+            "trigger_context": self._ai_trigger_context(signals, trigger),
+            "analysis_config": {
+                "strategy_mode": mode,
+                "strategy_label": profile.get("label", score.get("strategy_label")),
                 "risk_preference": self._risk_preference(),
+                "ai_output_style": self._ai_output_style(),
+                "holding_time": profile.get("holding_time", ""),
+                "primary_bars": profile.get("primary_bars", []),
+                "confirm_bars": profile.get("confirm_bars", []),
+                "background_bars": profile.get("background_bars", []),
+                "push_thresholds": {
+                    "trade": self.push_score,
+                    "watch": self.config.watch_push_score,
+                    "spike": self.config.spike_push_score,
+                },
                 "signal_types_enabled": {
                     "trade": self.config.signal_trade_enabled,
                     "watch": self.config.signal_watch_enabled,
                     "spike": self.config.signal_spike_enabled,
                 },
-            },
-            "rule_outputs": {
-                "signals": signals,
-                "score": score,
-                "local_hint": self.build_local_hint(score, signals),
-                "direction_audit": {
-                    "raw_direction": score.get("raw_direction"),
-                    "final_direction": score.get("final_direction"),
-                    "downgraded_to_wait": score.get("raw_direction") != score.get("final_direction"),
+                "reference_thresholds": {
+                    "volume_multiplier": self.config.volume_multiplier,
+                    "oi_change_pct_15m": self.config.oi_change_pct_15m,
+                    "funding_abs_threshold": self.config.funding_abs_threshold,
+                    "funding_change_threshold": self.config.funding_change_threshold,
+                    "long_short_extreme": self.config.long_short_extreme,
                 },
-                "signal_evidence": self._signal_evidence(snapshot, signals),
-            },
-            "local_trigger": {
-                "level": (trigger or {}).get("level", "L0"),
-                "reasons": (trigger or {}).get("reasons", []),
-                "fingerprint": (trigger or {}).get("fingerprint", ""),
             },
         }
 
@@ -4573,85 +4973,70 @@ class OkxAiShortTermAssistant:
         score: Dict[str, Any],
         trigger: Optional[Dict[str, Any]] = None,
     ) -> str:
-        # Prompt明确约束AI：只做分析，不自动下单，不承诺收益，并要求固定字段。
-        cfg = self.config
+        # Prompt：AI 从 market_data 自主分析；trigger_context 仅说明为何调用。
         trigger = trigger or {}
-        trigger_level = trigger.get("level", "L0")
-        trigger_reasons = trigger.get("reasons") or []
-        trigger_reasons_text = "、".join(str(x) for x in trigger_reasons) or "无"
+        profile = self._strategy_profile()
         payload = self._ai_payload(snapshot, signals, score, trigger)
+        meta = payload.get("payload_meta", {})
+        config = payload.get("analysis_config", {})
+        thresholds = config.get("push_thresholds", {})
+        included_bars = meta.get("raw_candle_bars") or []
+        profile_only_bars = meta.get("profile_only_bars") or []
+        bars_text = "、".join(included_bars) or "无"
+        profile_only_text = "、".join(profile_only_bars) or "无"
+        trigger_reasons_text = "、".join(str(x) for x in (trigger.get("reasons") or [])) or "无"
         return (
             "你是欧易OKX USDT永续合约多策略分析助手，只分析BTC-USDT-SWAP和ETH-USDT-SWAP。"
             "你的输出会写入本地日志，并可能经微信推送给人工复核；"
-            "字段 push_recommendation 会参与是否推送，请与下方阈值一致。\n\n"
-            "【本次触发上下文】\n"
-            f"- 本地 AI 触发级别: {trigger_level}（见 local_trigger.level）\n"
-            f"- 触发原因: {trigger_reasons_text}\n"
-            f"- 推送阈值（confidence 对照）: trade≥{self.push_score}, watch≥{cfg.watch_push_score}, spike≥{cfg.spike_push_score}\n\n"
-            "你的任务是根据实时行情、多周期K线、EMA/MA/RSI/MACD/KDJ/BOLL/ADX/ATR结构画像、成交量、OI、资金费率、多空比、订单簿，"
-            "直接根据原始数据和本地触发的 signals 独立判断；"
-            "rule_outputs.local_hint 与 rule_outputs.score 仅供参考，不得机械照搬。\n\n"
+            "字段 push_recommendation 会参与是否推送。\n\n"
+            "【角色】\n"
+            "你必须从 market_data 独立分析并给出 direction/entry/stop_loss/take_profit。"
+            "trigger_context 只说明本地为何调用 AI，不得作为方向或价位依据。\n\n"
+            "【本次触发】\n"
+            f"- 级别: {trigger.get('level', 'L0')}\n"
+            f"- 原因: {trigger_reasons_text}\n"
+            f"- 主策略: {config.get('strategy_label', profile.get('label', '短线'))} "
+            f"({config.get('strategy_mode', 'short')})\n"
+            f"- 推送阈值 confidence: trade≥{thresholds.get('trade', self.push_score)}, "
+            f"watch≥{thresholds.get('watch', self.config.watch_push_score)}, "
+            f"spike≥{thresholds.get('spike', self.config.spike_push_score)}\n"
+            f"- 原始K线周期: {bars_text}\n"
+            f"- 仅 profile 摘要周期: {profile_only_text}（无 OHLC，见 background_profiles）\n\n"
             "硬性限制：\n"
             "1. 只提供分析和风险提示，不允许表示系统会自动下单。\n"
             "2. 不允许承诺收益，不允许使用稳赚、必涨、必跌等确定性表述。\n"
-            "3. 如果数据不足、信号矛盾、预热未完成或风险过高，direction必须选择观望。\n"
-            "4. 如果long_short_ratio.available=false，需要说明多空比不可用，不要凭空编造多空比。\n"
-            "5. 如果oi_warmup_ready=false或funding_warmup_ready=false，需要降低对15分钟变化类指标的权重。\n\n"
-            f"策略要求：当前主策略为{score.get('strategy_label')}，风险偏好为{score.get('risk_preference')}，AI输出风格为{score.get('ai_output_style')}。"
-            "可参考 score.strategy_views 解释超短线/短线/中线差异，但最终 direction 与 push_recommendation 必须由你独立给出。"
-            "超短线只看1m/3m/5m与15m过滤，4H只做背景；短线看5m/15m和1H确认；中线看1H/4H结构。"
-            "如果超短线出现急速异动但主策略不是超短线，应在 push_recommendation 中用 spike 或 watch 表达，不要包装成中线趋势。\n\n"
+            "3. 数据不足、预热未完成、周期严重冲突或风险过高时 direction=观望。\n"
+            "4. long_short_ratio.available=false 时不得编造多空比。\n"
+            "5. oi/funding warmup 未完成时，降低 15 分钟变化类指标权重。\n\n"
+            f"策略视角：{config.get('strategy_label')}，持仓周期约 {config.get('holding_time', '')}；"
+            f"风险偏好 {config.get('risk_preference', 'standard')}。"
+            "超短线重 1m/3m/5m+15m 过滤；短线重 5m/15m+1H；中线重 1H/4H+15m 确认。"
+            "L3/spike 场景偏短线快进快出，不要包装成中线趋势。\n\n"
             "分析步骤：\n"
-            "1. 规则审计：根据 raw_evidence 和 signal_evidence，判断程序触发的 signals 是否有原始数据支持。\n"
-            "2. 情绪与方向：读 score.sentiment_meta 与 market_context，判断情绪/领先方向是否支持或削弱本地方向；"
-            "若 rule_outputs.direction_audit.downgraded_to_wait=true，说明 raw_direction 被降级，需在 rule_audit 中解释。\n"
-            "3. 市场状态：优先参考 market_context.regime/bias，区分趋势、震荡、高波动、混合状态。\n"
-            "4. 趋势：根据K线原始数据、EMA9/20/60/120、MA120、ADX和结构高低点判断1m、3m、5m、15m、1H、4H方向。\n"
-            "5. 动量：用RSI、MACD柱体变化、KDJ和K线实体质量判断是否过热、背离或动能衰减。\n"
-            "6. 量能：复核已收盘1m成交量、量价方向、动态分位数和突破放量确认。\n"
-            "7. 合约资金：根据OI+价格组合、资金费率、多空比判断新增仓、平仓和拥挤风险。\n"
-            "8. 订单簿：只作为入场确认，不允许单独用盘口不平衡决定方向；注意 top5/top20 分歧和价差。\n"
-            "9. 回测反馈：signal_tracking 只是在线复盘统计，样本少时不能过度依赖。\n"
-            "10. 价位与可执行性：结合 score.entry_plan 评估；做多时 stop_loss 应低于入场、take_profit 应高于入场；"
-            "做空时 stop_loss 应高于入场、take_profit 应低于入场。"
-            "若仅为「等待结构位」或缺少明确价位，direction 应为观望，不可标可执行 trade。\n"
-            "11. 风险：结合ATR止损距离、资金费率、趋势冲突、信号数量、预热状态给出 risk_level。\n"
-            "12. 推送建议：direction 只能是做多、做空、观望；push_recommendation 只能是 none/watch/trade/spike；"
-            f"confidence 为 0-100。默认倾向 none，避免无效骚扰。规则："
-            f"trade=做多/做空且 confidence≥{self.push_score} 且 entry_plan 可执行；"
-            f"watch=观望且 confidence≥{cfg.watch_push_score} 且存在 watch 类信号"
-            "（funding_hot/rsi_extreme/rsi_divergence/boll_squeeze/long_short_extreme/funding_fast_change）或值得提醒的结构/风险；"
-            f"spike=local_trigger.level 为 L3 或 scalp 急速异动且 direction 为做多/做空且 confidence≥{cfg.spike_push_score}；"
-            "rule_audit.overall=不可信 时通常 none，最多 watch；downgraded_to_wait 时通常不应 trade/spike。\n\n"
-            "必须只输出一个合法JSON对象，不要输出Markdown代码块，不要输出JSON以外的解释。"
-            "JSON字段必须完全包含：\n"
-            "{\n"
-            '  "trend": {\n'
-            '    "summary": "一句话趋势结论",\n'
-            '    "timeframes": {"1m": "...", "3m": "...", "5m": "...", "15m": "...", "1H": "...", "4H": "..."},\n'
-            '    "conflict": "是否存在周期冲突"\n'
-            "  },\n"
-            '  "risk": "风险分析，说明资金费率/OI/多空比/预热状态",\n'
-            '  "suggestion": "简短交易建议和执行注意事项",\n'
-            '  "direction": "做多/做空/观望",\n'
-            '  "entry": "建议入场区间，观望时填-",\n'
-            '  "stop_loss": "建议止损，观望时填-",\n'
-            '  "take_profit": "建议止盈，观望时填-",\n'
-            '  "risk_level": "低/中/高",\n'
-            '  "confidence": 0,\n'
-            '  "push_recommendation": "none/watch/trade/spike",\n'
-            '  "score_comment": "对本地参考分是否可信的说明",\n'
-            '  "rule_audit": {\n'
-            '    "overall": "规则结果可信/部分可信/不可信",\n'
-            '    "volume_signal_valid": true,\n'
-            '    "oi_signal_valid": true,\n'
-            '    "funding_signal_valid": true,\n'
-            '    "long_short_signal_valid": true,\n'
-            '    "score_consistency": "综合评分与原始证据是否一致",\n'
-            '    "warnings": ["规则审计警告"]\n'
-            "  },\n"
-            '  "reasons": ["理由1", "理由2", "理由3"]\n'
-            "}\n\n"
+            "1. 读 payload_meta 确认哪些周期有 raw candles，哪些仅 background_profiles。\n"
+            "2. 从 K 线自主判断多周期结构、动量、量价与波动（RSI/MACD/ADX/BOLL/ATR 等自行从 OHLCV 推演）。\n"
+            "3. 结合 derivatives（OI、费率、多空比及历史）判断资金行为与拥挤风险。\n"
+            "4. 订单簿仅作入场确认，不得单独用盘口决定方向。\n"
+            "5. 自主给出 entry/stop_loss/take_profit：做多 SL 低于入场、TP 高于入场；做空相反。"
+            "无明确可执行结构时 direction=观望。\n"
+            "6. 评估 data_quality（预热、缺失、冲突），再定 risk_level 与 confidence。\n"
+            "7. push_recommendation：默认 none。"
+            f"trade=做多/做空且 confidence≥{thresholds.get('trade', self.push_score)} 且价位可执行；"
+            f"watch=观望且 confidence≥{thresholds.get('watch', self.config.watch_push_score)} 且值得提醒；"
+            f"spike=L3/急速异动且 direction 为做多/做空且 confidence≥{thresholds.get('spike', self.config.spike_push_score)}。"
+            "data_quality.overall=数据不足/不可信 时通常 none，最多 watch。\n\n"
+            "必须只输出一个合法 JSON 对象，不要 Markdown，不要 JSON 外文字。"
+            "必填字段：trend, risk, suggestion, direction, entry, stop_loss, take_profit, "
+            "risk_level, confidence, push_recommendation, data_quality, reasons；"
+            "analysis_note 可选。"
+            "trend.timeframes 对无 raw candles 的周期填 profile_only 或 -，不要编造 OHLC。\n"
+            "data_quality 含 overall（充足/部分可用/数据不足）与 warnings 数组。\n"
+            "输出 JSON 模板（字段必须齐全，数值类型正确）：\n"
+            '{"trend":{"summary":"...","timeframes":{"5m":"up"},"conflict":"..."},'
+            '"risk":"...","suggestion":"...","direction":"观望","entry":"-",'
+            '"stop_loss":"-","take_profit":"-","risk_level":"中","confidence":65,'
+            '"push_recommendation":"none","data_quality":{"overall":"部分可用","warnings":[]},'
+            '"reasons":["..."],"analysis_note":"..."}\n\n'
             f"输入数据：{json.dumps(payload, ensure_ascii=False)}"
         )
 
@@ -4723,7 +5108,10 @@ class OkxAiShortTermAssistant:
             "risk_level": display_push_value(final_decision.get("risk_level"), "中"),
             "suggestion": clip_push_text(final_decision.get("summary"), 240),
             "risk": clip_push_text(parsed.get("risk"), 260),
-            "score_comment": clip_push_text(final_decision.get("score_comment", parsed.get("score_comment")), 180),
+            "score_comment": clip_push_text(
+                final_decision.get("score_comment", parsed_analysis_note(parsed)),
+                180,
+            ),
             "trend_summary": clip_push_text(trend.get("summary"), 120),
             "trend_conflict": clip_push_text(trend.get("conflict"), 120),
             "rule_audit_overall": clip_push_text(rule_audit.get("overall"), 40),
@@ -4842,26 +5230,20 @@ class OkxAiShortTermAssistant:
                 if value not in (None, "", "-"):
                     lines.append(f"- {label}：{value}")
 
-            for key, label in (("risk", "风险分析"), ("suggestion", "交易建议"), ("score_comment", "评分说明")):
+            for key, label in (("risk", "风险分析"), ("suggestion", "交易建议")):
                 value = str(parsed.get(key) or "").strip()
                 if value:
                     lines.append(f"- {label}：{value}")
 
-            audit = parsed.get("rule_audit") if isinstance(parsed.get("rule_audit"), dict) else {}
+            note = parsed_analysis_note(parsed)
+            if note:
+                lines.append(f"- 分析说明：{note}")
+
+            audit = parsed_data_quality(parsed)
             if audit:
-                lines.append("- 规则审计：")
+                lines.append("- 数据质量：")
                 if audit.get("overall"):
                     lines.append(f"  · 总体：{audit.get('overall')}")
-                if audit.get("score_consistency"):
-                    lines.append(f"  · 评分一致性：{audit.get('score_consistency')}")
-                for key, label in (
-                    ("volume_signal_valid", "放量信号"),
-                    ("oi_signal_valid", "OI 信号"),
-                    ("funding_signal_valid", "费率信号"),
-                    ("long_short_signal_valid", "多空比信号"),
-                ):
-                    if key in audit:
-                        lines.append(f"  · {label}：{audit.get(key)}")
                 for warning in audit.get("warnings") or []:
                     text = str(warning or "").strip()
                     if text:
@@ -5014,9 +5396,9 @@ class OkxAiShortTermAssistant:
             audit_bits.append(view["rule_audit_overall"])
         audit_bits.extend(view["rule_audit_warnings"])
         if audit_bits and not ai_invoked:
-            lines.append(f"- 规则审计：{'；'.join(audit_bits)}")
+            lines.append(f"- 数据质量：{'；'.join(audit_bits)}")
         elif view["score_comment"] != "-" and not ai_invoked:
-            lines.append(f"- 评分说明：{view['score_comment']}")
+            lines.append(f"- 分析说明：{view['score_comment']}")
 
         lines.extend([
             "",
@@ -5240,14 +5622,9 @@ def build_wechat_push_format_preview(config: Optional[Dict[str, Any]] = None) ->
         "risk_level": "中",
         "confidence": 78,
         "push_recommendation": "trade",
-        "score_comment": "【示例】本地观察分略低于 AI；盘口支撑与 5m/15m 结构更可信，建议以 AI 计划为主、本地分为辅。",
-        "rule_audit": {
-            "overall": "部分可信",
-            "volume_signal_valid": True,
-            "oi_signal_valid": True,
-            "funding_signal_valid": True,
-            "long_short_signal_valid": False,
-            "score_consistency": "盘口失衡有原始数据支持，本地方向偏保守",
+        "analysis_note": "【示例】基于 5m/15m 结构与盘口自主推导价位；15m 刚转多需防假突破。",
+        "data_quality": {
+            "overall": "部分可用",
             "warnings": [
                 "【示例】15m 趋势刚转多，需防假突破",
                 "【示例】费率预热已完成，但 15m 变化幅度一般",
@@ -5315,14 +5692,14 @@ def build_wechat_push_format_preview(config: Optional[Dict[str, Any]] = None) ->
         "risk_level": "中",
         "summary": mock_parsed["suggestion"],
         "reasons": mock_parsed["reasons"],
-        "rule_audit": mock_parsed["rule_audit"],
+        "rule_audit": mock_parsed["data_quality"],
         "decision_source": "ai",
         "ai_called": True,
         "trigger_level": "L2",
         "market_regime": "high_volatility",
         "strategy_label": strategy_label,
         "risk_preference": risk_preference,
-        "score_comment": mock_parsed["score_comment"],
+        "score_comment": parsed_analysis_note(mock_parsed),
     }
     trigger = {
         "level": "L2",
