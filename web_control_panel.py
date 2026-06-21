@@ -31,6 +31,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from monitor_config_summary import (  # noqa: E402
+    ACCURACY_METRIC_SCOPES,
+    config_requires_monitor_restart,
+    config_value,
+    paper_settings_from_log_item,
+)
+from monitor_design_docs import render_design_docs_html  # noqa: E402
+
 _SIGNAL_MONITOR = None
 
 
@@ -130,7 +138,7 @@ APP_VERSION = "1.2.0"
 APP_NAME = "OKX AI Assistant"
 PRESET_INSTRUMENTS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
 SUPPORTED_INSTRUMENTS = PRESET_INSTRUMENTS
-MONITOR_BAR_CHANNELS = ("1m", "3m", "5m", "15m", "1H", "4H")
+MONITOR_BAR_CHANNELS = ("1m", "3m", "5m", "15m", "1H", "4H", "1D", "1W")
 OKX_BASE_URL = "https://www.okx.com"
 INST_ID_PATTERN = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+-SWAP$")
 _INST_VALIDATION_CACHE: Dict[str, Tuple[float, bool]] = {}
@@ -186,9 +194,9 @@ LEGACY_CONFIG_KEYS = ("runtime", "flag")
 
 
 SUGGESTED_PUSH_SCORES = {
-    "conservative": {"push_score": 80, "short_push_score": 74, "watch_push_score": 72, "spike_push_score": 68},
-    "standard": {"push_score": 75, "short_push_score": 70, "watch_push_score": 65, "spike_push_score": 62},
-    "aggressive": {"push_score": 70, "short_push_score": 65, "watch_push_score": 62, "spike_push_score": 58},
+    "conservative": {"push_score": 80, "short_push_score": 78, "watch_push_score": 72, "spike_push_score": 68, "forecast_push_score": 62},
+    "standard": {"push_score": 75, "short_push_score": 75, "watch_push_score": 65, "spike_push_score": 60, "forecast_push_score": 58},
+    "aggressive": {"push_score": 70, "short_push_score": 68, "watch_push_score": 62, "spike_push_score": 58, "forecast_push_score": 55},
 }
 
 RISK_PREFERENCE_LABELS = {
@@ -202,14 +210,33 @@ CONFIG_FIELDS = [
     ("基础运行", "log_max_mb", "number", "单文件日志上限(MB)", "当前分卷达到此大小后轮转；默认500MB，适合约12小时写入量。"),
     ("基础运行", "log_total_max_mb", "number", "日志总容量上限(MB)", "所有分卷合计超过此值时自动删除最旧分卷；默认1500MB（约3卷）。监控图表与压测依赖分析日志，建议保持开启。"),
     ("基础运行", "record_replay_enabled", "checkbox", "录制回放数据集", "监控运行时把每轮 collect_snapshot 原始输入写入 replay_dataset.jsonl，供离线回放压测。"),
-    ("策略", "strategy_mode", "strategy_choice", "策略周期", "超短线抓5-10分钟脉冲；短线需5m+15m profile 同向或20分钟延伸；中线看1H/15m/4H结构。会切换本地主路径与 final_direction。"),
+    ("策略", "strategy_mode", "strategy_choice", "策略周期", "超短线看1m-5m；短线看5m/15m；中线看15m/1H/4H；长线看4H/1D/1W。会同步切换画像参数、市场语境、评分和 final_direction。"),
     ("策略", "risk_preference", "risk_choice", "确认严格度", "保守：更高动量阈值与确认分(88)；标准：默认；激进：更低阈值(65)且短线可凭短窗压力给方向。变更后可在下方推送说明中一键填入建议分数。"),
-    ("AI与推送", "ai_enabled", "checkbox", "启用AI分析", "L2/L3 触发后调用 AI 做主决策。"),
-    ("AI与推送", "push_enabled", "checkbox", "启用微信推送", "final_decision 过门槛后通过 Server酱 推送。"),
+    ("AI与推送", "ai_enabled", "checkbox", "启用AI分析", "L2/L3 本地筛查通过后调用 AI，输出 forward_view 前瞻方向与操作计划。"),
+    ("AI与推送", "push_enabled", "checkbox", "启用微信推送", "每轮最多 1 条；需过「确认关注」门槛（trade/spike 偏 L2+，watch 需 AI，演变需更高概率）；同币种最短间隔 10 分钟。"),
     ("AI与推送", "push_score", "number", "做多推送门槛(trade)", "direction 为做多且 confidence ≥ 此值时可推 trade。建议见下方「推送分数建议」。"),
-    ("AI与推送", "short_push_score", "number", "做空推送门槛(trade)", "direction 为做空且 confidence ≥ 此值时可推 trade；通常略低于做多门槛。"),
+    ("AI与推送", "short_push_score", "number", "做空推送门槛(trade)", "direction 为做空且 confidence ≥ 此值时可推 trade；标准模式建议与做多对称(75/75)。"),
     ("AI与推送", "watch_push_score", "number", "观察推送门槛(watch)", "观望或风险提示类 watch 推送。建议见下方「推送分数建议」。"),
     ("AI与推送", "spike_push_score", "number", "异动推送门槛(spike)", "超短线急速异动 L3 / spike 推送。建议见下方「推送分数建议」。"),
+    ("AI与推送", "ai_conflict_guard", "checkbox", "冲突拦截(post-audit)", "trade/spike 与超短线急变或短窗压力反向时自动降级或拦截。"),
+    ("AI与推送", "l3_local_spike_push", "checkbox", "L3本地急变推送", "默认关；开启后 L3 scalp_spike 可本地 spike，但微信仍要求更高分或 AI 确认。"),
+    ("AI与推送", "l2_require_volume_or_structure", "checkbox", "L2需放量/结构", "L2 不因 macd 单信号触发；需放量/结构或 macd+第二信号。"),
+    ("AI与推送", "push_cooldown_seconds", "number", "trade推送冷却(秒)", "同键 trade 推送最小间隔，默认900秒。"),
+    ("AI与推送", "spike_push_cooldown_seconds", "number", "spike推送冷却(秒)", "急变 spike 推送冷却，默认900秒。"),
+    ("AI与推送", "watch_push_cooldown_seconds", "number", "watch推送冷却(秒)", "观察 watch 推送冷却，默认900秒；微信 watch 另需 AI 推荐。"),
+    ("AI与推送", "reverse_trade_cooldown_seconds", "number", "反向trade冷却(秒)", "同币种推过多/空 trade 后，反向 trade 冷却，默认300秒。"),
+    ("AI与推送", "signal_forecast_enabled", "checkbox", "启用结构演变预测", "按策略使用独立领先/目标/背景周期；严格结算目标结构确认或窗口内ATR价格命中。"),
+    ("AI与推送", "forecast_push_score", "number", "演变推送门槛", "structure_forecast.probability ≥ 此值时可推 [演变]；微信另需 +7 或 L2+。"),
+    ("AI与推送", "forecast_horizon_minutes", "number", "演变预测时间窗(分)", "实际窗口取此值与策略最低值的较大者：超短10m、短线15m、中线240m、长线2880m。"),
+    ("AI与推送", "forecast_push_cooldown_seconds", "number", "演变推送冷却(秒)", "同方向演变推送冷却，默认1800秒。"),
+    ("自校准", "calibration_enabled", "checkbox", "启用在线自校准", "v2按策略/窗口/场景隔离，使用严格命中率和Brier误差调整概率与推送门槛。"),
+    ("自校准", "calibration_min_samples", "number", "校准最少样本", "某场景样本少于此值时保守缩分；默认8。"),
+    ("自校准", "calibration_blend_weight", "number", "历史权重(0-1)", "样本充足时历史命中率在概率中的权重，默认0.65。"),
+    ("自校准", "calibration_disable_below_hit_rate", "number", "自动降权命中率", "某场景命中率低于此值(0.38=38%)且样本足够时自动禁用，默认0.38。"),
+    ("模拟与前瞻", "paper_follow_ai_only", "checkbox", "模拟仅跟AI前瞻", "模拟账户只跟随 decision_source=ai 的 forward_view 换仓。"),
+    ("模拟与前瞻", "paper_fee_bps", "number", "模拟手续费(bps)", "开/平仓各扣一次单边手续费，默认5bps。"),
+    ("模拟与前瞻", "forward_require_forecast_alignment", "checkbox", "前瞻需演变同向", "AI forward_view 与 structure_forecast 同向才推 trade/演变。"),
+    ("模拟与前瞻", "replay_ai_cache_enabled", "checkbox", "回放AI缓存", "离线回放按 inst+指纹 缓存 AI 响应，便于回归对比。"),
 ]
 
 ENV_DEFAULTS = {
@@ -250,9 +277,27 @@ def default_config() -> Dict[str, Any]:
         "dry_run_ai": False,
         "push_enabled": False,
         "push_score": 75,
-        "short_push_score": 70,
+        "short_push_score": 75,
         "watch_push_score": 65,
         "spike_push_score": 62,
+        "ai_conflict_guard": True,
+        "l3_local_spike_push": False,
+        "l2_require_volume_or_structure": True,
+        "spike_push_cooldown_seconds": 900,
+        "watch_push_cooldown_seconds": 900,
+        "reverse_trade_cooldown_seconds": 300,
+        "signal_forecast_enabled": True,
+        "forecast_push_score": 58,
+        "forecast_horizon_minutes": 15,
+        "forecast_push_cooldown_seconds": 1800,
+        "calibration_enabled": True,
+        "calibration_min_samples": 8,
+        "calibration_blend_weight": 0.65,
+        "calibration_disable_below_hit_rate": 0.38,
+        "paper_follow_ai_only": True,
+        "paper_fee_bps": 5.0,
+        "forward_require_forecast_alignment": True,
+        "replay_ai_cache_enabled": True,
         "volume_multiplier": 2.0,
         "oi_change_pct_15m": 5.0,
         "funding_abs_threshold": 0.0008,
@@ -316,10 +361,16 @@ def push_score_guide_text(risk_preference: str, ai_enabled: bool = False) -> str
     suggested = suggested_push_scores(risk)
     label = RISK_PREFERENCE_LABELS.get(risk, risk)
     ai_note = "已启用 AI：trade 建议可贴近下表。" if ai_enabled else "未启用 AI：建议 trade 取偏保守一档（如标准 75→78~80）。"
+    gap = abs(int(suggested["push_score"]) - int(suggested["short_push_score"]))
+    gap_note = ""
+    if gap < 8:
+        gap_note = f" 注意：做多/做空 trade 门槛差仅 {gap} 分（建议≥8），易压线做空泛滥。"
     return (
         f"当前严格度「{label}」建议 做多 {suggested['push_score']} · 做空 {suggested['short_push_score']} · "
-        f"watch {suggested['watch_push_score']} · spike {suggested['spike_push_score']}。"
-        f"{ai_note} watch/spike 应低于 trade，做空可略低于做多。"
+        f"watch {suggested['watch_push_score']} · spike {suggested['spike_push_score']} · "
+        f"forecast {suggested.get('forecast_push_score', 58)}。"
+        f"{ai_note} watch/spike 应低于 trade；标准模式建议做多/做空对称。"
+        f"{gap_note}"
     )
 
 
@@ -328,7 +379,7 @@ def derive_ai_output_style(config: Dict[str, Any]) -> str:
     mode = str(config.get("strategy_mode", "short") or "short")
     if risk == "aggressive":
         return "momentum"
-    if mode == "swing":
+    if mode in ("swing", "long"):
         return "trend"
     return "steady"
 
@@ -540,6 +591,8 @@ def normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         merged["watch_push_score"] = suggested["watch_push_score"]
     if "spike_push_score" not in loaded:
         merged["spike_push_score"] = suggested["spike_push_score"]
+    if "forecast_push_score" not in loaded:
+        merged["forecast_push_score"] = suggested.get("forecast_push_score", 58)
     if "push_score" not in loaded:
         merged["push_score"] = suggested["push_score"]
     if "short_push_score" not in loaded:
@@ -548,6 +601,12 @@ def normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     merged["short_push_score"] = max(0, min(100, int(merged.get("short_push_score", suggested.get("short_push_score", merged["push_score"])))))
     merged["watch_push_score"] = max(0, min(100, int(merged.get("watch_push_score", suggested["watch_push_score"]))))
     merged["spike_push_score"] = max(0, min(100, int(merged.get("spike_push_score", suggested["spike_push_score"]))))
+    merged["forecast_push_score"] = max(0, min(100, int(merged.get("forecast_push_score", suggested.get("forecast_push_score", 58)))))
+    merged["calibration_min_samples"] = max(3, int(merged.get("calibration_min_samples", 8)))
+    merged["calibration_blend_weight"] = max(0.0, min(1.0, float(merged.get("calibration_blend_weight", 0.65))))
+    merged["calibration_disable_below_hit_rate"] = max(
+        0.1, min(0.9, float(merged.get("calibration_disable_below_hit_rate", 0.38)))
+    )
     merged["allow_scalp_trade"] = merged.get("strategy_mode") == "scalp" or bool(merged.get("allow_scalp_trade"))
     normalize_log_size_config(merged, loaded)
     inst_ids = order_configured_inst_ids(merged.get("inst_ids", [])) or list(PRESET_INSTRUMENTS)
@@ -900,21 +959,23 @@ def log_size_summary_text(config: Dict[str, Any] = None) -> str:
     )
 
 
-def save_config(config: Dict[str, Any]) -> Path:
+def save_config(config: Dict[str, Any]) -> Tuple[Path, bool]:
+    before = load_config()
     normalized = normalize_config(config)
     visible = visible_config_keys()
     to_save = {key: normalized[key] for key in visible if key in normalized}
     text = json.dumps(to_save, indent=2, ensure_ascii=False) + "\n"
+    requires_restart = config_requires_monitor_restart(before, normalized)
     try:
         PORTABLE_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         PORTABLE_CONFIG_FILE.write_text(text, encoding="utf-8")
         if USER_CONFIG_FILE.exists():
             USER_CONFIG_FILE.write_text(text, encoding="utf-8")
-        return PORTABLE_CONFIG_FILE
+        return PORTABLE_CONFIG_FILE, requires_restart
     except PermissionError:
         USER_STATE_DIR.mkdir(parents=True, exist_ok=True)
         USER_CONFIG_FILE.write_text(text, encoding="utf-8")
-        return USER_CONFIG_FILE
+        return USER_CONFIG_FILE, requires_restart
 
 
 def ensure_portable_auth_seed() -> None:
@@ -1189,7 +1250,7 @@ def parse_removed_inst_ids_from_form(form: Dict[str, Any]) -> List[str]:
     return [inst for inst in order_configured_inst_ids(raw) if inst in PRESET_INSTRUMENTS]
 
 
-def update_from_form(form: Dict[str, Any]) -> Path:
+def update_from_form(form: Dict[str, Any]) -> Tuple[Path, Path, bool]:
     config = load_config()
     env = load_env()
     config["inst_ids"] = resolve_configured_inst_ids(form)
@@ -1208,8 +1269,9 @@ def update_from_form(form: Dict[str, Any]) -> Path:
 
     for key, _, _ in ENV_FIELDS:
         env[key] = str(form.get(f"env_{key}", "")).strip()
-    save_config(config)
-    return save_env(env)
+    saved_path, requires_restart = save_config(config)
+    env_path = save_env(env)
+    return saved_path, env_path, requires_restart
 
 
 def export_config_bundle(name: str = "") -> Dict[str, Any]:
@@ -1226,8 +1288,6 @@ def export_config_bundle(name: str = "") -> Dict[str, Any]:
 def import_config_bundle(bundle: Dict[str, Any]) -> None:
     config = bundle.get("config", bundle)
     env = bundle.get("env", {})
-    if not isinstance(config, dict):
-        raise ValueError("配置文件格式错误")
     save_config(config)
     if isinstance(env, dict):
         save_env(env)
@@ -1255,15 +1315,23 @@ def build_monitor_args(config: Dict[str, Any]) -> List[str]:
         "--flag",
         FIXED_OKX_FLAG,
         "--push-score",
-        str(config.get("push_score", 80)),
+        str(config.get("push_score", 75)),
         "--short-push-score",
-        str(config.get("short_push_score", config.get("push_score", 80))),
+        str(config.get("short_push_score", config.get("push_score", 75))),
         "--retry-times",
         str(config.get("retry_times", 3)),
         "--retry-backoff",
         str(config.get("retry_backoff", 1.5)),
         "--push-cooldown",
-        str(config.get("push_cooldown_seconds", 900)),
+        str(config_value(config, "push_cooldown_seconds")),
+        "--spike-push-cooldown",
+        str(config_value(config, "spike_push_cooldown_seconds")),
+        "--watch-push-cooldown",
+        str(config_value(config, "watch_push_cooldown_seconds")),
+        "--reverse-trade-cooldown",
+        str(config_value(config, "reverse_trade_cooldown_seconds")),
+        "--forecast-push-cooldown",
+        str(config_value(config, "forecast_push_cooldown_seconds")),
         "--log-max-bytes",
         str(config.get("log_max_bytes", DEFAULT_LOG_MAX_BYTES)),
         "--log-total-max-bytes",
@@ -1289,10 +1357,44 @@ def build_monitor_args(config: Dict[str, Any]) -> List[str]:
         "--scalp-move-pct-10m",
         str(config.get("scalp_move_pct_10m", 0.35)),
         "--watch-push-score",
-        str(config.get("watch_push_score", 65)),
+        str(config_value(config, "watch_push_score")),
         "--spike-push-score",
-        str(config.get("spike_push_score", 62)),
+        str(config_value(config, "spike_push_score")),
+        "--forecast-push-score",
+        str(config_value(config, "forecast_push_score")),
+        "--forecast-horizon-minutes",
+        str(config.get("forecast_horizon_minutes", 15)),
     ]
+    if config.get("calibration_enabled", True):
+        args.append("--calibration")
+    else:
+        args.append("--no-calibration")
+    args.extend(
+        [
+            "--calibration-min-samples",
+            str(config.get("calibration_min_samples", 8)),
+            "--calibration-blend-weight",
+            str(config.get("calibration_blend_weight", 0.65)),
+            "--calibration-disable-below-hit-rate",
+            str(config.get("calibration_disable_below_hit_rate", 0.38)),
+        ]
+    )
+    if config.get("signal_forecast_enabled", True):
+        args.append("--forecast-alerts")
+    else:
+        args.append("--no-forecast-alerts")
+    if config_value(config, "ai_conflict_guard"):
+        args.append("--ai-conflict-guard")
+    else:
+        args.append("--no-ai-conflict-guard")
+    if config_value(config, "l3_local_spike_push"):
+        args.append("--l3-local-spike-push")
+    else:
+        args.append("--no-l3-local-spike-push")
+    if config_value(config, "l2_require_volume_or_structure"):
+        args.append("--l2-require-volume-or-structure")
+    else:
+        args.append("--no-l2-require-volume-or-structure")
     args.append("--trade-signals" if config.get("signal_trade_enabled", True) else "--no-trade-signals")
     args.append("--watch-signals" if config.get("signal_watch_enabled", True) else "--no-watch-signals")
     args.append("--spike-alerts" if config.get("signal_spike_enabled", True) else "--no-spike-alerts")
@@ -1310,13 +1412,25 @@ def build_monitor_args(config: Dict[str, Any]) -> List[str]:
         args.append("--push")
     if config.get("record_replay_enabled"):
         args.extend(["--record-replay", "--record-replay-file", str(REPLAY_DATASET_FILE)])
+    if config_value(config, "paper_follow_ai_only"):
+        args.append("--paper-follow-ai-only")
+    else:
+        args.append("--no-paper-follow-ai-only")
+    args.extend(["--paper-fee-bps", str(config_value(config, "paper_fee_bps"))])
+    if config_value(config, "forward_require_forecast_alignment"):
+        args.append("--forward-require-forecast-alignment")
+    else:
+        args.append("--no-forward-require-forecast-alignment")
+    if config_value(config, "replay_ai_cache_enabled"):
+        args.append("--replay-ai-cache")
+    else:
+        args.append("--no-replay-ai-cache")
     args.append("--analysis-log")
     return args
 
 
 def build_replay_args(config: Dict[str, Any], replay_interval: float, dataset_path: Path = None) -> List[str]:
     args = build_monitor_args(config)
-    args = [arg for arg in args if arg not in ("--push", "--ai") and arg != "--dry-run-ai"]
     dataset = dataset_path or REPLAY_DATASET_FILE
     args.extend(
         [
@@ -1375,8 +1489,6 @@ def start_replay(replay_interval: float = 0.5, dataset_path: Path = None) -> str
     log_file.write(f"\n===== replay started at {REPLAY_STARTED_AT} dataset={dataset} =====\n")
     log_file.flush()
     config = load_config()
-    config["push_enabled"] = False
-    config["ai_enabled"] = False
     REPLAY_PROCESS = subprocess.Popen(
         build_replay_args(config, replay_interval, dataset),
         cwd=str(SCRIPT_DIR),
@@ -1478,6 +1590,9 @@ def replay_dataset_info(*, lite: bool = False) -> Dict[str, Any]:
         "analysis_log_lines": line_count,
         "analysis_log_bytes": analysis_log_bytes(),
         "replay_log_start_at": REPLAY_LOG_START_AT,
+        "ai_enabled": bool(config.get("ai_enabled")),
+        "dry_run_ai": bool(config.get("dry_run_ai")),
+        "push_enabled": bool(config.get("push_enabled")),
     }
 
 
@@ -1639,7 +1754,7 @@ def get_quick_ticker(inst_id: str) -> Dict[str, Any]:
 
 def normalize_monitor_bar(bar: Any) -> str:
     text = str(bar or "1m").strip()
-    aliases = {"1h": "1H", "4h": "4H"}
+    aliases = {"1h": "1H", "4h": "4H", "1d": "1D", "1w": "1W"}
     normalized = aliases.get(text.lower(), text)
     if normalized not in MONITOR_BAR_CHANNELS:
         raise ValueError(f"不支持的 K 线周期：{bar}，可选 {', '.join(MONITOR_BAR_CHANNELS)}")
@@ -1647,11 +1762,20 @@ def normalize_monitor_bar(bar: Any) -> str:
 
 
 def candle_fetch_limit(bar: str) -> int:
-    return {"1m": 120, "3m": 120, "5m": 120, "15m": 96, "1H": 96, "4H": 72}.get(bar, 120)
+    return {"1m": 120, "3m": 120, "5m": 120, "15m": 96, "1H": 96, "4H": 90, "1D": 120, "1W": 104}.get(bar, 120)
 
 
 def metrics_overlay_window_seconds(bar: str) -> int:
-    return {"1m": 180, "3m": 540, "5m": 900, "15m": 1800, "1H": 7200, "4H": 28800}.get(bar, 180)
+    return {
+        "1m": 180,
+        "3m": 540,
+        "5m": 900,
+        "15m": 1800,
+        "1H": 7200,
+        "4H": 28800,
+        "1D": 172800,
+        "1W": 1209600,
+    }.get(bar, 180)
 
 
 def get_history_candle_points(inst_id: str, bar: str = "1m", limit: int = 120) -> List[Dict[str, Any]]:
@@ -1782,9 +1906,46 @@ def read_paper_account(inst_id: str) -> Dict[str, Any]:
     }
 
 
+def local_analysis_mode_from_log_item(item: Dict[str, Any]) -> bool:
+    """True only when the monitor explicitly recorded AI as disabled for this frame."""
+    snapshot = item.get("config_snapshot")
+    return isinstance(snapshot, dict) and snapshot.get("ai_enabled") is False
+
+
 def effective_fields_from_log_item(item: Dict[str, Any]) -> Dict[str, Any]:
     score = item.get("score") if isinstance(item.get("score"), dict) else {}
     final_decision = item.get("final_decision") if isinstance(item.get("final_decision"), dict) else {}
+    if local_analysis_mode_from_log_item(item):
+        # AI-off is a local-model test mode. Keep score exactly as produced by the
+        # monitor and only attach display metadata; do not let the external
+        # local_screening=观望 wrapper overwrite local direction or levels.
+        merged = dict(score)
+        screening = final_decision.get("local_screening") if isinstance(final_decision.get("local_screening"), dict) else {}
+        structure_forecast = score.get("structure_forecast") if isinstance(score.get("structure_forecast"), dict) else {}
+        local_direction = score.get("final_direction", score.get("direction", "观望"))
+        merged.update(
+            {
+                "direction": local_direction,
+                "final_direction": local_direction,
+                "confidence": score.get("direction_score", score.get("confidence", score.get("final_trade_score", 0))),
+                "local_final_trade_score": score.get("final_trade_score", 0),
+                "push_recommendation": score.get("trade_action_level", "none"),
+                "decision_source": "local_screening",
+                "ai_called": False,
+                "trigger_level": final_decision.get("trigger_level"),
+                "local_hint_direction": local_direction,
+                "local_bias": local_direction,
+                "summary": screening.get("summary") or final_decision.get("summary", ""),
+                "forward_direction": None,
+                "forward_probability": None,
+                "forward_horizon_minutes": None,
+                "structure_forecast_direction": (
+                    structure_forecast.get("direction") if structure_forecast.get("active") else None
+                ),
+                "analysis_mode": "local",
+            }
+        )
+        return merged
     if not final_decision:
         return score
 
@@ -1822,7 +1983,33 @@ def effective_fields_from_log_item(item: Dict[str, Any]) -> Dict[str, Any]:
     )
     if not entry_plan:
         merged["entry_plan"] = {}
+    screening = final_decision.get("local_screening") if isinstance(final_decision.get("local_screening"), dict) else {}
+    forward = final_decision.get("forward_view") if isinstance(final_decision.get("forward_view"), dict) else {}
+    local_bias = final_decision.get("local_bias") or final_decision.get("local_hint_direction") or screening.get("local_bias")
+    structure_forecast = score.get("structure_forecast") if isinstance(score.get("structure_forecast"), dict) else {}
+    merged["local_bias"] = local_bias or score.get("direction", "观望")
+    merged["forward_direction"] = forward.get("direction")
+    merged["forward_probability"] = forward.get("probability")
+    merged["forward_horizon_minutes"] = forward.get("horizon_minutes")
+    merged["structure_forecast_direction"] = structure_forecast.get("direction") if structure_forecast.get("active") else None
     return merged
+
+
+def prediction_direction_from_log_item(item: Dict[str, Any]) -> Tuple[str, str]:
+    """Prediction track for accuracy chart: AI forward_view when available, else raw_direction."""
+    fields = effective_fields_from_log_item(item)
+    decision_source = str(fields.get("decision_source", "") or "")
+    forward = fields.get("forward_direction")
+    if decision_source == "ai" and forward in ("做多", "做空", "观望"):
+        return str(forward), "ai_forward"
+    raw = fields.get("raw_direction")
+    if raw in ("做多", "做空", "观望"):
+        return str(raw), "raw_direction"
+    structure = fields.get("structure_forecast_direction")
+    if structure in ("做多", "做空"):
+        return str(structure), "structure_forecast"
+    fallback = fields.get("final_direction", fields.get("direction", "观望"))
+    return str(fallback or "观望"), "final_fallback"
 
 
 def point_from_log_item(item: Dict[str, Any], price: float) -> Dict[str, Any]:
@@ -1836,6 +2023,7 @@ def point_from_log_item(item: Dict[str, Any], price: float) -> Dict[str, Any]:
     dynamic = item.get("dynamic_thresholds") if isinstance(item.get("dynamic_thresholds"), dict) else {}
     profiles = item.get("trend_profiles") if isinstance(item.get("trend_profiles"), dict) else {}
     data_quality = profiles.get("15m", {}).get("data_quality", {}) if isinstance(profiles.get("15m"), dict) else {}
+    snapshot_quality = item.get("snapshot_quality") if isinstance(item.get("snapshot_quality"), dict) else {}
     profile_15m = profiles.get("15m", {}) if isinstance(profiles.get("15m"), dict) else {}
     trends = score.get("trends") if isinstance(score.get("trends"), dict) else {}
     entry_plan = score.get("entry_plan") if isinstance(score.get("entry_plan"), dict) else {}
@@ -1876,6 +2064,11 @@ def point_from_log_item(item: Dict[str, Any], price: float) -> Dict[str, Any]:
         "push_recommendation": score.get("push_recommendation"),
         "local_final_trade_score": score.get("local_final_trade_score", final_trade_score),
         "local_hint_direction": score.get("local_hint_direction"),
+        "local_bias": score.get("local_bias"),
+        "forward_direction": score.get("forward_direction"),
+        "forward_probability": score.get("forward_probability"),
+        "forward_horizon_minutes": score.get("forward_horizon_minutes"),
+        "structure_forecast_direction": score.get("structure_forecast_direction"),
         "decision_source": score.get("decision_source"),
         "trigger_level": score.get("trigger_level"),
         "summary": score.get("summary"),
@@ -1906,6 +2099,10 @@ def point_from_log_item(item: Dict[str, Any], price: float) -> Dict[str, Any]:
         "volume_threshold_used": context.get("volume_threshold_used", dynamic.get("volume_multiplier_p85")),
         "data_quality_reliable": data_quality.get("is_reliable"),
         "data_quality_count": data_quality.get("confirmed_count"),
+        "snapshot_quality_overall": snapshot_quality.get("overall"),
+        "snapshot_stale_sources": snapshot_quality.get("stale_sources", []),
+        "snapshot_max_source_age_seconds": snapshot_quality.get("max_source_age_seconds"),
+        "snapshot_collection_duration_ms": snapshot_quality.get("collection_duration_ms"),
         "signal_tracking": tracking,
         "signals": [signal.get("type", "") for signal in signals if isinstance(signal, dict)],
         "paper_equity": paper.get("equity"),
@@ -2593,6 +2790,55 @@ def pct_rate(hit: int, total: int) -> float:
     return (hit / total * 100) if total else 0.0
 
 
+PUSH_KIND_LABELS = {
+    "trade": "结构单",
+    "spike": "急变",
+    "watch": "观察",
+    "forecast": "演变",
+}
+PUSH_KIND_PRIORITY = ("trade", "spike", "forecast", "watch")
+
+
+def push_marker_from_log_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    empty: Dict[str, Any] = {
+        "would_push": False,
+        "push_kind": "",
+        "push_kinds": [],
+        "push_direction": "",
+        "push_label": "",
+    }
+    push_analysis = item.get("push_analysis")
+    if not isinstance(push_analysis, dict) or not push_analysis.get("would_push"):
+        return empty
+    tracks = push_analysis.get("tracks") if isinstance(push_analysis.get("tracks"), list) else []
+    would = [track for track in tracks if isinstance(track, dict) and track.get("status") == "would_push"]
+    if not would:
+        return empty
+    kinds: List[str] = []
+    for kind in PUSH_KIND_PRIORITY:
+        if any(str(track.get("kind", "") or "") == kind for track in would):
+            kinds.append(kind)
+    for track in would:
+        kind = str(track.get("kind", "") or "")
+        if kind and kind not in kinds:
+            kinds.append(kind)
+    primary = kinds[0] if kinds else str(would[0].get("kind", "") or "")
+    final_decision = item.get("final_decision") if isinstance(item.get("final_decision"), dict) else {}
+    direction = str(final_decision.get("direction", "观望") or "观望")
+    for track in would:
+        if str(track.get("kind", "") or "") == "forecast":
+            direction = str(track.get("direction", direction) or direction)
+            break
+    kind_labels = [PUSH_KIND_LABELS.get(kind, kind) for kind in kinds]
+    return {
+        "would_push": True,
+        "push_kind": primary,
+        "push_kinds": kinds,
+        "push_direction": direction,
+        "push_label": "+".join(kind_labels) if kind_labels else primary,
+    }
+
+
 def new_paper_account_state() -> Dict[str, Any]:
     return {
         "initial_capital": PAPER_INITIAL_CAPITAL,
@@ -2610,6 +2856,10 @@ def new_paper_account_state() -> Dict[str, Any]:
 
 
 def direction_from_log_item(item: Dict[str, Any]) -> str:
+    if local_analysis_mode_from_log_item(item):
+        score = item.get("score") if isinstance(item.get("score"), dict) else {}
+        direction = score.get("final_direction", score.get("direction", "观望"))
+        return str(direction or "观望")
     final_decision = item.get("final_decision") if isinstance(item.get("final_decision"), dict) else {}
     direction = final_decision.get("direction")
     if direction in ("做多", "做空", "观望"):
@@ -2617,6 +2867,29 @@ def direction_from_log_item(item: Dict[str, Any]) -> str:
     score = item.get("score") if isinstance(item.get("score"), dict) else {}
     direction = score.get("final_direction", score.get("direction", "观望"))
     return str(direction or "观望")
+
+
+def paper_direction_from_log_item(item: Dict[str, Any], *, paper_follow_ai_only: bool = True) -> str:
+    if local_analysis_mode_from_log_item(item):
+        return direction_from_log_item(item)
+    final_decision = item.get("final_decision") if isinstance(item.get("final_decision"), dict) else {}
+    if not paper_follow_ai_only:
+        return direction_from_log_item(item)
+    if str(final_decision.get("decision_source", "") or "") != "ai":
+        return "观望"
+    forward = final_decision.get("forward_view") if isinstance(final_decision.get("forward_view"), dict) else {}
+    direction = forward.get("direction") or final_decision.get("direction", "观望")
+    return str(direction or "观望")
+
+
+def _paper_fee_rate(fee_bps: float) -> float:
+    return max(0.0, float(fee_bps)) / 10000.0
+
+
+def _apply_paper_fee(amount: float, fee_bps: float) -> float:
+    if amount <= 0:
+        return amount
+    return amount * (1.0 - _paper_fee_rate(fee_bps))
 
 
 def _paper_position_from_direction(direction: str) -> str:
@@ -2647,38 +2920,38 @@ def _mark_paper_equity(state: Dict[str, Any], price: float) -> None:
     state["pnl_pct"] = (state["pnl_usd"] / initial * 100) if initial else 0.0
 
 
-def _close_paper_position(state: Dict[str, Any], price: float) -> None:
+def _close_paper_position(state: Dict[str, Any], price: float, fee_bps: float = 5.0) -> None:
     position = state.get("position", "flat")
     entry_price = safe_float(state.get("entry_price"), 0.0)
     basis_equity = safe_float(state.get("basis_equity"), 0.0)
     if position == "long" and entry_price > 0:
-        state["cash"] = basis_equity * (price / entry_price)
+        state["cash"] = _apply_paper_fee(basis_equity * (price / entry_price), fee_bps)
     elif position == "short" and entry_price > 0:
-        state["cash"] = basis_equity * (1 + (entry_price - price) / entry_price)
+        state["cash"] = _apply_paper_fee(basis_equity * (1 + (entry_price - price) / entry_price), fee_bps)
     state["position"] = "flat"
     state["position_label"] = "空仓"
     state["entry_price"] = 0.0
     state["basis_equity"] = 0.0
 
 
-def _open_paper_position(state: Dict[str, Any], position: str, price: float, direction: str) -> None:
+def _open_paper_position(state: Dict[str, Any], position: str, price: float, direction: str, fee_bps: float = 5.0) -> None:
     state["position"] = position
     state["position_label"] = _paper_position_label(position)
     state["entry_price"] = price
-    state["basis_equity"] = safe_float(state.get("cash"), PAPER_INITIAL_CAPITAL)
+    state["basis_equity"] = _apply_paper_fee(safe_float(state.get("cash"), PAPER_INITIAL_CAPITAL), fee_bps)
     state["cash"] = 0.0
     state["direction"] = direction
     state["trade_count"] = int(state.get("trade_count", 0) or 0) + 1
 
 
-def step_paper_account_state(state: Dict[str, Any], price: float, direction: str) -> None:
+def step_paper_account_state(state: Dict[str, Any], price: float, direction: str, fee_bps: float = 5.0) -> None:
     target = _paper_position_from_direction(direction)
     current = state.get("position", "flat")
     if target != current:
         if current != "flat":
-            _close_paper_position(state, price)
+            _close_paper_position(state, price, fee_bps)
         if target != "flat":
-            _open_paper_position(state, target, price, direction)
+            _open_paper_position(state, target, price, direction, fee_bps)
         else:
             state["direction"] = "观望"
             state["position_label"] = "空仓"
@@ -2689,10 +2962,16 @@ def step_paper_account_state(state: Dict[str, Any], price: float, direction: str
     _mark_paper_equity(state, price)
 
 
-def simulate_paper_account_series(items: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-    """按 final_direction 对日志逐轮模拟 $10k 跟单账户，返回 time->状态 与最终状态。"""
+def simulate_paper_account_series(
+    items: List[Dict[str, Any]],
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any], Dict[str, int]]:
+    """按日志 config_snapshot（有则用）或当前配置，对日志逐轮模拟 $10k 跟单账户。"""
+    fallback = config or load_config()
     state = new_paper_account_state()
     by_time: Dict[str, Dict[str, Any]] = {}
+    from_log_snapshot = 0
+    from_current_config = 0
     for item in items:
         try:
             price = float(item.get("price"))
@@ -2700,9 +2979,22 @@ def simulate_paper_account_series(items: List[Dict[str, Any]]) -> Tuple[Dict[str
             continue
         if price <= 0:
             continue
-        step_paper_account_state(state, price, direction_from_log_item(item))
+        settings, source = paper_settings_from_log_item(item, fallback)
+        if source == "log_snapshot":
+            from_log_snapshot += 1
+        else:
+            from_current_config += 1
+        step_paper_account_state(
+            state,
+            price,
+            paper_direction_from_log_item(item, paper_follow_ai_only=settings["paper_follow_ai_only"]),
+            settings["paper_fee_bps"],
+        )
         by_time[str(item.get("time", ""))] = dict(state)
-    return by_time, dict(state)
+    return by_time, dict(state), {
+        "from_log_snapshot": from_log_snapshot,
+        "from_current_config": from_current_config,
+    }
 
 
 def trade_direction_hit(
@@ -2775,6 +3067,103 @@ def next_pending_maturity_seconds(
         remaining = int(max(0, (target - now).total_seconds()))
         wait_seconds = remaining if wait_seconds is None else min(wait_seconds, remaining)
     return wait_seconds or 0
+
+
+def ai_forward_from_log_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Extract AI forward_view for dedicated hit-rate stats (per-item horizon)."""
+    final_decision = item.get("final_decision") if isinstance(item.get("final_decision"), dict) else {}
+    analysis = item.get("analysis") if isinstance(item.get("analysis"), dict) else {}
+    parsed = analysis.get("parsed") if isinstance(analysis.get("parsed"), dict) else {}
+    decision_source = str(final_decision.get("decision_source", "") or "")
+    if decision_source != "ai":
+        return None
+
+    forward = final_decision.get("forward_view") if isinstance(final_decision.get("forward_view"), dict) else {}
+    if not forward and isinstance(parsed.get("forward_view"), dict):
+        forward = parsed.get("forward_view")
+    if not forward and decision_source == "ai":
+        direction = str(final_decision.get("direction", "观望") or "观望")
+        if direction not in ("做多", "做空", "观望"):
+            direction = "观望"
+        forward = {
+            "direction": direction,
+            "horizon_minutes": 15,
+            "probability": final_decision.get("confidence", 0),
+            "summary": final_decision.get("summary", ""),
+            "invalidation": "-",
+        }
+    if not forward:
+        return None
+
+    direction = str(forward.get("direction") or final_decision.get("direction") or "观望")
+    if direction not in ("做多", "做空", "观望"):
+        direction = "观望"
+    try:
+        horizon_minutes = max(5, min(10080, int(round(float(forward.get("horizon_minutes", 15))))))
+    except (TypeError, ValueError):
+        horizon_minutes = 15
+    try:
+        probability = max(0, min(100, int(round(float(forward.get("probability", final_decision.get("confidence", 0)))))))
+    except (TypeError, ValueError):
+        probability = int(final_decision.get("confidence", 0) or 0)
+
+    return {
+        "direction": direction,
+        "horizon_minutes": horizon_minutes,
+        "horizon_seconds": horizon_minutes * 60,
+        "probability": probability,
+        "summary": str(forward.get("summary", "") or "").strip(),
+        "invalidation": str(forward.get("invalidation", "-") or "-"),
+        "decision_source": decision_source,
+        "ai_called": bool(final_decision.get("ai_called")) or bool(analysis),
+    }
+
+
+def evaluate_ai_forward_advice(
+    forward_ctx: Dict[str, Any],
+    price: float,
+    future_path: List[Tuple[datetime, float]],
+    threshold_pct: float,
+) -> Dict[str, Any]:
+    """Validate AI forward_view against future price path (uses forward horizon)."""
+    direction = str(forward_ctx.get("direction", "观望") or "观望")
+    pred_value = direction_value(direction)
+    future_price = future_path[-1][1] if future_path else 0.0
+    future_time = future_path[-1][0].strftime("%Y-%m-%d %H:%M:%S") if future_path else ""
+    actual_return = (future_price - price) / price * 100 if price and future_price else 0.0
+    if actual_return > threshold_pct:
+        actual_value, actual_direction = 1, "上涨"
+    elif actual_return < -threshold_pct:
+        actual_value, actual_direction = -1, "下跌"
+    else:
+        actual_value, actual_direction = 0, "震荡"
+
+    path_returns = [((path_price - price) / price * 100) for _, path_price in future_path if price]
+    max_abs_pct = max(abs(max(path_returns) if path_returns else 0.0), abs(min(path_returns) if path_returns else 0.0))
+    watch_threshold_pct = max(threshold_pct * 4.0, 0.08)
+
+    result = {
+        "future_time": future_time,
+        "future_price": future_price,
+        "direction": direction,
+        "actual_direction": actual_direction,
+        "actual_return_pct": actual_return,
+        "horizon_minutes": forward_ctx.get("horizon_minutes", 15),
+        "probability": forward_ctx.get("probability", 0),
+        "price_strict_hit": pred_value == actual_value,
+        "trade_direction_hit": False,
+        "hit": False,
+        "outcome_type": "ai_watch",
+    }
+    if pred_value == 0:
+        result["hit"] = max_abs_pct <= watch_threshold_pct
+        result["outcome_type"] = "ai_watch_ok" if result["hit"] else "ai_watch_missed"
+        return result
+
+    result["trade_direction_hit"] = trade_direction_hit(pred_value, actual_return, threshold_pct)
+    result["hit"] = result["trade_direction_hit"]
+    result["outcome_type"] = "ai_forward_hit" if result["hit"] else "ai_forward_miss"
+    return result
 
 
 def price_crosses_range(prev_price: float, price: float, low: float, high: float) -> bool:
@@ -2949,6 +3338,17 @@ def empty_accuracy_summary() -> Dict[str, Any]:
         "paper_position_label": "空仓",
         "paper_trade_count": 0,
         "paper_log_points": 0,
+        "ai_invoked_total": 0,
+        "ai_forward_total": 0,
+        "ai_forward_pending": 0,
+        "ai_forward_accuracy_pct": 0.0,
+        "ai_forward_direction_total": 0,
+        "ai_forward_direction_accuracy_pct": 0.0,
+        "ai_forward_watch_total": 0,
+        "ai_forward_watch_accuracy_pct": 0.0,
+        "ai_forward_horizon_minutes": 15,
+        "metric_scopes": dict(ACCURACY_METRIC_SCOPES),
+        "primary_forward_metric": "ai_forward_direction_accuracy_pct",
     }
 
 
@@ -3066,7 +3466,7 @@ def accuracy_report(
         replay_scope=replay_scope,
     )
     next_pending_seconds = next_pending_maturity_seconds(items, price_points, horizon_seconds)
-    paper_by_time, paper_final = simulate_paper_account_series(items)
+    paper_by_time, paper_final, paper_meta = simulate_paper_account_series(items)
     rows = []
     raw_log_total = 0
     pending_total = 0
@@ -3090,8 +3490,18 @@ def accuracy_report(
     watch_baseline_hit = 0
     baseline_watch_hit = 0
     price_strict_hit = 0
+    push_would_total = 0
     signed_error_sum = 0.0
     abs_error_sum = 0.0
+    ai_invoked_total = 0
+    ai_forward_total = 0
+    ai_forward_pending = 0
+    ai_forward_hit = 0
+    ai_forward_direction_total = 0
+    ai_forward_direction_hit = 0
+    ai_forward_watch_total = 0
+    ai_forward_watch_hit = 0
+    ai_horizon_minutes_sum = 0
     for item in items:
         try:
             item_time = parse_history_time(str(item.get("time", "")))
@@ -3141,14 +3551,51 @@ def accuracy_report(
         signed_error = (pred_value - actual_value)
         signed_error_sum += signed_error
         abs_error_sum += abs(signed_error)
+        push_marker = push_marker_from_log_item(item)
+        if push_marker.get("would_push"):
+            push_would_total += 1
+        ai_forward_ctx = ai_forward_from_log_item(item)
+        ai_row: Dict[str, Any] = {}
+        if ai_forward_ctx:
+            ai_invoked_total += 1
+            ai_horizon = int(ai_forward_ctx.get("horizon_seconds", 900) or 900)
+            ai_path, ai_mature = future_price_path(price_points, item_time, ai_horizon)
+            if not ai_mature or not ai_path or not price:
+                ai_forward_pending += 1
+            else:
+                ai_threshold = realtime_accuracy_threshold_pct(ai_horizon)
+                ai_advice = evaluate_ai_forward_advice(ai_forward_ctx, price, ai_path, ai_threshold)
+                ai_forward_total += 1
+                ai_horizon_minutes_sum += int(ai_forward_ctx.get("horizon_minutes", 15) or 15)
+                if ai_advice.get("hit"):
+                    ai_forward_hit += 1
+                if direction_value(ai_forward_ctx.get("direction")) != 0:
+                    ai_forward_direction_total += 1
+                    if ai_advice.get("trade_direction_hit"):
+                        ai_forward_direction_hit += 1
+                else:
+                    ai_forward_watch_total += 1
+                    if ai_advice.get("hit"):
+                        ai_forward_watch_hit += 1
+                ai_row = {
+                    "ai_forward_direction": ai_forward_ctx.get("direction"),
+                    "ai_forward_hit": bool(ai_advice.get("hit")),
+                    "ai_forward_horizon_minutes": ai_forward_ctx.get("horizon_minutes"),
+                    "ai_forward_probability": ai_forward_ctx.get("probability"),
+                    "ai_forward_outcome": ai_advice.get("outcome_type"),
+                }
         item_time_text = item_time.strftime("%Y-%m-%d %H:%M:%S")
         paper = paper_by_time.get(item_time_text, {})
+        prediction_direction, prediction_source = prediction_direction_from_log_item(item)
         rows.append({
             "time": item_time_text,
             "future_time": advice["future_time"],
             "price": price,
             "future_price": advice["future_price"],
             "raw_direction": raw_direction,
+            "prediction_direction": prediction_direction,
+            "prediction_source": prediction_source,
+            "confirm_direction": predicted,
             "final_direction": predicted,
             "actual_direction": advice["actual_direction"],
             "actual_return_pct": advice["actual_return_pct"],
@@ -3175,6 +3622,12 @@ def accuracy_report(
             "paper_pnl_pct": paper.get("pnl_pct"),
             "paper_position": paper.get("position_label"),
             "paper_trade_count": paper.get("trade_count"),
+            "would_push": push_marker.get("would_push", False),
+            "push_kind": push_marker.get("push_kind", ""),
+            "push_kinds": push_marker.get("push_kinds", []),
+            "push_direction": push_marker.get("push_direction", ""),
+            "push_label": push_marker.get("push_label", ""),
+            **ai_row,
         })
     rolling = []
     window = 25
@@ -3188,14 +3641,34 @@ def accuracy_report(
             "return_pct": row["actual_return_pct"],
             "hit": row["hit"],
             "direction": row["final_direction"],
+            "raw_direction": row.get("raw_direction"),
+            "prediction_direction": row.get("prediction_direction"),
+            "prediction_source": row.get("prediction_source"),
+            "confirm_direction": row.get("confirm_direction", row["final_direction"]),
+            "final_direction": row["final_direction"],
             "actual_direction": row["actual_direction"],
             "outcome_type": row.get("outcome_type", ""),
             "paper_equity": row.get("paper_equity"),
             "paper_pnl_usd": row.get("paper_pnl_usd"),
             "paper_pnl_pct": row.get("paper_pnl_pct"),
             "paper_position": row.get("paper_position"),
+            "would_push": row.get("would_push", False),
+            "push_kind": row.get("push_kind", ""),
+            "push_kinds": row.get("push_kinds", []),
+            "push_direction": row.get("push_direction", ""),
+            "push_label": row.get("push_label", ""),
+            "ai_forward_direction": row.get("ai_forward_direction"),
+            "ai_forward_hit": row.get("ai_forward_hit"),
+            "ai_forward_horizon_minutes": row.get("ai_forward_horizon_minutes"),
+            "ai_forward_probability": row.get("ai_forward_probability"),
+            "ai_forward_outcome": row.get("ai_forward_outcome"),
         })
     total = len(rows)
+    ai_forward_horizon_minutes = (
+        int(round(ai_horizon_minutes_sum / ai_forward_total))
+        if ai_forward_total
+        else 15
+    )
     mature_rate_pct = pct_rate(total, raw_log_total)
     prediction_accuracy_pct = pct_rate(decision_hit, decision_total)
     decision_accuracy_pct = prediction_accuracy_pct
@@ -3266,6 +3739,30 @@ def accuracy_report(
             "paper_position_label": paper_final.get("position_label", "空仓"),
             "paper_trade_count": paper_final.get("trade_count", 0),
             "paper_log_points": len(paper_by_time),
+            "push_would_total": push_would_total,
+            "ai_invoked_total": ai_invoked_total,
+            "ai_forward_total": ai_forward_total,
+            "ai_forward_pending": ai_forward_pending,
+            "ai_forward_accuracy_pct": pct_rate(ai_forward_hit, ai_forward_total),
+            "ai_forward_direction_total": ai_forward_direction_total,
+            "ai_forward_direction_accuracy_pct": pct_rate(ai_forward_direction_hit, ai_forward_direction_total),
+            "ai_forward_watch_total": ai_forward_watch_total,
+            "ai_forward_watch_accuracy_pct": pct_rate(ai_forward_watch_hit, ai_forward_watch_total),
+            "ai_forward_horizon_minutes": ai_forward_horizon_minutes,
+            "metric_scopes": dict(ACCURACY_METRIC_SCOPES),
+            "primary_forward_metric": "ai_forward_direction_accuracy_pct",
+            "paper_config_from_log_snapshot": paper_meta.get("from_log_snapshot", 0),
+            "paper_config_from_current": paper_meta.get("from_current_config", 0),
+        },
+        "metric_scopes": dict(ACCURACY_METRIC_SCOPES),
+        "primary_forward_metric": "ai_forward_direction_accuracy_pct",
+        "paper_simulation": {
+            "from_log_snapshot": paper_meta.get("from_log_snapshot", 0),
+            "from_current_config": paper_meta.get("from_current_config", 0),
+            "note": (
+                "模拟 PnL 优先使用每条日志的 config_snapshot；"
+                "无快照行按当前 Web 配置重算（与当时 live paper_account.json 可能不一致）。"
+            ),
         },
         "points": rolling[-max_points:],
         "recent": rows[-20:],
@@ -3323,6 +3820,7 @@ def field_html(key: str, label: str, kind: str, help_text: str, value: Any) -> s
             ("scalp", "超短线"),
             ("short", "短线（推荐）"),
             ("swing", "中线"),
+            ("long", "长线"),
         )
         control = '<select name="' + esc(key) + '">' + "".join(
             f'<option value="{esc(opt)}" {"selected" if current == opt else ""}>{esc(text)}</option>' for opt, text in options
@@ -3403,281 +3901,7 @@ addEventListener('resize',r);r();a();
 
 
 def design_docs_html() -> str:
-    return """
-	<div class="page-panel" data-page="design"><section class="card toolbar-card"><div><h2>设计</h2><p class="section-sub">技术文档：单轮处理流程、AI 熔断与异常告警、推送参数、JSON 字段、Web/托盘接口。监控实现见 <code>okx_signal_monitor.py</code> 的 <code>_process_inst</code>；Windows 托盘与电源行为见附录 D。</p></div><div class="toolbar-right"><a class="button btn-view" href="#help">返回操作手册</a></div></section><div class="help-panel doc-panel">
-	<section class="card help-card"><h2>架构原则</h2>
-	<table class="help-table"><thead><tr><th>层级</th><th>职责</th><th>写入字段</th><th>是否决定推送</th></tr></thead><tbody>
-	<tr><td>本地检测 + 评分</td><td>便宜预筛、方向/价位参考、AI 触发判定</td><td><code>signals</code>、<code>score</code>、<code>local_trigger</code></td><td>否（仅 L1 可走 local 的 watch）</td></tr>
-	<tr><td>AI 分析</td><td>L2/L3 深分析，输出语义结论</td><td><code>analysis</code></td><td>否（需经 merge）</td></tr>
-	<tr><td>final_decision</td><td>权威结论：方向、置信度、推送建议、价位</td><td><code>final_decision</code></td><td>是</td></tr>
-	</tbody></table>
-	<div class="help-note">Web 监控图、压测、微信推送、信号跟踪均优先读 <code>final_decision</code>；<code>score</code> 保留为本地参考分，便于对比 AI 与规则差异。</div>
-	</section>
-	<section class="card help-card"><h2>总览：单轮处理链路</h2>
-	<p>主循环 <code>run_forever → run_once → _process_inst</code>，每个币种每轮固定执行：</p>
-	<ol class="help-list">
-	<li><code>collect_snapshot</code> — 采集市场快照</li>
-	<li><code>detect_signals</code> — 阈值检测，判断「是否值得关注」</li>
-	<li><code>score_snapshot</code> — 本地多层评分，产出参考方向/分数/价位</li>
-	<li><code>evaluate_ai_trigger</code> — 判定 L0–L3，决定是否调用 AI</li>
-	<li><code>analyze_with_ai</code> — 仅 L2/L3 且满足间隔/指纹时执行</li>
-	<li><code>merge_final_decision</code> — AI 有效 JSON → AI 结论；否则 local / local_fallback</li>
-	<li><code>update_signal_tracking</code> — 基于 final_decision 登记/结算样本</li>
-	<li><code>push_gate(final_decision)</code> + <code>push_if_needed</code> — 交易信号微信推送</li>
-	<li><code>_maybe_push_ai_abnormal_alert</code> — AI 长时间异常运维告警（独立于信号推送）</li>
-	<li><code>log_result</code> — 写入 JSONL</li>
-	</ol>
-	<h3>流程图</h3>
-	<div class="flow-chain"><span>采集</span><span>检测</span><span>本地评分</span><span>AI触发</span><span>AI(可选)</span><span>merge</span><span>跟踪</span><span>推送</span><span>AI告警</span><span>JSONL</span></div>
-	<h3>AI 触发等级 evaluate_ai_trigger</h3>
-	<table class="help-table"><thead><tr><th>等级</th><th>典型条件</th><th>调 AI</th><th>推送预期</th></tr></thead><tbody>
-	<tr><td>L0</td><td>无信号</td><td>否</td><td>不推</td></tr>
-	<tr><td>L1</td><td>单条弱信号</td><td>否</td><td>最多 watch，不推 trade</td></tr>
-	<tr><td>L2</td><td>多信号 / 交易类信号 / raw≥72 / 多观察信号</td><td>是（同指纹 <code>AI_CALL_MIN_INTERVAL_SECONDS</code> 内不重复，默认 60s）</td><td>看 final_decision</td></tr>
-	<tr><td>L3</td><td>scalp 急速异动 或 资金费率极端</td><td>是（可 bypass 间隔）</td><td>看 final_decision，可能 spike</td></tr>
-	</tbody></table>
-	</section>
-	<section class="card help-card"><h2>第一阶段：数据采集 collect_snapshot</h2>
-	<table class="help-table"><thead><tr><th>数据</th><th>用途</th></tr></thead><tbody>
-	<tr><td>ticker（最新价、买卖价）</td><td>价格基准</td></tr>
-	<tr><td>多周期 K 线（1m/3m/5m/15m/1H/4H）</td><td>趋势、结构、技术指标</td></tr>
-	<tr><td>1m 成交量统计</td><td>放量检测</td></tr>
-	<tr><td>OI 持仓量</td><td>15 分钟变化率</td></tr>
-	<tr><td>资金费率</td><td>过热 / 快速变化</td></tr>
-	<tr><td>5m 多空比</td><td>拥挤度</td></tr>
-	<tr><td>订单簿 top20</td><td>盘口压力</td></tr>
-	</tbody></table>
-	<p>衍生：<code>trend_profiles</code>（各周期 EMA/ADX/结构 trend 标签）、<code>volatility</code>、<code>dynamic_thresholds</code>、<code>market_context</code>（含 bias、trade_up/down、recent_move_pct 含 20m）。OI/资金费率按分钟采样，<strong>满 15 分钟预热</strong>后变化类信号才生效。</p>
-	</section>
-	<section class="card help-card"><h2>第二阶段：信号检测 detect_signals</h2>
-	<p>职责：判断「是否值得进一步分析」，<strong>不直接定最终交易方向</strong>。以下任一满足即追加 signal（可多条并存）：</p>
-	<table class="help-table"><thead><tr><th>信号类型</th><th>触发条件（概要）</th></tr></thead><tbody>
-	<tr><td><code>volume_spike</code></td><td>1m 放量 ≥ max(用户阈值, 动态 P85)</td></tr>
-	<tr><td><code>structure_break</code></td><td>5m/15m 结构突破 up/down</td></tr>
-	<tr><td><code>boll_squeeze</code></td><td>15m 布林收口 + ADX 偏弱</td></tr>
-	<tr><td><code>rsi_divergence</code></td><td>15m RSI 顶/底背离</td></tr>
-	<tr><td><code>rsi_extreme</code></td><td>15m RSI ≥80 或 ≤20</td></tr>
-	<tr><td><code>macd_momentum_change</code></td><td>MACD 柱体斜率显著</td></tr>
-	<tr><td><code>oi_change</code></td><td>预热完成 且 |15m OI 变化| ≥ 配置阈值</td></tr>
-	<tr><td><code>funding_hot</code></td><td>|资金费率| ≥ 绝对值阈值</td></tr>
-	<tr><td><code>funding_fast_change</code></td><td>预热完成 且 |15m 费率变化| ≥ 阈值</td></tr>
-	<tr><td><code>long_short_extreme</code></td><td>多/空账户占比 ≥ 75%</td></tr>
-	<tr><td><code>order_book_imbalance</code></td><td>top20 盘口不平衡 ≥ max(0.35, 动态 P85)</td></tr>
-	</tbody></table>
-	<div class="help-note">检测不受「交易/观察/急速异动」推送开关影响；开关只影响 push_gate 最终是否发出对应类型。</div>
-	</section>
-	<section class="card help-card"><h2>第三阶段：本地评分 score_snapshot（参考分 → 权威方向）</h2>
-	<h3>方向决策流水线（与配置页「策略周期」「确认严格度」联动）</h3>
-	<ol class="help-list">
-	<li><code>_raw_direction_for_mode</code> — 按当前 <code>strategy_mode</code> 选路径：scalp / short / swing 各自独立逻辑（见下）</li>
-	<li><code>_direction_guard</code> — 按策略 + 风险偏好拦截逆势/结构不足（如短线 neutral 时 trade 票不足）</li>
-	<li><code>_suggest_levels</code> + <code>_should_downgrade_direction</code> — 入场质量与观察分不足时降为观望</li>
-	<li><code>strategy_views</code> — 每轮同时计算三种策略视图（scalp / short / swing）</li>
-	<li><code>_apply_selected_strategy_view</code> — <strong>仅当前 strategy_mode</strong> 且无 guard 时，用对应视图覆盖 <code>final_direction</code>、价位与展示分</li>
-	</ol>
-	<div class="flow-chain"><span>raw_direction</span><span>guard</span><span>降级</span><span>三视图</span><span>选中视图覆盖</span><span>final_direction</span></div>
-	<p>七层评分加权 → <code>raw_total_score</code>（0–100）；权重随 strategy_mode 的 <code>score_weights</code> 变化。有方向时 <code>final_trade_score</code> 来自当前 strategy_view；推送与 merge 后的 <code>final_decision.confidence</code> 为准，本地 <code>score</code> 供对比与 fallback。</p>
-	<h3>做空分数为何常慢于做多</h3>
-	<p>短线策略对做空常需 5m+15m 同向、20m 跌幅延伸等结构确认，<code>final_trade_score</code> 从 70+ 爬到 trade 门槛可能晚于方向已判空。这是确认链设计，不是推送 bug。若希望更早收到做空 trade 推送，可在配置页将 <code>short_push_score</code> 设为低于 <code>push_score</code>（建议差 4–6 分）。</p>
-	<h3>15m 趋势标签（短线/中线共用瓶颈）</h3>
-	<p>策略判断用的是 <code>trend_profiles["15m"].trend</code>（EMA9/20/60 排列 + 近 4 根 15m 斜率），<strong>不是</strong>简单数几根阳线。日志里 <code>score.trends["15m"]</code> 仅为 5 根首尾对比，可能与 profile 不一致；<strong>以 profile 为准</strong>。急涨时 15m 常长期为 <code>mixed</code>，故短线/中线都会滞后。</p>
-	<h3>多策略视图 strategy_views（三选一覆盖 final）</h3><div class="help-grid">
-	<div class="help-item"><strong>scalp 超短线</strong><p><em>主看 1m/3m/5m，持仓 3–15 分钟。</em> 5m/10m 涨跌幅达阈值（默认约 0.22%/0.35%，随严格度缩放），或 1m/3m/5m 投票 + 反弹/回落形态。<strong>过滤：</strong>15m profile 明显反向时不追小脉冲。仅 <code>strategy_mode=scalp</code>（或 allow_scalp_trade）时主方向可执行；否则视图仅供参考、L3/spike 仍可触发。</p></div>
-	<div class="help-item"><strong>short 短线</strong><p><em>主看 5m+15m profile，持仓 15 分钟–数小时。</em> 由严到宽：① bias 偏多且 5m/15m 未背离 ② 5m+15m 均 <code>up/down</code> ③ developing：同向 + 20m 延伸 ④ momentum：20m 达阈值且 15m 已 <code>up/down</code>。<strong>标准模式无</strong>「单靠短窗 pressure」档（仅激进有）。止损参考 15m ATR。</p></div>
-	<div class="help-item"><strong>swing 中线</strong><p><em>主看 1H/4H，15m 确认，持仓数小时–数天。</em> aligned：1H+4H 同向；developing：1H 领先 + 15m 确认 + 4H 不反向；momentum：30–60 分钟延伸。动量档允许 15m 为 <code>mixed</code>（比短线宽）。止损参考 1H ATR。</p></div>
-	</div>
-	<h3>确认严格度 risk_preference（与策略正交）</h3>
-	<table class="help-table"><thead><tr><th>档位</th><th>动量阈值</th><th>wait_confirmation 保留方向约需分</th><th>其它</th></tr></thead><tbody>
-	<tr><td>保守</td><td>×1.15（要更大波动）</td><td>scalp ≥61 / short ≥67 / swing ≥65</td><td>短线 neutral 需 5m+15m 双票；风控层 ×1.15</td></tr>
-	<tr><td>标准</td><td>×1.0</td><td>scalp ≥55 / short ≥60 / swing ≥58</td><td>短线 neutral 需 1 票；默认推荐</td></tr>
-	<tr><td>激进</td><td>×0.9（scalp ×0.82）</td><td>scalp ≥55 / short ≥60 / swing ≥58</td><td>短线可凭 pressure 给方向；scalp guard 最松</td></tr>
-	</tbody></table>
-	<h3>周期分工（避免混用预期）</h3>
-	<table class="help-table"><thead><tr><th>行情特征</th><th>更合适策略</th></tr></thead><tbody>
-	<tr><td>5–10 分钟脉冲，15m 尚未转多</td><td>超短线（主策略须选 scalp）</td></tr>
-	<tr><td>20–40 分钟延伸，5m+15m profile 同向</td><td>短线</td></tr>
-	<tr><td>30–60 分钟及以上，1H/4H 结构</td><td>中线</td></tr>
-	</tbody></table>
-	</section>
-	<section class="card help-card"><h2>第四阶段：AI 触发 evaluate_ai_trigger</h2>
-	<p>在 <code>ai_enabled=true</code> 时，仅 L2/L3 可能置 <code>should_call_ai=true</code>。L2 需满足：指纹变化、或首次调用、或距上次调用 ≥ <code>AI_CALL_MIN_INTERVAL_SECONDS</code>（默认 60）。L3 可跳过间隔。</p>
-	<p>未调 AI 时，<code>merge_final_decision</code> 走 <code>decision_source=local</code>；L1 时 local 的 trade 建议会降级为 watch 或 none。</p>
-	</section>
-	<section class="card help-card"><h2>第五阶段：AI 分析 analyze_with_ai</h2>
-	<p><strong>前置：</strong><code>should_call_ai=true</code>。本地 <code>score</code> 与 <code>local_hint</code> 仅作参考，AI 需独立输出 direction、confidence、push_recommendation 等。</p>
-	<table class="help-table"><thead><tr><th>条件</th><th>结果</th></tr></thead><tbody>
-	<tr><td><code>ai_enabled=false</code></td><td>不调用，merge 走 local</td></tr>
-	<tr><td><code>dry_run_ai=true</code></td><td>只构造 payload，不调 API</td></tr>
-	<tr><td>API Key 未配置 / openai 未安装</td><td>merge 走 local_fallback</td></tr>
-	<tr><td>AI 熔断 open</td><td>探活失败则 local_fallback</td></tr>
-	<tr><td>以上通过</td><td>chat completion → 解析 JSON</td></tr>
-	</tbody></table>
-	<p>校验：<code>_validate_ai_result</code>。JSON 无效或缺字段 → 保留原文但 merge 为 local_fallback。AI payload 的 <code>analysis_config.push_thresholds</code> 含 <code>trade_long</code> / <code>trade_short</code>，与配置页做多/做空门槛一致。</p>
-	<h3>AI 熔断（circuit breaker）</h3>
-	<p>连续失败达到 <code>AI_CIRCUIT_FAIL_THRESHOLD</code>（默认 3）后进入 <strong>open</strong> 状态，暂停调用 API，改走 local_fallback；冷却 <code>AI_CIRCUIT_COOLDOWN_SECONDS</code>（默认 120s）后进入 <strong>half_open</strong>，按 <code>AI_PROBE_INTERVAL_SECONDS</code>（默认 60s）发轻量 ping 探活。探活成功 → 关闭熔断；失败 → 重新 open。</p>
-	<table class="help-table"><thead><tr><th>状态</th><th>行为</th></tr></thead><tbody>
-	<tr><td><code>closed</code></td><td>正常调用 AI</td></tr>
-	<tr><td><code>open</code></td><td>跳过 chat，本地兜底；周期性探活</td></tr>
-	<tr><td><code>half_open</code></td><td>冷却结束，等待下一次探活窗口</td></tr>
-	</tbody></table>
-	<p>不可重试错误（如 401 鉴权失败）会立即拉满失败计数并开熔断。请求层另有 <code>RETRY_TIMES</code> / <code>AI_REQUEST_TIMEOUT</code> 控制单次 chat 重试。</p>
-	<h3>AI 长时间异常微信告警</h3>
-	<p>每轮 <code>run_once</code> 结束时调用 <code>_maybe_push_ai_abnormal_alert</code>。当 <code>ai_enabled=true</code> 且异常持续 ≥ <code>AI_ABNORMAL_ALERT_SECONDS</code>（默认 300s）时，经 Server酱 发送<strong>运维告警</strong>（标题含异常类型，正文含<strong>失败原因</strong>、持续时长、熔断状态、连续失败次数、模型与接口地址）。</p>
-	<table class="help-table"><thead><tr><th>异常类型</th><th>典型原因</th></tr></thead><tbody>
-	<tr><td><code>request_failed</code></td><td>chat 重试耗尽：超时、连接失败、429 等</td></tr>
-	<tr><td><code>circuit_open</code></td><td>熔断中，探活尚未恢复</td></tr>
-	<tr><td><code>probe_failed</code></td><td>半开探活 ping 失败</td></tr>
-	<tr><td><code>config_missing</code></td><td>未配置 AI_API_KEY / OPENAI_API_KEY</td></tr>
-	<tr><td><code>package_missing</code></td><td>未安装 openai 包</td></tr>
-	</tbody></table>
-	<p>告警与<strong>交易信号推送</strong>独立：不依赖 <code>push_enabled</code>，仅需 <code>WECHAT_SEND_KEY</code>。同类告警最短间隔 <code>AI_ABNORMAL_ALERT_COOLDOWN_SECONDS</code>（默认 3600s）。AI 恢复后自动清除异常状态；回放模式不发告警。</p>
-	</section>
-	<section class="card help-card"><h2>第六阶段：合并 merge_final_decision</h2>
-	<table class="help-table"><thead><tr><th>decision_source</th><th>含义</th></tr></thead><tbody>
-	<tr><td><code>ai</code></td><td>AI 返回有效 JSON，由 <code>_build_ai_final_decision</code> 生成</td></tr>
-	<tr><td><code>local</code></td><td>未调 AI（L0/L1 或 ai 关闭），由本地规则生成</td></tr>
-	<tr><td><code>local_fallback</code></td><td>已调 AI 但失败/无效，回退本地规则</td></tr>
-	</tbody></table>
-	<p><code>final_decision</code> 核心字段：<code>direction</code>、<code>confidence</code>、<code>push_recommendation</code>（none/watch/trade/spike）、<code>entry/stop_loss/take_profit</code>、<code>risk_level</code>、<code>reasons</code>、<code>rule_audit</code>、<code>trigger_level</code>。</p>
-	<p>AI 侧 <code>push_recommendation</code> 可由模型显式给出；否则由 direction、confidence、audit、trigger level 推导。audit 为「不可信」时 trade 会降级。</p>
-	<h3>trade 门槛：做多 / 做空分开</h3>
-	<table class="help-table"><thead><tr><th>配置项</th><th>用途</th><th>代码入口</th></tr></thead><tbody>
-	<tr><td><code>push_score</code></td><td>做多 trade 推送最低 confidence</td><td><code>trade_push_score("做多")</code></td></tr>
-	<tr><td><code>short_push_score</code></td><td>做空 trade 推送最低 confidence</td><td><code>trade_push_score("做空")</code></td></tr>
-	<tr><td><code>watch_push_score</code></td><td>watch 推送（方向无关）</td><td><code>push_gate</code> / watch 推导</td></tr>
-	<tr><td><code>spike_push_score</code></td><td>L3 急速异动 spike</td><td><code>push_gate</code> / scalp 视图</td></tr>
-	</tbody></table>
-	<p><code>_derive_push_recommendation</code>、<code>_push_kind</code>、<code>push_gate</code>、AI prompt 的 <code>push_thresholds.trade_long/trade_short</code> 均使用上述分工。模拟跟单与压测方向判定<strong>不读</strong> trade 门槛，只看 <code>final_direction</code>。</p>
-	</section>
-	<section class="card help-card"><h2>第七阶段：信号跟踪 update_signal_tracking</h2>
-	<ul class="help-list"><li>依据 <code>final_decision.direction</code> 与 <code>confidence</code> 登记样本（trade/spike 且 confidence ≥ max(70, trade_push_score(direction)−10)）</li><li>价格触达 entry → active_review，跟踪 MFE/MAE</li><li>到期结算 → <code>signal_performance.jsonl</code></li></ul>
-	<p>与微信推送无直接关系，供压测与复盘；登记门槛同样区分做多/做空 trade 分。</p>
-	</section>
-	<section class="card help-card"><h2>第八阶段：微信推送 push_gate</h2>
-	<h3>8.1 交易信号推送（push_if_needed）</h3>
-	<ol class="help-list"><li><code>signals</code> 非空</li><li><code>final_decision.push_recommendation</code> ≠ none</li><li><code>push_gate</code> 校验 confidence 阈值与类型开关</li><li>不在冷却期</li><li><code>push_enabled</code> + <code>WECHAT_SEND_KEY</code> 决定是否真发</li></ol>
-	<table class="help-table"><thead><tr><th>push_recommendation</th><th>push_gate 额外校验</th></tr></thead><tbody>
-	<tr><td><strong>trade</strong></td><td>direction 为做多/做空，confidence ≥ push_score（做多）或 short_push_score（做空）</td></tr>
-	<tr><td><strong>watch</strong></td><td>confidence ≥ watch_push_score；本地来源需命中观察类信号或 AI 来源</td></tr>
-	<tr><td><strong>spike</strong></td><td>confidence ≥ spike_push_score；L3 超短线急速异动</td></tr>
-	</tbody></table>
-	<p>冷却 key：<code>{push_kind}:{inst_id}:{direction}:{信号类型组合}</code>，间隔 <code>PUSH_COOLDOWN_SECONDS</code>（默认 900s）。推送正文展示「做多 / 做空 / watch / spike」四类门槛。</p>
-	<h3>8.2 AI 异常运维告警（_maybe_push_ai_abnormal_alert）</h3>
-	<p>与 8.1 无关：即使关闭「启用微信推送」，只要配置了 <code>WECHAT_SEND_KEY</code> 且 AI 长时间异常，仍会发告警。正文包含失败原因与排查建议；详见第五阶段「AI 长时间异常微信告警」。</p>
-	</section>
-	<section class="card help-card"><h2>第九阶段：日志 log_result</h2>
-	<p>配置页设置<strong>单文件日志上限</strong>与<strong>日志总容量上限</strong>（默认 500MB / 1500MB）。当前分卷满则轮转为 <code>.jsonl.1</code>、<code>.jsonl.2</code> …；合计超过总容量时删除最旧分卷。写入 <code>okx_signal_analysis.jsonl</code> 系列：<code>score</code>（本地参考）、<code>local_trigger</code>、<code>analysis</code>、<code>final_decision</code>（权威）。控制台以 <code>【AI分析/本地规则/本地兜底】</code> 前缀输出触发原因、分析结论与推送摘要；详细 debug 设 <code>CONSOLE_VERBOSE=1</code>。</p>
-	<h3>关键配置对照</h3>
-	<table class="help-table"><thead><tr><th>Web 可配项</th><th>影响阶段</th></tr></thead><tbody>
-	<tr><td>策略周期 / 确认严格度</td><td>raw_direction 路径、guard、降级门槛、strategy_view 覆盖、动量阈值、score_weights</td></tr>
-	<tr><td>push_score / short_push_score</td><td>做多 / 做空 trade 微信推送门槛（<code>trade_push_score</code>）</td></tr>
-	<tr><td>watch_push_score / spike_push_score</td><td>watch / spike 推送门槛</td></tr>
-	<tr><td>ai_enabled / push_enabled</td><td>是否调 AI / 是否发<strong>交易信号</strong>微信</td></tr>
-	<tr><td>单文件 / 总日志容量</td><td>分卷轮转与最旧分卷回收；Web API 读取分析日志时默认 tail 16MB（压测 32MB），非全量扫描</td></tr>
-	<tr><td>AI 密钥与 Base URL</td><td>AI 连接</td></tr>
-	</tbody></table>
-	<h3>环境变量（监控进程，Web 未暴露）</h3>
-	<table class="help-table"><thead><tr><th>变量</th><th>默认</th><th>说明</th></tr></thead><tbody>
-	<tr><td><code>AI_CIRCUIT_FAIL_THRESHOLD</code></td><td>3</td><td>连续失败几次后开熔断</td></tr>
-	<tr><td><code>AI_CIRCUIT_COOLDOWN_SECONDS</code></td><td>120</td><td>熔断冷却时长</td></tr>
-	<tr><td><code>AI_PROBE_INTERVAL_SECONDS</code></td><td>60</td><td>熔断期间探活间隔</td></tr>
-	<tr><td><code>AI_CALL_MIN_INTERVAL_SECONDS</code></td><td>60</td><td>同指纹 L2 重复调 AI 最短间隔</td></tr>
-	<tr><td><code>AI_REQUEST_TIMEOUT</code></td><td>30</td><td>单次 chat 超时（秒）</td></tr>
-	<tr><td><code>AI_ABNORMAL_ALERT_SECONDS</code></td><td>300</td><td>AI 异常持续多久后发微信告警</td></tr>
-	<tr><td><code>AI_ABNORMAL_ALERT_COOLDOWN_SECONDS</code></td><td>3600</td><td>同类 AI 告警最短间隔</td></tr>
-	<tr><td><code>PUSH_COOLDOWN_SECONDS</code></td><td>900</td><td>交易信号推送冷却</td></tr>
-	<tr><td><code>RETRY_TIMES</code> / <code>RETRY_BACKOFF_SECONDS</code></td><td>3 / 1.5</td><td>HTTP 与 AI 请求重试</td></tr>
-	<tr><td><code>CONSOLE_VERBOSE</code></td><td>0</td><td>设为 1 输出更多 debug</td></tr>
-	<tr><td><code>OKX_CIRCUIT_FAIL_THRESHOLD</code></td><td>5</td><td>OKX 连续失败几次后全局熔断</td></tr>
-	<tr><td><code>OKX_CIRCUIT_COOLDOWN_SECONDS</code></td><td>90</td><td>OKX 熔断冷却时长</td></tr>
-	<tr><td><code>REPLAY_DATASET_MAX_BYTES</code></td><td>500MB</td><td>replay 数据集单文件轮转阈值</td></tr>
-	<tr><td><code>REPLAY_DATASET_TOTAL_MAX_BYTES</code></td><td>1500MB</td><td>replay 数据集总容量上限</td></tr>
-	</tbody></table>
-	<h3>环境变量（Web 控制台，可选）</h3>
-	<table class="help-table"><thead><tr><th>变量</th><th>默认</th><th>说明</th></tr></thead><tbody>
-	<tr><td><code>WEB_REALTIME_LOG_TAIL_BYTES</code></td><td>16MB</td><td>监控图表读分析日志 tail 上限</td></tr>
-	<tr><td><code>WEB_ACCURACY_LOG_TAIL_BYTES</code></td><td>32MB</td><td>压测 API 读分析日志 tail 上限</td></tr>
-	<tr><td><code>WEB_LOG_DISPLAY_MAX_LINES</code></td><td>2000</td><td>日志页 textarea 最多显示行数</td></tr>
-	<tr><td><code>WEB_CONSOLE_LOG_MAX_BYTES</code></td><td>100MB</td><td>控制台日志单文件轮转（启动/读取/状态轮询时检查）</td></tr>
-	<tr><td><code>WEB_API_CACHE_TTL_SECONDS</code></td><td>3</td><td>monitor-candles / accuracy-data 短缓存</td></tr>
-	<tr><td><code>WEB_CANDLE_CACHE_TTL_SECONDS</code></td><td>45</td><td>Web 侧 OKX K 线 REST 缓存</td></tr>
-	<tr><td><code>WEB_SESSION_TTL_SECONDS</code></td><td>7 天</td><td>登录会话滑动过期</td></tr>
-	<tr><td><code>WEB_SESSION_ABSOLUTE_TTL_SECONDS</code></td><td>30 天</td><td>登录会话绝对最长寿命</td></tr>
-	<tr><td><code>WEB_MONITOR_AUTO_RESTART</code></td><td>1</td><td>监控子进程意外退出时自动重启</td></tr>
-	<tr><td><code>WEB_MONITOR_MAX_AUTO_RESTARTS</code></td><td>5</td><td>每窗口内最多自动重启次数</td></tr>
-	<tr><td><code>WEB_MONITOR_CRASH_ALERT</code></td><td>1</td><td>意外退出时发微信运维告警（需 SendKey）</td></tr>
-	<tr><td><code>WEB_MAX_CONCURRENT_REQUESTS</code></td><td>48</td><td>Web HTTP 并发上限</td></tr>
-	<tr><td><code>OKX_LAUNCHED_BY_TRAY</code></td><td>—</td><td>由 <code>tray_launcher.py</code> 注入（只读）；Web 电源关机/重启会通过退出码通知托盘同步退出或重拉子进程</td></tr>
-	<tr><td><code>OKX_WEB_SKIP_BROWSER</code></td><td>—</td><td>设为 1 时 Web 启动不自动开浏览器（托盘/重启场景）</td></tr>
-	</tbody></table>
-	<p>以下使用内置默认，不在 Web 暴露：策略检测阈值、高级 scalp 开关、trade/watch/spike 通道开关（默认全开）、日志轮转细节等。</p>
-	<div class="help-note">一句话：本地负责「发现异常 + 决定是否叫 AI」；AI 负责「被叫时的主决策」；final_decision 负责「推送、跟踪、Web 展示」的统一出口。</div>
-	</section>
-	<section class="card help-card"><h2>附录 A：采集参数与技术指标</h2>
-	<h3>采集的数据</h3><div class="help-grid">
-	<div class="help-item"><strong>行情与K线</strong><p>默认提供 BTC/ETH 快捷选项，也可在配置页通过「增加新币种」添加更多 OKX USDT 永续（添加时会校验）。每轮采集 ticker、买卖一档、1m/3m/5m/15m/1H/4H K线；每个周期请求最近 <code>200</code> 根。</p></div>
-	<div class="help-item"><strong>合约资金数据</strong><p>OI、资金费率、5m 多空比。OI/费率按约 <code>60s</code> 采样，保留约 <code>3小时</code>，用于 15m 变化与资金状态。</p></div>
-	<div class="help-item"><strong>盘口数据</strong><p>前 20 档订单簿，top5/top20 不平衡与价差；缓存约 5s，仅作入场确认与风险修正。</p></div>
-	<div class="help-item"><strong>运行内统计</strong><p>放量倍数、ATR%、盘口不平衡按约 60s 采样；动态阈值来自近 3h 分位数；结算样本 → <code>signal_performance.jsonl</code>。</p></div>
-	</div>
-	<h3>计算的技术指标</h3><table class="help-table"><thead><tr><th>类别</th><th>指标</th><th>用途</th></tr></thead><tbody>
-	<tr><td>趋势</td><td>EMA9/20/60/120、MA120、结构高低点、ADX/+DI/-DI</td><td>趋势排列、强度、多周期共振、震荡识别。</td></tr>
-	<tr><td>动量</td><td>RSI6/14/24、MACD、KDJ、实体占比、RSI 背离</td><td>动能增强/衰减/过热/背离。</td></tr>
-	<tr><td>波动</td><td>ATR、ATR%、布林带、带宽</td><td>高/低波动、挤压；入场/止损/止盈锚点。</td></tr>
-	<tr><td>量价</td><td>1m 放量倍数、量能方向、近 5 根趋势</td><td>突破/回踩量能确认。</td></tr>
-	<tr><td>合约资金</td><td>OI 15m 变化、费率及变化、多空比</td><td>新增仓、平仓、拥挤、过热。</td></tr>
-	<tr><td>数据质量</td><td>确认 K 线数、各指标 ready 标志</td><td>15m 确认 K 少于 35 根会降低趋势/动量分。</td></tr>
-	</tbody></table>
-	<h3>八层评分（score.layer_scores）</h3>
-	<ul class="help-list"><li><code>market_regime_score</code> — 市场状态</li><li><code>trend_score</code> / <code>momentum_score</code></li><li><code>volume_price_score</code> / <code>derivatives_score</code></li><li><code>orderbook_score</code> / <code>entry_quality_score</code> / <code>risk_control_score</code></li></ul>
-	</section>
-	<section class="card help-card"><h2>附录 B：推送分数建议（配置页）</h2>
-	<table class="help-table"><thead><tr><th>配置项</th><th>含义</th><th>保守</th><th>标准</th><th>激进</th></tr></thead><tbody>
-	<tr><td><code>push_score</code></td><td>做多 trade</td><td>80</td><td>75</td><td>70</td></tr>
-	<tr><td><code>short_push_score</code></td><td>做空 trade</td><td>74</td><td>70</td><td>65</td></tr>
-	<tr><td><code>watch_push_score</code></td><td>watch</td><td>72</td><td>65</td><td>62</td></tr>
-	<tr><td><code>spike_push_score</code></td><td>spike</td><td>68</td><td>62</td><td>58</td></tr>
-	</tbody></table>
-	<p>配置页可按「确认严格度」一键填入。做空门槛通常比做多低 4–6 分，以补偿结构确认链更长。</p>
-	</section>
-	<section class="card help-card"><h2>附录 C：JSON / Snapshot 字段</h2>
-	<table class="help-table"><thead><tr><th>字段</th><th>来源</th><th>说明</th></tr></thead><tbody>
-	<tr><td><code>final_decision.direction</code></td><td>merge</td><td>权威方向；Web 图表/压测/推送均优先读此字段。</td></tr>
-	<tr><td><code>final_decision.confidence</code></td><td>merge / AI</td><td>推送 trade 时：做多 ≥ push_score，做空 ≥ short_push_score。</td></tr>
-	<tr><td><code>final_decision.push_recommendation</code></td><td>merge / AI</td><td>none / watch / trade / spike。</td></tr>
-	<tr><td><code>decision_source</code></td><td>merge</td><td>ai / local / local_fallback。</td></tr>
-	<tr><td><code>trigger_level</code></td><td>local_trigger</td><td>L0–L3；L2/L3 才可能调 AI。</td></tr>
-	<tr><td><code>score.raw_total_score</code></td><td>本地</td><td>观察分；与 confidence 可不一致。</td></tr>
-	<tr><td><code>score.final_trade_score</code></td><td>strategy_view</td><td>本地交易分；AI 有效时以 confidence 为准。</td></tr>
-	<tr><td><code>score.trends["15m"]</code> vs <code>trend_profiles["15m"].trend</code></td><td>本地</td><td>二者可能不一致；<strong>策略方向以后者为准</strong>。</td></tr>
-	<tr><td><code>analysis.error</code></td><td>AI</td><td>请求失败或熔断时的错误文本；local_fallback 时 merge 仍走本地规则。</td></tr>
-	<tr><td><code>analysis.ai_status</code></td><td>AI</td><td>如 <code>circuit_open</code>、<code>open</code> 等连接状态。</td></tr>
-	<tr><td><code>oi_warmup_ready</code> / <code>funding_warmup_ready</code></td><td>snapshot</td><td>满 15 分钟后 OI/费率变化类信号才完全生效。</td></tr>
-	</tbody></table>
-	<h3>入场 / 止损 / 止盈</h3>
-	<ul class="help-list"><li>由 ATR、结构位、EMA/VWAP 生成入场区；止损为结构失效 + ATR 缓冲；止盈约 1R/2R 两档。</li><li>信号跟踪：触达 entry → 统计 MFE/MAE → 写入 <code>signal_performance.jsonl</code>。</li></ul>
-	</section>
-	<section class="card help-card"><h2>附录 D：Web 控制台 web_control_panel.py</h2>
-	<p>Web 进程与监控子进程分离：配置页保存 → <code>build_monitor_args</code> 拉起 <code>okx_signal_monitor.py</code>；日志/图表 API 读取 <code>build/runtime_logs/</code> 下 JSONL。</p>
-	<table class="help-table"><thead><tr><th>能力</th><th>说明</th></tr></thead><tbody>
-	<tr><td>监控图表</td><td>读分析日志 K 线 + 指标；OKX K 线 REST 默认缓存 45s；未选中 K 线时快照面板显示最新 <code>final_decision</code></td></tr>
-	<tr><td>监控守护</td><td>子进程意外退出：写控制台日志、可选微信告警（<code>WEB_MONITOR_CRASH_ALERT</code>）、默认自动重启（<code>WEB_MONITOR_AUTO_RESTART</code>，窗口内最多 5 次）</td></tr>
-	<tr><td>孤儿 PID 文件</td><td>Web 启动时若 <code>local_state/monitor.pid</code> / <code>replay.pid</code> 对应进程已退出则清理；若进程仍存活则<strong>不终止</strong>（兼容 Web 崩溃后监控继续 7×24 运行）</td></tr>
-	<tr><td>诊断包导出</td><td>测试页 <code>POST /api/diagnostic-export</code>：ZIP 含打码配置、状态、日志、实时/回放压测 JSON、回放数据尾部；单文件默认 tail 32MB，整包上限 150MB</td></tr>
-	<tr><td>电源 API</td><td><code>POST /api/power/restart</code> · <code>POST /api/power/shutdown</code>（需登录）；重启前将会话写入 <code>local_state/web_restart_sessions.json</code> 并在新进程恢复</td></tr>
-	<tr><td>托盘 API</td><td><code>POST /api/tray/shutdown</code>（仅 127.0.0.1，无需登录）— 托盘菜单「退出」调用；与 Web 关机走同一停止逻辑</td></tr>
-	<tr><td>重启拉起（终端）</td><td>未设 <code>OKX_LAUNCHED_BY_TRAY</code> 时：Windows 走 <code>restart_web_control_panel_windows.bat</code> → 延迟后 <code>start_web_control_panel_windows.bat</code>；子进程设 <code>OKX_WEB_SKIP_BROWSER=1</code></td></tr>
-	<tr><td>重启拉起（托盘）</td><td>设 <code>OKX_LAUNCHED_BY_TRAY=1</code> 时：Web 以退出码 101 结束，<code>tray_launcher.py</code> 监控后在本进程内重拉 <code>web_control_panel.py</code>（不新开 cmd）</td></tr>
-	<tr><td>关机（托盘）</td><td>Web 以退出码 100 结束 → 托盘 <code>quit_application()</code> 同步退出；与托盘菜单「退出」效果一致</td></tr>
-	<tr><td>终端行为</td><td>终端模式 Web 正常退出（关机/重启旧窗口）→ cmd 自动关闭；Ctrl+C → pause 后关闭。托盘模式无 cmd 窗口</td></tr>
-	</tbody></table>
-	<h3>Windows 启动方式</h3>
-	<table class="help-table"><thead><tr><th>方式</th><th>入口</th><th>说明</th></tr></thead><tbody>
-	<tr><td>托盘（安装包默认）</td><td><code>launch_web_control_panel.vbs</code> → <code>tray_launcher.py</code></td><td>系统托盘 + 可选任务栏小窗；Web 设 <code>OKX_LAUNCHED_BY_TRAY=1</code>；关浏览器不停服务</td></tr>
-	<tr><td>终端</td><td><code>start_web_control_panel_windows.bat</code></td><td>可见 cmd；电源「重启」会延迟后新开 bat；「关机」关闭 Web 与 cmd</td></tr>
-	</tbody></table>
-	</section></div></div>
-"""
+    return render_design_docs_html()
 
 
 def help_manual_html(config: Dict[str, Any]) -> str:
@@ -3711,6 +3935,7 @@ def help_manual_html(config: Dict[str, Any]) -> str:
 	<h3>离线回放</h3>
 	<ul class="help-list">
 	<li>配置页勾选「录制回放数据集」→ 运行监控采集 → <strong>停止监控</strong> →「测试」页点击「开始回放」。</li>
+	<li>回放会按配置页<strong>启用 AI / 微信推送</strong>（与线上一致）；未启用推送时仅写入 <code>push_analysis</code> 与控制台日志，便于多次回放对比同一行情下的判断。</li>
 	<li>回放与实时监控<strong>不能同时</strong>运行；回放进行中请勿再点「开始监控」。</li>
 	<li>停止回放：测试页「停止回放」。</li>
 	</ul>
@@ -3729,7 +3954,7 @@ def help_manual_html(config: Dict[str, Any]) -> str:
 	<tr><td><strong>配置</strong></td><td>币种、策略、AI/推送、密钥</td><td>勾选合约；保存配置；一键填入推送分数建议</td></tr>
 	<tr><td><strong>日志</strong></td><td>JSON 分析日志、控制台摘要</td><td>查看容量与分卷；刷新；另存为；打开日志目录</td></tr>
 	<tr><td><strong>测试</strong></td><td>AI 对话、微信连通性、压测、回放</td><td>AI 对话 / 测试推送；刷新压测；开始/停止回放</td></tr>
-	<tr><td><strong>设计</strong></td><td>流程与参数技术文档</td><td>查阅九阶段链路、AI 熔断/告警与环境变量附录</td></tr>
+	<tr><td><strong>设计</strong></td><td>流程与参数技术文档</td><td>按<strong>职责·计算·指标含义·输出·后续用途</strong>五维查阅全链路（§A–§K）</td></tr>
 	<tr><td><strong>帮助</strong></td><td>本操作手册</td><td>启停与界面说明</td></tr>
 	<tr><td><strong>设置</strong></td><td>Web 登录账号</td><td>修改用户名/密码</td></tr>
 	</tbody></table>
@@ -3746,7 +3971,7 @@ def help_manual_html(config: Dict[str, Any]) -> str:
 	</section>
 	<section class="card help-card"><h2>配置页</h2>
 	<ul class="help-list">
-	<li><strong>策略周期</strong>：超短线 / 短线 / 中线，决定主方向逻辑（详见「设计」附录）。</li>
+	<li><strong>策略周期</strong>：超短线 / 短线 / 中线 / 长线，决定画像参数、主方向、评分周期与预测窗口（详见「设计」附录）。</li>
 	<li><strong>确认严格度</strong>：保守 / 标准 / 激进，影响动量阈值与降级门槛。</li>
 	<li><strong>AI与推送</strong>：启用 AI、微信推送（交易信号）；<code>push_score</code>（做多）与 <code>short_push_score</code>（做空）分开配置。Server酱 SendKey 在密钥区配置。</li>
 	<li><strong>AI 异常告警</strong>：与「启用微信推送」无关；启用 AI 且配置了 SendKey 时，AI 连续异常超过约 5 分钟会自动发微信，正文含失败原因。间隔与阈值见「设计」页环境变量表（<code>AI_ABNORMAL_ALERT_*</code>）。</li>
@@ -3785,13 +4010,14 @@ def help_manual_html(config: Dict[str, Any]) -> str:
 	<ul class="help-list">
 	<li>右上角<strong>开关</strong>默认关闭；打开后才会读取分析日志并自动刷新压测图表（节省长期运行资源）。</li>
 	<li>选择合约、验证窗口（短线建议 15–20 分钟）、范围（本次启动后 / 全部历史 / 回放会话）。</li>
-	<li>顶部绿底卡片 + 图表<strong>绿线</strong>为 $10k 模拟账户；<strong>蓝线</strong>价格、<strong>黄线</strong>方向累计（非 0–100 分）。</li>
+	<li>顶部绿底卡片 + 图表<strong>绿线</strong>为 $10k 模拟账户；<strong>蓝线</strong>价格、<strong>紫线</strong>预测方向累计、<strong>黄线</strong>确认方向累计（右轴 ± 累计，非 0–100 分）。紫先黄后表示预测领先确认。</li>
 	<li>绿/红点表示该点预测是否在验证窗内合理；「已验证/日志」分母为成熟样本数。</li>
 	<li>可导出/导入图表 JSON 快照。</li>
 	</ul>
 	<h3>离线回放压测</h3>
 	<ul class="help-list">
 	<li>数据集：{esc(REPLAY_DATASET_FILE)} · 回放结果：{esc(REPLAY_ANALYSIS_LOG_FILE)}</li>
+	<li>每行 JSON 含 <code>analysis</code>（AI 结果）与 <code>push_analysis</code>（是否应推送、阻断原因）；微信是否发送取决于配置页「启用微信推送」。</li>
 	<li>回放完成后，压测范围选「回放会话」查看曲线。</li>
 	</ul>
 	</section>
@@ -3945,7 +4171,7 @@ button,.button{{border:0;border-radius:12px;padding:11px 16px;background:#f1f3f8
 <form class="settings-form" method="post" action="/save-auth#settings" autocomplete="off"><input type="text" name="fake_username" autocomplete="username" tabindex="-1" aria-hidden="true" class="autofill-trap"><input type="password" name="fake_password" autocomplete="current-password" tabindex="-1" aria-hidden="true" class="autofill-trap"><section class="card page-panel" data-page="settings"><h2>登录账号</h2><div class="field"><label>用户名</label><div><input type="text" name="auth_username" autocomplete="off" value="{esc(auth.get("username","admin"))}"><p>Web 控制台登录用户名（单账户）。</p></div></div><div class="field"><label>当前密码</label><div><div class="password-wrap"><input type="password" name="auth_current_password" autocomplete="off" placeholder="请手动输入当前密码" readonly data-verify-password><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>须手动输入当前密码验证身份，不会自动填充。</p></div></div><div class="field"><label>新密码</label><div><div class="password-wrap"><input type="password" name="auth_password" autocomplete="off" placeholder="留空则不修改" readonly data-verify-password><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>留空表示保留当前密码；保存后将停止监控/回放并退出登录。</p></div></div></section><div class="actions settings-actions" data-page-actions="settings"><div class="action-group"><button class="action-control btn-save" type="submit">保存账号密码</button><a class="button action-control btn-danger" href="/logout">退出登录</a></div></div></form>
 <div class="page-panel active" data-page="monitor"><section class="card toolbar-card monitor-toolbar-card"><div><h2>实时监控</h2><p class="section-sub">K 线默认显示；关闭开关后不再请求 OKX/日志绘图，<strong>监控进程照常运行</strong>。下方模拟账户按 final_direction 满仓跟单（会话 $10,000 重置）。</p></div><div class="toolbar-right"><span class="section-sub" id="monitorChartLabel" style="margin:0;white-space:nowrap;">K线显示已开启</span><label class="switch" title="仅控制 Web 是否绘制 K 线与快照，不影响后台监控"><input type="checkbox" id="monitorChartEnableToggle" checked><span></span></label><div class="coin-tabs">{monitor_tabs}</div><button class="button btn-run action-control" type="button" id="monitorToggleBtn">开始监控</button></div></section><p class="accuracy-note accuracy-off-hint monitor-chart-off-hint" id="monitorChartOffHint" hidden>K 线显示已关闭。监控进程与磁盘日志照常运行；打开右上角开关后将请求 OKX 并绘制图表。</p><section class="market-card monitor-card" id="monitorChartPanel"><div class="market-head"><div><div class="market-title" id="monitorTitle">{esc(monitor_initial or "未配置币种")} K线</div><div class="market-sub" id="monitorMeta">{esc("选择周期查看蜡烛图 · 启动监控后叠加分析指标" if monitor_initial else "请先在配置页选择监控币种")}</div><div class="bar-tabs" id="monitorBarTabs">{monitor_bar_tabs}</div></div><div class="market-price" id="monitorPrice"><strong>--</strong><span>加载中</span></div></div><div class="market-canvas-wrap"><canvas id="monitorChart"></canvas><div class="market-loading" id="monitorLoading">正在加载 K 线...</div><div class="snapshot-panel" id="snapshotPanel"><strong>最新快照</strong><div class="snapshot-grid"><span>状态</span><b>加载中...</b><span>提示</span><b>点击 K 线查看 OHLC</b></div></div></div><div class="market-time-range"><span id="monitorProcessInfo">PID -- · Token --</span><span id="monitorUptime">已监控：未启动</span><span id="monitorPaperAccount">模拟账户：--</span><span id="monitorPointCount">K线：0</span></div></section></div>
 	<div class="page-panel" data-page="logs"><section class="card toolbar-card logs-toolbar-card"><div><h2>实时日志</h2><p class="section-sub">监控进程仍会照常写入磁盘（JSON 分析 + 控制台）；本页<strong>默认不拉取显示</strong>以节省资源。配置页可设单文件/总容量上限。</p></div><div class="toolbar-right" style="align-items:center;gap:10px;flex-wrap:wrap;"><span class="section-sub" id="logsDisplayLabel" style="margin:0;white-space:nowrap;">显示已关闭</span><label class="switch" title="仅控制 Web 是否读取并展示日志，不影响磁盘写入"><input type="checkbox" id="logsDisplayToggle"><span></span></label><span class="section-sub" id="analysisLogSwitchHint" style="margin:0;">{esc(log_size_summary_text(config))} · 修改后需重启监控</span><button class="button btn-log" type="button" id="refreshLogBtn">刷新全部</button><button class="button btn-log" type="button" id="openLogDirBtn">打开日志目录</button></div></section><p class="accuracy-note accuracy-off-hint" id="logsOffHint">Web 显示已关闭。监控仍正常写日志到磁盘；打开右上角开关后可在此查看本次启动后的内容。</p><section class="card logs-card" id="logPanelBody" hidden><div class="logs-grid"><div class="log-panel"><h3>JSON 分析日志</h3><p class="log-panel-desc">Web 图表/压测依赖的完整分析记录，分卷保存：{esc(MONITOR_JSON_LOG_FILE)} 及 .jsonl.1/.2 …</p><div class="log-panel-body"><textarea class="log-window" id="logWindow" readonly>正在加载日志...</textarea></div><div class="log-panel-footer"><div class="toolbar-card"><div><p class="section-sub" id="saveLogHint">可另存为 .jsonl 文件，便于回放与统计。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveLogBtn">另存为文件</button></div></div></div></div><div class="log-panel"><h3>控制台日志</h3><p class="log-panel-desc">监控进程精简调试输出（信号摘要、推送结果、错误）；详细重试日志需设置 CONSOLE_VERBOSE=1，默认保存：{esc(MONITOR_PROCESS_LOG_FILE)}</p><div class="log-panel-body"><textarea class="log-window log-window-console" id="consoleLogWindow" readonly>正在加载控制台日志...</textarea></div><div class="log-panel-footer"><div class="toolbar-card"><div><p class="section-sub" id="saveConsoleLogHint">可另存为 .log 文件，便于快速排查信号与推送。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearConsoleLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveConsoleLogBtn">另存为文件</button></div></div></div></div></div></section></div>
-	<div class="page-panel" data-page="tests"><section class="card diagnostic-export-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">问题排查导出</h2><p class="section-sub" style="margin:0;">一键打包配置（密钥已打码）、监控/回放状态、日志、压测图表与回放数据，便于反馈 bug 时分析。超大日志仅含尾部。</p></div><div class="toolbar-right"><button class="button action-control btn-save" type="button" id="diagnosticExportBtn">导出诊断包</button></div></div><p class="accuracy-note" id="diagnosticExportHint">将下载 ZIP 文件；包含 JSON 分析日志、控制台日志、回放数据、实时/回放压测 JSON、Token 统计与当前 AI 对话（如有）。</p></section><section class="card ai-chat-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">AI 对话测试</h2><p class="section-sub" style="margin:0;">使用配置页中的 AI 密钥与模型；发送前会先保存当前配置。对话历史仅保留在本页浏览器内存中。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="aiChatClearBtn">清空对话</button><button class="button action-control btn-test" type="button" id="aiChatPingBtn">连通性测试</button></div></div><div class="ai-chat-window" id="aiChatWindow"><div class="ai-chat-empty">输入下方消息开始与 AI 对话。可先点「连通性测试」验证配置是否可用。</div></div><div class="ai-chat-compose"><textarea id="aiChatInput" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea><button class="button action-control btn-test" type="button" id="aiChatSendBtn">发送</button></div></section><section class="card toolbar-card"><div><h2>微信推送测试</h2><p class="section-sub">测试 Server酱 推送是否可用。点击后会先保存配置页中的密钥，再发送与真实监控相同结构的格式预览（模拟 AI 全字段示例）。</p></div><div class="toolbar-right"><button class="button action-control btn-test" type="button" id="testPushBtn">测试微信推送</button></div></section><div id="connectivityTestNotice" class="notice" hidden></div><section class="card accuracy-card"><div class="toolbar-card" style="margin:0 0 12px;box-shadow:none;padding:0;background:transparent;border:none;align-items:flex-start;"><div><h2 style="margin:0 0 6px;">实时预测压测</h2><p class="section-sub" style="margin:0;">顶部<strong>模拟账户</strong>按 final_direction 从 $10,000 满仓跟单（方向变才换仓）；绿线为权益曲线。下方为分层预测准确度；短线建议验证窗 15–20 分钟。<strong>默认关闭</strong>以节省资源，需要时再打开。</p></div><div class="toolbar-right" style="align-items:center;gap:10px;flex-shrink:0;"><span class="section-sub" id="accuracyEnableLabel" style="margin:0;white-space:nowrap;">压测已关闭</span><label class="switch" title="启用后才会读取分析日志并自动刷新压测图表"><input type="checkbox" id="accuracyEnableToggle"><span></span></label></div></div><p class="accuracy-note accuracy-off-hint" id="accuracyOffHint">压测已关闭。打开右上角开关后将读取分析日志并自动刷新图表。</p><div id="accuracyPanelBody" hidden><div class="accuracy-controls"><select id="accuracyInst">{accuracy_inst_options}</select><select id="accuracyHorizon"><option value="5">5秒 · 轮询级</option><option value="15">15秒</option><option value="30">30秒</option><option value="60">1分钟</option><option value="180">3分钟</option><option value="300">5分钟</option><option value="900">15分钟 · 短线推荐</option><option value="1200">20分钟 · 短线结构</option></select><select id="accuracyScope"><option value="session">本次启动后</option><option value="replay">回放会话</option><option value="all">全部历史日志</option></select><select id="accuracyRetentionHours" title="结合配置页轮询间隔计算图表最多保留多少点"><option value="1">保留1小时</option><option value="2">保留2小时</option><option value="4">保留4小时</option><option value="8">保留8小时</option><option value="12" selected>保留12小时</option><option value="24">保留24小时</option><option value="48">保留48小时</option></select><button class="btn-test" type="button" id="accuracyRefreshBtn">刷新压测</button><button class="btn-save" type="button" id="accuracyExportBtn">导出图表</button><button class="btn-save" type="button" id="accuracyImportBtn">导入图表</button><button class="btn-test" type="button" id="accuracyLiveBtn" style="display:none">返回实时</button><input type="file" id="accuracyImportInput" accept=".json,application/json" hidden></div><div class="accuracy-summary" id="accuracySummary"><div><span>可靠性等级</span><b>--</b></div><div><span>已验证/日志</span><b>--</b></div><div><span>决策合理率</span><b>--</b></div><div><span>相对观望基准</span><b>--</b></div></div><div class="accuracy-canvas-wrap"><canvas id="accuracyChart"></canvas><div class="accuracy-point-panel" id="accuracyPointPanel" hidden></div></div><p class="accuracy-note" id="accuracyNote">观望：后续波动未超阈值即合理（错失机会记红点）。交易：验证窗内价格朝做多/做空方向走即方向命中；入场/止盈/止损仅在较长验证窗下有参考价值。</p></div></section><section class="card"><h2>离线回放压测</h2><p class="section-sub">配置页勾选「录制回放数据集」并运行监控，每轮原始输入写入 {esc(REPLAY_DATASET_FILE)}；停止监控后点击下方「开始回放」启动子进程，结果写入 {esc(REPLAY_ANALYSIS_LOG_FILE)}，再选上方「回放会话」查看压测曲线。</p><div class="replay-status" id="replayDatasetInfo">正在加载数据集状态...</div><div class="field"><label>回放间隔(秒)</label><div><input type="number" id="replayInterval" value="0" min="0" max="120" step="0.1"><p>0 表示尽快跑完；大于 0 可在回放过程中观察压测曲线刷新。</p></div></div><div class="field"><label>控制</label><div><div class="toolbar-right" style="justify-content:flex-start;gap:8px;"><button class="btn-test" type="button" id="replayStartBtn">开始回放</button><button class="btn-danger action-control" type="button" id="replayStopBtn">停止回放</button><button class="button btn-log" type="button" id="replayRefreshBtn">刷新状态</button></div><p id="replayStatusText">等待加载...</p></div></div></section></div>
+	<div class="page-panel" data-page="tests"><section class="card diagnostic-export-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">问题排查导出</h2><p class="section-sub" style="margin:0;">一键打包配置（密钥已打码）、监控/回放状态、日志、压测图表与回放数据，便于反馈 bug 时分析。超大日志仅含尾部。</p></div><div class="toolbar-right"><button class="button action-control btn-save" type="button" id="diagnosticExportBtn">导出诊断包</button></div></div><p class="accuracy-note" id="diagnosticExportHint">将下载 ZIP 文件；包含 JSON 分析日志、控制台日志、回放数据、实时/回放压测 JSON、Token 统计与当前 AI 对话（如有）。</p></section><section class="card ai-chat-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">AI 对话测试</h2><p class="section-sub" style="margin:0;">使用配置页中的 AI 密钥与模型；发送前会先保存当前配置。对话历史仅保留在本页浏览器内存中。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="aiChatClearBtn">清空对话</button><button class="button action-control btn-test" type="button" id="aiChatPingBtn">连通性测试</button></div></div><div class="ai-chat-window" id="aiChatWindow"><div class="ai-chat-empty">输入下方消息开始与 AI 对话。可先点「连通性测试」验证配置是否可用。</div></div><div class="ai-chat-compose"><textarea id="aiChatInput" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea><button class="button action-control btn-test" type="button" id="aiChatSendBtn">发送</button></div></section><section class="card toolbar-card"><div><h2>微信推送测试</h2><p class="section-sub">测试 Server酱 推送是否可用。点击后会先保存配置页中的密钥，再发送与真实监控相同结构的格式预览（模拟 AI 全字段示例）。</p></div><div class="toolbar-right"><button class="button action-control btn-test" type="button" id="testPushBtn">测试微信推送</button></div></section><div id="connectivityTestNotice" class="notice" hidden></div><section class="card accuracy-card"><div class="toolbar-card" style="margin:0 0 12px;box-shadow:none;padding:0;background:transparent;border:none;align-items:flex-start;"><div><h2 style="margin:0 0 6px;">实时预测压测</h2><p class="section-sub" style="margin:0;">顶部<strong>模拟账户</strong>按 final_direction 从 $10,000 满仓跟单（方向变才换仓）；绿线为权益曲线。下方为分层预测准确度；<strong>AI前瞻命中率</strong>按每条 <code>forward_view</code> 的 horizon 独立验证（默认约 15 分钟，与上方验证窗口无关）。回放会话在价线上方标记<strong>应推送</strong>（◆急变 ■观察 △演变 ★结构单，▲多 ▼空）。<strong>默认关闭</strong>以节省资源，需要时再打开。</p></div><div class="toolbar-right" style="align-items:center;gap:10px;flex-shrink:0;"><span class="section-sub" id="accuracyEnableLabel" style="margin:0;white-space:nowrap;">压测已关闭</span><label class="switch" title="启用后才会读取分析日志并自动刷新压测图表"><input type="checkbox" id="accuracyEnableToggle"><span></span></label></div></div><p class="accuracy-note accuracy-off-hint" id="accuracyOffHint">压测已关闭。打开右上角开关后将读取分析日志并自动刷新图表。</p><div id="accuracyPanelBody" hidden><div class="accuracy-controls"><select id="accuracyInst">{accuracy_inst_options}</select><select id="accuracyHorizon"><option value="5">5秒 · 轮询级</option><option value="15">15秒</option><option value="30">30秒</option><option value="60">1分钟</option><option value="180">3分钟</option><option value="300">5分钟</option><option value="900">15分钟 · 短线推荐</option><option value="1200">20分钟 · 短线结构</option></select><select id="accuracyScope"><option value="session">本次启动后</option><option value="replay">回放会话</option><option value="all">全部历史日志</option></select><select id="accuracyRetentionHours" title="结合配置页轮询间隔计算图表最多保留多少点"><option value="1">保留1小时</option><option value="2">保留2小时</option><option value="4">保留4小时</option><option value="8">保留8小时</option><option value="12" selected>保留12小时</option><option value="24">保留24小时</option><option value="48">保留48小时</option></select><button class="btn-test" type="button" id="accuracyRefreshBtn">刷新压测</button><button class="btn-save" type="button" id="accuracyExportBtn">导出图表</button><button class="btn-save" type="button" id="accuracyImportBtn">导入图表</button><button class="btn-test" type="button" id="accuracyLiveBtn" style="display:none">返回实时</button><input type="file" id="accuracyImportInput" accept=".json,application/json" hidden></div><div class="accuracy-summary" id="accuracySummary"><div><span>可靠性等级</span><b>--</b></div><div><span>已验证/日志</span><b>--</b></div><div><span>决策合理率</span><b>--</b></div><div><span>相对观望基准</span><b>--</b></div></div><div class="accuracy-canvas-wrap"><canvas id="accuracyChart"></canvas><div class="accuracy-point-panel" id="accuracyPointPanel" hidden></div></div><p class="accuracy-note" id="accuracyNote">综合准确度用上方验证窗口；AI前瞻命中率用每条 forward_view 的 horizon（通常 15m）。观望：后续波动未超阈值即合理。交易：验证窗内价格朝做多/做空方向走即方向命中。</p></div></section><section class="card"><h2>离线回放压测</h2><p class="section-sub">配置页勾选「录制回放数据集」并运行监控，每轮原始输入写入 {esc(REPLAY_DATASET_FILE)}；停止监控后点击下方「开始回放」。回放按配置启用 AI 与微信推送（未开推送则只写日志），结论写入 {esc(REPLAY_ANALYSIS_LOG_FILE)} 的 <code>push_analysis</code> 与 <code>analysis</code> 字段，便于同一数据集多次回放对比；再选上方「回放会话」查看压测曲线。</p><div class="replay-status" id="replayDatasetInfo">正在加载数据集状态...</div><div class="field"><label>回放间隔(秒)</label><div><input type="number" id="replayInterval" value="0" min="0" max="120" step="0.1"><p>0 表示尽快跑完；大于 0 可在回放过程中观察压测曲线刷新。</p></div></div><div class="field"><label>控制</label><div><div class="toolbar-right" style="justify-content:flex-start;gap:8px;"><button class="btn-test" type="button" id="replayStartBtn">开始回放</button><button class="btn-danger action-control" type="button" id="replayStopBtn">停止回放</button><button class="button btn-log" type="button" id="replayRefreshBtn">刷新状态</button></div><p id="replayStatusText">等待加载...</p></div></div></section></div>
 	{help_manual_html(config)}
 	{design_docs_html()}
 	</main></div></div>
@@ -4060,7 +4286,10 @@ async function autoSaveConfig() {{
   if (!form) return {{ ok: true }};
   const payload = await postFormJson('/api/config/save', form);
   if (payload.inst_ids) refreshInstSelectors(payload.inst_ids);
-  setAddInstFeedback('配置已保存。', true);
+  let feedback = '配置已保存。';
+  if (payload.restart_hint) feedback = payload.restart_hint;
+  else if (payload.requires_monitor_restart) feedback = '配置已保存。请停止并重新启动监控以加载新配置。';
+  setAddInstFeedback(feedback, true);
   return payload;
 }}
 function setAddInstFeedback(text, ok) {{
@@ -4344,13 +4573,13 @@ const importConfigBtn = document.getElementById('importConfigBtn');
     }}
 	  }});
 	}}
-	function renderReplayDatasetInfo(info){{const box=document.getElementById('replayDatasetInfo');if(!box)return;const lines=[];lines.push('数据集: '+(info.exists?info.frame_count+' 帧 · '+((info.inst_ids||[]).join(', ')||'--'):'尚未录制'));if(info.exists){{lines.push('路径: '+(info.path||'--'));if(info.recorded_at)lines.push('录制 meta: '+info.recorded_at);if(info.interval_seconds)lines.push('录制间隔: '+info.interval_seconds+' 秒');}}if(info.replay_running&&info.analysis_log_bytes)lines.push('回放日志: 约 '+Math.max(1,Math.round(info.analysis_log_bytes/1024))+' KB');else if(info.analysis_log_lines)lines.push('上次回放分析日志: '+info.analysis_log_lines+' 行');lines.push('录制开关: '+(info.record_enabled?'已勾选':'未勾选')+' · 监控: '+(info.monitor_running?'运行中':'未运行'));box.textContent=lines.join('\\n');}}
+	function renderReplayDatasetInfo(info){{const box=document.getElementById('replayDatasetInfo');if(!box)return;const lines=[];lines.push('数据集: '+(info.exists?info.frame_count+' 帧 · '+((info.inst_ids||[]).join(', ')||'--'):'尚未录制'));if(info.exists){{lines.push('路径: '+(info.path||'--'));if(info.recorded_at)lines.push('录制 meta: '+info.recorded_at);if(info.interval_seconds)lines.push('录制间隔: '+info.interval_seconds+' 秒');}}if(info.replay_running&&info.analysis_log_bytes)lines.push('回放日志: 约 '+Math.max(1,Math.round(info.analysis_log_bytes/1024))+' KB');else if(info.analysis_log_lines)lines.push('上次回放分析日志: '+info.analysis_log_lines+' 行');const aiLabel=info.ai_enabled?(info.dry_run_ai?'AI: 干跑(不调接口)':'AI: 已启用'):'AI: 未启用';const pushLabel=info.push_enabled?'微信: 已启用':'微信: 未启用(仅日志)';lines.push(aiLabel+' · '+pushLabel+' · 录制开关: '+(info.record_enabled?'已勾选':'未勾选')+' · 监控: '+(info.monitor_running?'运行中':'未运行'));box.textContent=lines.join('\\n');}}
 	function renderReplayStatus(info){{const text=document.getElementById('replayStatusText');if(!text)return;const st=info&&info.replay_status?info.replay_status:{{}};let msg=(st.text||'--')+(st.started_at?' · 开始 '+st.started_at:'')+(st.elapsed_seconds!=null?' · 已运行 '+st.elapsed_seconds+' 秒':'');if(info&&info.replay_running&&info.analysis_log_bytes)msg+=' · 日志约 '+Math.max(1,Math.round(info.analysis_log_bytes/1024))+' KB';else if(!info.replay_running&&info.analysis_log_lines)msg+=' · 分析日志 '+info.analysis_log_lines+' 行';text.textContent=msg;}}
 	function setReplayStartButtonState(mode){{const btn=document.getElementById('replayStartBtn');if(!btn)return;if(mode==='running'){{btn.disabled=false;btn.textContent='回放中...';btn.classList.add('is-starting');}}else if(mode==='starting'){{btn.disabled=true;btn.textContent='启动中...';btn.classList.add('is-starting');}}else{{btn.disabled=false;btn.textContent='开始回放';btn.classList.remove('is-starting');}}}}
 	async function refreshReplayInfo(options){{options=options||{{}};const lite=options.lite!==false;try{{const url='/api/replay-dataset'+(lite?'?lite=1':'');const r=await fetch(url,{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'加载失败');renderReplayDatasetInfo(p);renderReplayStatus(p);if(!lite&&syncAccuracyScopeWithReplay(p)&&isAccuracyEnabled())fetchAccuracy({{resetView:true}});if(!lite&&p.replay_running)startReplayProgress();return p;}}catch(e){{const box=document.getElementById('replayDatasetInfo');if(box)box.textContent='加载回放状态失败：'+e;renderReplayStatus({{replay_status:{{text:String(e)}}}});return null;}}}}
 	let replayProgressTimer=null,replayFinishedNotified=false,fetchAccuracyInFlight=null;
 	function stopReplayProgress(){{stopReplayAccuracyPoll();if(replayProgressTimer){{clearInterval(replayProgressTimer);replayProgressTimer=null;}}}}
-	function startReplayProgress(){{stopReplayProgress();replayFinishedNotified=false;switchAccuracyToReplaySession();replayProgressTimer=setInterval(async function(){{if(currentPage()!=='tests')return;const info=await refreshReplayInfo({{lite:true}});if(!info)return;setReplayStartButtonState(info.replay_running?'running':'idle');if(info.replay_running){{if(isAccuracyEnabled())fetchAccuracy({{resetView:false}});return;}}stopReplayProgress();if(isAccuracyEnabled())fetchAccuracy({{resetView:true}});if(!replayFinishedNotified){{replayFinishedNotified=true;const lines=info.analysis_log_lines!=null?info.analysis_log_lines:'--';alert('回放完成 · 分析日志 '+lines+' 行 · 上方压测已切到「回放会话」');}}}},2500);}}
+	function startReplayProgress(){{stopReplayProgress();replayFinishedNotified=false;switchAccuracyToReplaySession();replayProgressTimer=setInterval(async function(){{if(currentPage()!=='tests')return;const info=await refreshReplayInfo({{lite:true}});if(!info)return;setReplayStartButtonState(info.replay_running?'running':'idle');if(info.replay_running){{if(isAccuracyEnabled())fetchAccuracy({{resetView:false}});return;}}stopReplayProgress();if(isAccuracyEnabled())fetchAccuracy({{resetView:true}});if(!replayFinishedNotified){{replayFinishedNotified=true;const full=await refreshReplayInfo({{lite:false}});const lines=(full&&full.analysis_log_lines!=null)?full.analysis_log_lines:(info.analysis_log_lines!=null?info.analysis_log_lines:'--');alert('回放完成 · 分析日志 '+lines+' 行 · 上方压测已切到「回放会话」');}}}},2500);}}
 	async function startReplayRun(){{const intervalEl=document.getElementById('replayInterval'),interval=Number(intervalEl&&intervalEl.value),statusEl=document.getElementById('replayStatusText');setReplayStartButtonState('starting');if(statusEl)statusEl.textContent='正在启动回放，请稍候...';try{{const r=await fetch('/api/replay-start',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{interval:Number.isFinite(interval)?interval:0}}),cache:'no-store'}});let p=null;const ct=(r.headers.get('content-type')||'').toLowerCase();if(ct.includes('application/json')){{p=await r.json();}}else{{throw new Error('服务器返回异常页面（HTTP '+r.status+'），请刷新并重新登录后再试');}}if(!r.ok||p.ok===false)throw new Error(p.error||p.message||'启动失败');renderReplayDatasetInfo(p);renderReplayStatus(p);if(statusEl)statusEl.textContent=p.message||'回放已启动';setReplayStartButtonState('running');setAccuracyEnabled(true,{{fetchNow:true}});startReplayProgress();}}catch(e){{setReplayStartButtonState('idle');if(statusEl)statusEl.textContent='启动失败：'+e;alert('启动回放失败：'+e);}}}}
 	async function stopReplayRun(){{const btn=document.getElementById('replayStopBtn');if(btn)btn.disabled=true;try{{const r=await fetch('/api/replay-stop',{{method:'POST',cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||p.message||'停止失败');stopReplayProgress();setReplayStartButtonState('idle');await refreshReplayInfo({{lite:false}});if(isAccuracyEnabled())fetchAccuracy({{resetView:true}});alert(p.message||'回放已停止');}}catch(e){{alert('停止回放失败：'+e);}}finally{{if(btn)btn.disabled=false;}}}}
 	const replayStartBtn=document.getElementById('replayStartBtn'),replayStopBtn=document.getElementById('replayStopBtn'),replayRefreshBtn=document.getElementById('replayRefreshBtn');
@@ -4385,25 +4614,34 @@ const importConfigBtn = document.getElementById('importConfigBtn');
 	async function importAccuracyChart(){{try{{const file=await pickAccuracyImportFile();if(!file)return;const bundle=normalizeAccuracyBundle(JSON.parse(await file.text()));setAccuracyEnabled(true,{{fetchNow:false}});applyImportedAccuracyBundle(bundle);}}catch(e){{alert('导入图表失败：'+e);}}}}
 	function exitAccuracyImportedMode(){{setAccuracyImportedMode(false,'');fetchAccuracy({{resetView:true}});}}
 	function clamp(v,a,b){{return Math.max(a,Math.min(b,v));}}
-	function accuracyDirectionValue(o){{const v=String((o&&o.direction)||'');if(v==='\\u505a\\u591a')return 1;if(v==='\\u505a\\u7a7a')return -1;return 0;}}
+	function accuracyDirectionFromText(v){{if(v==='\\u505a\\u591a')return 1;if(v==='\\u505a\\u7a7a')return -1;return 0;}}
+	function accuracyConfirmDirection(o){{return String((o&&(o.confirm_direction||o.final_direction||o.direction))||'');}}
+	function accuracyPredictionDirection(o){{return String((o&&(o.prediction_direction||o.raw_direction))||'');}}
+	function accuracyDirectionValue(o){{return accuracyDirectionFromText(String((o&&o.direction)||''));}}
+	function accuracyConfirmValue(o){{return accuracyDirectionFromText(accuracyConfirmDirection(o));}}
+	function accuracyPredictionValue(o){{return accuracyDirectionFromText(accuracyPredictionDirection(o));}}
 	function resetAccuracyView(){{accuracyView.start=0;accuracyView.end=1;accuracyView.yZoom=1;accuracyView.yPan=0;accuracyView.priceRg=1;accuracyView.followLatest=true;accuracyView.selectedKey='';updateAccuracyPointPanel(null);}}
-	function accuracyPointHtml(o){{if(!o)return '';const hit=o.hit?'合理':'不合理',dir=o.direction||'--',actual=o.actual_direction||'--',ret=o.return_pct!=null?fmt(o.return_pct,3)+'%':'--',outcome=o.outcome_type||'--',paper=o.paper_equity!=null?('$'+fmt(o.paper_equity,0)+' / '+fmtSignedPct(o.paper_pnl_pct,2)+' / '+(o.paper_position||'--')):'--';return '<strong>选中压测点</strong><div class="snapshot-grid"><span>时间</span><b>'+escHtml(o.time||'--')+'</b><span>价格</span><b>'+fmt(o.price,2)+'</b><span>预测</span><b>'+dir+'</b><span>实际</span><b>'+actual+'</b><span>模拟账户</span><b>'+paper+'</b><span>后续价</span><b>'+(o.future_price!=null?fmt(o.future_price,2):'--')+'</b><span>涨跌</span><b>'+ret+'</b><span>判定</span><b>'+hit+'</b><span>类型</span><b>'+escHtml(outcome)+'</b><span>累计准确</span><b>'+(o.accuracy_pct!=null?fmt(o.accuracy_pct,1)+'%':'--')+'</b></div>';}}
+	function accuracyIsFullView(){{return accuracyView.start<=0.001&&accuracyView.end>=0.999&&Math.abs((accuracyView.yZoom||1)-1)<0.05&&Math.abs(accuracyView.yPan||0)<0.05;}}
+	function syncAccuracyFollowLatestFlag(){{accuracyView.followLatest=accuracyIsFullView();}}
+	function accuracyPointHtml(o){{if(!o)return '';const hit=o.hit?'合理':'不合理',predDir=accuracyPredictionDirection(o)||'--',confirmDir=accuracyConfirmDirection(o)||'--',actual=o.actual_direction||'--',ret=o.return_pct!=null?fmt(o.return_pct,3)+'%':'--',outcome=o.outcome_type||'--',paper=o.paper_equity!=null?('$'+fmt(o.paper_equity,0)+' / '+fmtSignedPct(o.paper_pnl_pct,2)+' / '+(o.paper_position||'--')):'--',pushBlock=o.would_push?('<span>应推送</span><b>'+escHtml(o.push_label||o.push_kind||'--')+' · '+escHtml(o.push_direction||'--')+'</b>'):'',aiBlock=(o.ai_forward_direction?('<span>AI前瞻</span><b>'+escHtml(o.ai_forward_direction)+' · '+(o.ai_forward_horizon_minutes||'--')+'m · P'+(o.ai_forward_probability??'--')+' · '+(o.ai_forward_hit?'命中':'未中')+'</b>'):''),predSrc=o.prediction_source?('<span>预测来源</span><b>'+escHtml(o.prediction_source)+'</b>'):'',leadBlock=(predDir!==confirmDir&&predDir!=='--'&&confirmDir!=='--')?('<span>先后</span><b>预测 '+escHtml(predDir)+' · 确认 '+escHtml(confirmDir)+'</b>'):'';return '<strong>选中压测点</strong><div class="snapshot-grid"><span>时间</span><b>'+escHtml(o.time||'--')+'</b><span>价格</span><b>'+fmt(o.price,2)+'</b><span>预测方向</span><b>'+escHtml(predDir)+'</b><span>确认方向</span><b>'+escHtml(confirmDir)+'</b>'+predSrc+leadBlock+'<span>实际</span><b>'+actual+'</b>'+aiBlock+'<span>模拟账户</span><b>'+paper+'</b><span>后续价</span><b>'+(o.future_price!=null?fmt(o.future_price,2):'--')+'</b><span>涨跌</span><b>'+ret+'</b><span>判定</span><b>'+hit+'</b><span>类型</span><b>'+escHtml(outcome)+'</b>'+pushBlock+'<span>累计准确</span><b>'+(o.accuracy_pct!=null?fmt(o.accuracy_pct,1)+'%':'--')+'</b></div>';}}
 	function escHtml(v){{return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}}
 	function updateAccuracyPointPanel(point){{const panel=document.getElementById('accuracyPointPanel');if(!panel)return;if(!point){{panel.hidden=true;panel.innerHTML='';return;}}panel.hidden=false;panel.innerHTML=accuracyPointHtml(point);}}
 	function drawAccuracyLeftAxis(ctx,pad,W,H,mn,mx){{ctx.fillStyle='rgba(226,232,240,.82)';ctx.font='12px Segoe UI, Microsoft YaHei';ctx.textAlign='right';ctx.textBaseline='middle';const ch=H-pad.t-pad.b;for(let i=0;i<=4;i++){{const value=mx-(mx-mn)*i/4,y=pad.t+ch*i/4;ctx.fillText(fmt(value,2),pad.l-8,y);}}}}
 	function drawAccuracyRightAxis(ctx,pad,W,H,mn,mx){{ctx.fillStyle='rgba(251,191,36,.82)';ctx.font='12px Segoe UI, Microsoft YaHei';ctx.textAlign='left';ctx.textBaseline='middle';const ch=H-pad.t-pad.b;for(let i=0;i<=4;i++){{const value=mx-(mx-mn)*i/4,y=pad.t+ch*i/4;ctx.fillText(fmt(value,0),W-pad.r+6,y);}}}}
-	function drawAccuracyCrosshair(ctx,pad,W,H,plot){{const pt=plot.point||{{}};ctx.save();ctx.strokeStyle='rgba(226,232,240,.72)';ctx.setLineDash([5,5]);ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(plot.x,pad.t);ctx.lineTo(plot.x,H-pad.b);ctx.stroke();ctx.beginPath();ctx.moveTo(pad.l,plot.yPrice);ctx.lineTo(W-pad.r,plot.yPrice);ctx.stroke();ctx.strokeStyle='rgba(251,191,36,.55)';ctx.beginPath();ctx.moveTo(pad.l,plot.yPred);ctx.lineTo(W-pad.r,plot.yPred);ctx.stroke();ctx.setLineDash([]);ctx.font='12px Segoe UI, Microsoft YaHei';ctx.fillStyle='rgba(96,165,250,.95)';ctx.textAlign='right';ctx.textBaseline='middle';ctx.fillText(fmt(pt.price,2),pad.l-8,plot.yPrice);ctx.fillStyle='rgba(251,191,36,.95)';ctx.textAlign='left';ctx.fillText(fmt(plot.predVal!=null?plot.predVal:accuracyDirectionValue(pt),0),W-pad.r+6,plot.yPred);ctx.fillStyle='rgba(229,231,235,.95)';ctx.textAlign='center';ctx.textBaseline='top';ctx.fillText(shortTime(pt.time||''),plot.x,H-pad.b+4);ctx.fillStyle='#60a5fa';ctx.beginPath();ctx.arc(plot.x,plot.yPrice,5,0,Math.PI*2);ctx.fill();ctx.fillStyle='#fbbf24';ctx.beginPath();ctx.arc(plot.x,plot.yPred,4.5,0,Math.PI*2);ctx.fill();ctx.restore();}}
-	function selectAccuracyPoint(event,strict){{const c=document.getElementById('accuracyChart');if(!c||!accuracyPlotPoints.length)return;const rect=c.getBoundingClientRect(),x=event.clientX-rect.left,y=event.clientY-rect.top;let best=null,bestDist=Infinity;accuracyPlotPoints.forEach(o=>{{const dPrice=Math.hypot(o.x-x,o.yPrice-y),dPred=Math.hypot(o.x-x,o.yPred-y),dist=Math.min(dPrice,dPred);if(dist<bestDist){{best=o;bestDist=dist;}}}});const limit=strict?36:30;if(best&&bestDist<limit){{accuracyView.selectedKey=best.point.time||'';updateAccuracyPointPanel(best.point);drawAccuracyChart();}}else if(!strict){{accuracyView.selectedKey='';updateAccuracyPointPanel(null);drawAccuracyChart();}}}}
+	function drawAccuracyCrosshair(ctx,pad,W,H,plot){{const pt=plot.point||{{}};ctx.save();ctx.strokeStyle='rgba(226,232,240,.72)';ctx.setLineDash([5,5]);ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(plot.x,pad.t);ctx.lineTo(plot.x,H-pad.b);ctx.stroke();ctx.beginPath();ctx.moveTo(pad.l,plot.yPrice);ctx.lineTo(W-pad.r,plot.yPrice);ctx.stroke();ctx.strokeStyle='rgba(167,139,250,.55)';ctx.beginPath();ctx.moveTo(pad.l,plot.yForecast);ctx.lineTo(W-pad.r,plot.yForecast);ctx.stroke();ctx.strokeStyle='rgba(251,191,36,.55)';ctx.beginPath();ctx.moveTo(pad.l,plot.yConfirm);ctx.lineTo(W-pad.r,plot.yConfirm);ctx.stroke();ctx.setLineDash([]);ctx.font='12px Segoe UI, Microsoft YaHei';ctx.fillStyle='rgba(96,165,250,.95)';ctx.textAlign='right';ctx.textBaseline='middle';ctx.fillText(fmt(pt.price,2),pad.l-8,plot.yPrice);ctx.fillStyle='rgba(167,139,250,.95)';ctx.textAlign='left';ctx.textBaseline='bottom';ctx.fillText('预 '+fmt(plot.forecastVal!=null?plot.forecastVal:accuracyPredictionValue(pt),0),W-pad.r+6,plot.yForecast-2);ctx.fillStyle='rgba(251,191,36,.95)';ctx.textBaseline='top';ctx.fillText('确 '+fmt(plot.confirmVal!=null?plot.confirmVal:accuracyConfirmValue(pt),0),W-pad.r+6,plot.yConfirm+2);ctx.fillStyle='rgba(229,231,235,.95)';ctx.textAlign='center';ctx.textBaseline='top';ctx.fillText(shortTime(pt.time||''),plot.x,H-pad.b+4);ctx.fillStyle='#60a5fa';ctx.beginPath();ctx.arc(plot.x,plot.yPrice,5,0,Math.PI*2);ctx.fill();ctx.fillStyle='#a78bfa';ctx.beginPath();ctx.arc(plot.x,plot.yForecast,4.5,0,Math.PI*2);ctx.fill();ctx.fillStyle='#fbbf24';ctx.beginPath();ctx.arc(plot.x,plot.yConfirm,4.5,0,Math.PI*2);ctx.fill();ctx.restore();}}
+	function selectAccuracyPoint(event,strict){{const c=document.getElementById('accuracyChart');if(!c||!accuracyPlotPoints.length)return;const rect=c.getBoundingClientRect(),x=event.clientX-rect.left,y=event.clientY-rect.top;let best=null,bestDist=Infinity;accuracyPlotPoints.forEach(o=>{{const dPrice=Math.hypot(o.x-x,o.yPrice-y),dConfirm=Math.hypot(o.x-x,o.yConfirm-y),dForecast=Math.hypot(o.x-x,o.yForecast-y),dist=Math.min(dPrice,dConfirm,dForecast);if(dist<bestDist){{best=o;bestDist=dist;}}}});const limit=strict?36:30;if(best&&bestDist<limit){{accuracyView.selectedKey=best.point.time||'';updateAccuracyPointPanel(best.point);drawAccuracyChart();}}else if(!strict){{accuracyView.selectedKey='';updateAccuracyPointPanel(null);drawAccuracyChart();}}}}
 	function visibleAccuracyPoints(){{const pts=accuracyView.points||[];if(pts.length<=1)return pts;const n=pts.length,span=Math.max(0.001,accuracyView.end-accuracyView.start),a=Math.floor(accuracyView.start*(n-1)),b=Math.min(n,Math.max(a+2,Math.ceil((accuracyView.start+span)*(n-1))+1));return pts.slice(a,b);}}
 	function accuracyLinePointBudget(cw,count){{if(count<=160)return count;const cap=Math.max(120,Math.floor(cw*1.2));return Math.min(count,cap);}}
 	function accuracyShowPointMarkers(cw,count){{if(count<=80)return true;const budget=accuracyLinePointBudget(cw,count);return count<=Math.min(100,budget);}}
-	function decimateAccuracySeries(points,predVals,maxPoints){{if(points.length<=maxPoints)return{{points:points,predVals:predVals}};const idx=new Set([0,points.length-1]);const buckets=Math.max(1,Math.floor((maxPoints-2)/2));for(let b=0;b<buckets;b++){{const start=Math.floor(b*(points.length-1)/buckets),end=Math.min(points.length-1,Math.floor((b+1)*(points.length-1)/buckets));if(start>=end){{idx.add(start);continue;}}let minI=start,maxI=start;for(let i=start;i<=end;i++){{const p=Number(points[i].price);if(p<Number(points[minI].price))minI=i;if(p>Number(points[maxI].price))maxI=i;}}idx.add(minI);idx.add(maxI);}}let order=Array.from(idx).sort((a,b)=>a-b);if(order.length>maxPoints){{const slim=[];for(let i=0;i<maxPoints;i++)slim.push(order[Math.round(i*(order.length-1)/(maxPoints-1))]);order=slim;}}return{{points:order.map(i=>points[i]),predVals:order.map(i=>predVals[i])}};}}
+	function decimateAccuracySeries(points,confirmVals,forecastVals,maxPoints){{if(points.length<=maxPoints)return{{points:points,confirmVals:confirmVals,forecastVals:forecastVals}};const idx=new Set([0,points.length-1]);const buckets=Math.max(1,Math.floor((maxPoints-2)/2));for(let b=0;b<buckets;b++){{const start=Math.floor(b*(points.length-1)/buckets),end=Math.min(points.length-1,Math.floor((b+1)*(points.length-1)/buckets));if(start>=end){{idx.add(start);continue;}}let minI=start,maxI=start;for(let i=start;i<=end;i++){{const p=Number(points[i].price);if(p<Number(points[minI].price))minI=i;if(p>Number(points[maxI].price))maxI=i;}}idx.add(minI);idx.add(maxI);}}let order=Array.from(idx).sort((a,b)=>a-b);if(order.length>maxPoints){{const slim=[];for(let i=0;i<maxPoints;i++)slim.push(order[Math.round(i*(order.length-1)/(maxPoints-1))]);order=slim;}}return{{points:order.map(i=>points[i]),confirmVals:order.map(i=>confirmVals[i]),forecastVals:order.map(i=>forecastVals[i])}};}}
 	function accuracyMinTimeSpan(){{const n=(accuracyView.points||[]).length;return n<=1?1:Math.max(0.02,Math.min(1,36/Math.max(36,n)));}}
 	function accuracySpanHours(points){{if(!points||points.length<2)return 0;const a=parsePointTime(points[0].time).getTime(),b=parsePointTime(points[points.length-1].time).getTime();return Math.abs(b-a)/3600000;}}
 	function accuracyTimeLabel(t,spanHours){{if(spanHours>=4)return compactTime(t);return shortTime(t);}}
-	function syncAccuracyPoints(points,options){{const opts=options||{{}},clean=(points||[]).filter(o=>Number.isFinite(Number(o&&o.price))),hadFullView=accuracyView.start<=0.001&&accuracyView.end>=0.999;if(opts.resetView){{accuracyView.points=clean;resetAccuracyView();return;}}const followLatest=accuracyView.followLatest!==false&&accuracyView.end>=0.995;accuracyView.points=clean;if(clean.length>2&&(followLatest||hadFullView)){{accuracyView.start=0;accuracyView.end=1;accuracyView.followLatest=true;}}else if(followLatest&&clean.length>2){{const span=Math.max(0.001,accuracyView.end-accuracyView.start);accuracyView.end=1;accuracyView.start=Math.max(0,1-span);}}}}
+	function pushKindStyle(kind){{const k=String(kind||'').split('+')[0];if(k==='spike')return{{fill:'#fb923c',stroke:'#7c2d12'}};if(k==='watch')return{{fill:'#22d3ee',stroke:'#155e75'}};if(k==='forecast')return{{fill:'#c084fc',stroke:'#581c87'}};if(k==='trade')return{{fill:'#4ade80',stroke:'#166534'}};return{{fill:'#f472b6',stroke:'#831843'}};}}
+	function drawPushMarker(ctx,x,y,kind,direction){{const st=pushKindStyle(kind),r=6.5;ctx.save();ctx.lineWidth=1.4;ctx.strokeStyle=st.stroke;ctx.fillStyle=st.fill;const k=String(kind||'').split('+')[0];if(k==='watch'){{ctx.fillRect(x-r,y-r,r*2,r*2);ctx.strokeRect(x-r,y-r,r*2,r*2);}}else if(k==='forecast'){{ctx.beginPath();ctx.moveTo(x,y-r-1);ctx.lineTo(x+r+1,y+r);ctx.lineTo(x-r-1,y+r);ctx.closePath();ctx.fill();ctx.stroke();}}else if(k==='trade'){{ctx.beginPath();for(let i=0;i<5;i++){{const a=-Math.PI/2+i*Math.PI*2/5,b=-Math.PI/2+(i+2)*Math.PI*2/5;ctx.lineTo(x+Math.cos(a)*r,y+Math.sin(a)*r);ctx.lineTo(x+Math.cos(b)*r*0.45,y+Math.sin(b)*r*0.45);}}ctx.closePath();ctx.fill();ctx.stroke();}}else{{ctx.beginPath();ctx.moveTo(x,y-r-1);ctx.lineTo(x+r+1,y);ctx.lineTo(x,y+r+1);ctx.lineTo(x-r-1,y);ctx.closePath();ctx.fill();ctx.stroke();}}const dir=String(direction||'');if(dir==='\\u505a\\u591a'||dir==='\\u505a\\u7a7a'){{ctx.fillStyle=st.fill;ctx.beginPath();if(dir==='\\u505a\\u591a'){{ctx.moveTo(x,y-r-11);ctx.lineTo(x-4,y-r-5);ctx.lineTo(x+4,y-r-5);}}else{{ctx.moveTo(x,y+r+11);ctx.lineTo(x-4,y+r+5);ctx.lineTo(x+4,y+r+5);}}ctx.closePath();ctx.fill();}}ctx.restore();}}
+	function syncAccuracyPoints(points,options){{const opts=options||{{}},clean=(points||[]).filter(o=>Number.isFinite(Number(o&&o.price)));if(opts.resetView){{accuracyView.points=clean;resetAccuracyView();return;}}const prevSpan=Math.max(0.001,accuracyView.end-accuracyView.start);accuracyView.points=clean;if(clean.length<=2)return;if(accuracyView.followLatest){{accuracyView.end=1;accuracyView.start=Math.max(0,1-prevSpan);}}}}
 	function redrawAccuracyChart(){{drawAccuracyChart();}}
-	async function fetchAccuracy(options){{options=options||{{}};if(!isAccuracyEnabled())return null;if(fetchAccuracyInFlight&&!options.force)return fetchAccuracyInFlight;const run=async()=>{{const canvas=document.getElementById('accuracyChart');if(!canvas)return;const resetView=!!options.resetView||accuracyQuerySignature()!==accuracyQueryKey;if(accuracyImportedMode&&!options.resetView)return;if(options.resetView)setAccuracyImportedMode(false,'');const inst=(document.getElementById('accuracyInst')||{{}}).value||'BTC-USDT-SWAP',h=(document.getElementById('accuracyHorizon')||{{}}).value||'5',scope=(document.getElementById('accuracyScope')||{{}}).value||'session',retention=accuracyRetentionHours(),interval=configuredMonitorInterval(),note=document.getElementById('accuracyNote');const queryKey=accuracyQuerySignature();accuracyQueryKey=queryKey;try{{if(note&&resetView)note.textContent='正在统计实时预测压测...';const qs='inst_id='+encodeURIComponent(inst)+'&horizon='+encodeURIComponent(h)+'&scope='+encodeURIComponent(scope)+'&retention_hours='+encodeURIComponent(retention)+'&interval_seconds='+encodeURIComponent(interval);const r=await fetch('/api/accuracy-data?'+qs,{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'统计失败');accuracyLivePayload=p;const s=p.summary||{{}};updateAccuracySummary(s);syncAccuracyPoints(p.points||[],{{resetView:resetView}});redrawAccuracyChart();if(p.replay_pending){{if(note)note.textContent=p.hint||'请先点击下方「开始回放」；切换「回放会话」不会自动启动回放。';return;}}const maxPts=p.max_points||0,intervalSec=p.interval_seconds||interval,retainH=p.retention_hours||retention;let noteExtra='';if(p.scope==='replay'&&(s.total??0)===0&&((s.raw_log_total??0)>0||(s.pending_total??0)>0))noteExtra=' · 回放日志已有数据，验证窗口成熟后曲线才会加点';else if(p.scope==='replay'&&(s.raw_log_total??0)===0)noteExtra=' · 回放进行中，请稍候';else if(p.scope==='session'&&(s.raw_log_total??0)===0)noteExtra=' · 监控刚启动，请等待几轮轮询';else if((s.pending_total??0)>0&&(s.next_pending_seconds??0)>0)noteExtra=' · 还有 '+s.pending_total+' 条待验证，最近约 '+s.next_pending_seconds+' 秒后可加点';else if((s.pending_total??0)>0)noteExtra=' · 还有 '+s.pending_total+' 条待验证，点「刷新压测」即可尝试更新';if(note)note.textContent=(p.scope==='replay'?'回放会话':p.scope==='session'?'本次启动后':'全部历史')+' · 模拟 '+formatPaperSummary(s)+' · 综合 '+fmt(s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,1)+'% · 窗口 '+formatHorizonLabel(p.horizon_seconds||h)+((p.time_start&&p.time_end)?(' · 范围 '+compactTime(p.time_start)+' ~ '+compactTime(p.time_end)):'')+' · '+(p.chart_points||accuracyView.points.length||0)+'点 · 双击重置缩放'+noteExtra;}}catch(e){{updateAccuracySummary({{}});syncAccuracyPoints([],{{resetView:true}});redrawAccuracyChart();if(note)note.textContent='预测压测统计失败：'+e;}}}};fetchAccuracyInFlight=run();try{{await fetchAccuracyInFlight;}}finally{{fetchAccuracyInFlight=null;}}}}
+	async function fetchAccuracy(options){{options=options||{{}};if(!isAccuracyEnabled())return null;if(fetchAccuracyInFlight&&!options.force)return fetchAccuracyInFlight;const run=async()=>{{const canvas=document.getElementById('accuracyChart');if(!canvas)return;const resetView=!!options.resetView||accuracyQuerySignature()!==accuracyQueryKey;if(accuracyImportedMode&&!options.resetView)return;if(options.resetView)setAccuracyImportedMode(false,'');const inst=(document.getElementById('accuracyInst')||{{}}).value||'BTC-USDT-SWAP',h=(document.getElementById('accuracyHorizon')||{{}}).value||'5',scope=(document.getElementById('accuracyScope')||{{}}).value||'session',retention=accuracyRetentionHours(),interval=configuredMonitorInterval(),note=document.getElementById('accuracyNote');const queryKey=accuracyQuerySignature();accuracyQueryKey=queryKey;try{{if(note&&resetView)note.textContent='正在统计实时预测压测...';const qs='inst_id='+encodeURIComponent(inst)+'&horizon='+encodeURIComponent(h)+'&scope='+encodeURIComponent(scope)+'&retention_hours='+encodeURIComponent(retention)+'&interval_seconds='+encodeURIComponent(interval);const r=await fetch('/api/accuracy-data?'+qs,{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'统计失败');accuracyLivePayload=p;const s=p.summary||{{}};updateAccuracySummary(s);syncAccuracyPoints(p.points||[],{{resetView:resetView}});redrawAccuracyChart();if(p.replay_pending){{if(note)note.textContent=p.hint||'请先点击下方「开始回放」；切换「回放会话」不会自动启动回放。';return;}}const maxPts=p.max_points||0,intervalSec=p.interval_seconds||interval,retainH=p.retention_hours||retention;let noteExtra='';if(p.scope==='replay'&&(s.total??0)===0&&((s.raw_log_total??0)>0||(s.pending_total??0)>0))noteExtra=' · 回放日志已有数据，验证窗口成熟后曲线才会加点';else if(p.scope==='replay'&&(s.raw_log_total??0)===0)noteExtra=' · 回放进行中，请稍候';else if(p.scope==='session'&&(s.raw_log_total??0)===0)noteExtra=' · 监控刚启动，请等待几轮轮询';else if((s.pending_total??0)>0&&(s.next_pending_seconds??0)>0)noteExtra=' · 还有 '+s.pending_total+' 条待验证，最近约 '+s.next_pending_seconds+' 秒后可加点';else if((s.pending_total??0)>0)noteExtra=' · 还有 '+s.pending_total+' 条待验证，点「刷新压测」即可尝试更新';if(note)note.textContent=(p.scope==='replay'?'回放会话':p.scope==='session'?'本次启动后':'全部历史')+' · 模拟 '+formatPaperSummary(s)+' · 综合 '+fmt(s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,1)+'% · AI前瞻 '+((s.ai_forward_direction_total??0)>0?(fmt(s.ai_forward_direction_accuracy_pct,1)+'%/'+s.ai_forward_direction_total+'@'+(s.ai_forward_horizon_minutes||15)+'m'):((s.ai_invoked_total??0)>0?'待验证':'--'))+' · 窗口 '+formatHorizonLabel(p.horizon_seconds||h)+((p.time_start&&p.time_end)?(' · 范围 '+compactTime(p.time_start)+' ~ '+compactTime(p.time_end)):'')+' · '+(p.chart_points||accuracyView.points.length||0)+'点 · 双击重置缩放'+((s.push_would_total??0)>0?(' · 应推送 '+s.push_would_total+' 帧（价线上方标记）'):'')+noteExtra;}}catch(e){{updateAccuracySummary({{}});syncAccuracyPoints([],{{resetView:true}});redrawAccuracyChart();if(note)note.textContent='预测压测统计失败：'+e;}}}};fetchAccuracyInFlight=run();try{{await fetchAccuracyInFlight;}}finally{{fetchAccuracyInFlight=null;}}}}
 	function switchAccuracyToLiveSession(){{const scopeEl=document.getElementById('accuracyScope');if(scopeEl&&scopeEl.value!=='session'){{accuracyScopeSyncing=true;scopeEl.value='session';accuracyScopeSyncing=false;}}setAccuracyImportedMode(false,'');accuracyQueryKey='';if(isAccuracyEnabled())fetchAccuracy({{resetView:true}});}}
 	function switchAccuracyToReplaySession(){{const scopeEl=document.getElementById('accuracyScope');if(scopeEl&&scopeEl.value!=='replay'){{accuracyScopeSyncing=true;scopeEl.value='replay';accuracyScopeSyncing=false;}}setAccuracyImportedMode(false,'');accuracyQueryKey='';}}
 	function syncAccuracyScopeWithReplay(info){{if(!info||!info.replay_running)return false;const scopeEl=document.getElementById('accuracyScope');if(!scopeEl||scopeEl.value==='replay')return false;switchAccuracyToReplaySession();return true;}}
@@ -4417,9 +4655,9 @@ const importConfigBtn = document.getElementById('importConfigBtn');
 	const accuracyScopeEl=document.getElementById('accuracyScope');if(accuracyScopeEl)accuracyScopeEl.addEventListener('change',onAccuracyScopeChange);
 	function formatHorizonLabel(sec){{const n=Number(sec)||0;if(n>=60&&n%60===0)return (n/60)+'分钟';return n+'秒';}}
 	function formatPaperSummary(s){{if(!s||s.paper_equity==null)return '--';const pnl=Number(s.paper_pnl_usd)||0,pct=Number(s.paper_pnl_pct)||0,sign=pnl>=0?'+':'';return '$'+fmt(s.paper_equity,0)+' ('+sign+fmt(pnl,0)+' / '+sign+fmt(pct,2)+'%) · '+(s.paper_position_label||'--');}}
-	function updateAccuracySummary(s){{const box=document.getElementById('accuracySummary');if(!box)return;s=s||{{}};const pred=s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,tradeTotal=s.trade_signal_total??0,tradeDir=s.trade_direction_accuracy_pct,tradePlan=s.trade_signal_accuracy_pct,watchTotal=s.watch_total??0,watchPct=s.watch_reasonable_pct,resolved=s.trade_resolved_total??0,pending=s.pending_total??0,nextPending=s.next_pending_seconds??0,execLine=tradeTotal>=5?(fmt(s.entry_touch_pct,1)+'% / '+fmt(s.no_fill_pct,1)+'%'):'样本不足',paperPts=s.paper_log_points??0,verifiedLine=(s.total??0)+' / '+(s.raw_log_total??s.total??0)+(pending>0?(' · '+pending+'待'):'');const vals=[['模拟账户($10k)',formatPaperSummary(s)+' / '+(s.paper_trade_count??0)+'笔 · '+paperPts+'轮','paper'],['综合预测准确度',pred!=null?fmt(pred,1)+'% / '+(s.decision_total??s.total??0):'--','primary'],['可靠性等级',(s.reliability_level||'--')+' / '+(s.reliability_score!=null?fmt(s.reliability_score,1):'--')],['已验证/日志',verifiedLine],['待验证',pending>0?(nextPending>0?('约'+nextPending+'秒后下一条'):'窗口已够，刷新即验证'):'--'],['观望准确度',watchPct!=null?fmt(watchPct,1)+'% / '+watchTotal:'--'],['交易方向命中',tradeDir!=null?fmt(tradeDir,1)+'% / '+tradeTotal:'--'],['交易执行合理率',tradePlan!=null?fmt(tradePlan,1)+'% / '+tradeTotal:'--'],['验证窗口',formatHorizonLabel(s.horizon_seconds)+' · 阈值 '+fmt(s.threshold_pct,3)+'%'],['入场触达/未成交',execLine]];if(resolved>=3)vals.push(['止盈/止损/胜率',fmt(s.take_profit_pct,1)+'% / '+fmt(s.stop_hit_pct,1)+'% / '+fmt(s.trade_win_rate_pct,1)+'% ('+resolved+')']);box.innerHTML=vals.map(v=>'<div class="'+(v[2]==='paper'?'accuracy-paper-primary':(v[2]==='primary'?'accuracy-primary':''))+'"><span>'+v[0]+'</span><b>'+v[1]+'</b></div>').join('');}}
-	function drawAccuracyChart(points){{if(Array.isArray(points))syncAccuracyPoints(points,{{resetView:true}});const c=document.getElementById('accuracyChart');if(!c)return;accuracyPlotPoints=[];const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=Math.max(1,r.width*d);c.height=Math.max(1,r.height*d);const ctx=c.getContext('2d');ctx.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,pad={{l:58,r:52,t:24,b:40}},cw=W-pad.l-pad.r,ch=H-pad.t-pad.b;ctx.clearRect(0,0,W,H);ctx.fillStyle='#0f172a';ctx.fillRect(0,0,W,H);let clean=visibleAccuracyPoints();if(!clean.length){{updateAccuracyPointPanel(null);ctx.fillStyle='rgba(203,213,225,.82)';ctx.textAlign='center';ctx.textBaseline='middle';ctx.font='13px Segoe UI, Microsoft YaHei';const scopeNow=(document.getElementById('accuracyScope')||{{}}).value||'session',emptyMsg=scopeNow==='replay'?'回放会话暂无数据：请先点击下方「开始回放」，切换范围不会自动启动回放':(scopeNow==='all'?'全部历史暂无已验证点：请确认日志中有该币种数据':'暂无可验证样本：live 监控请启动后选「本次启动后」；离线回放请点「开始回放」后选「回放会话」');ctx.fillText(emptyMsg,W/2,H/2);return;}}const visibleCount=clean.length,totalCount=(accuracyView.points||[]).length;if(clean.length===1)clean=[clean[0],Object.assign({{}},clean[0])];const priceVals=clean.map(o=>Number(o.price)),mn=Math.min(...priceVals),mx=Math.max(...priceVals),basePriceRg=Math.max((mx||1)*0.001,(mx-mn)*1.16,0.01);let pred=0;const predVals=clean.map(o=>{{pred+=accuracyDirectionValue(o);return pred;}}),pmn=Math.min(...predVals),pmx=Math.max(...predVals),basePredRg=Math.max(1,(pmx-pmn)*1.16,1);const yZoom=Math.max(0.35,accuracyView.yZoom||1),yPan=accuracyView.yPan||0,normTop=0.5+yPan+0.5/yZoom,normBottom=0.5+yPan-0.5/yZoom,priceSpan=Math.max(0.000001,basePriceRg),predSpan=Math.max(0.000001,basePredRg),priceAxisBottom=mn+normBottom*priceSpan,priceAxisTop=mn+normTop*priceSpan,predAxisBottom=pmn+normBottom*predSpan,predAxisTop=pmn+normTop*predSpan;accuracyView.priceRg=priceSpan/yZoom;const pricePlotRg=Math.max(0.000001,priceAxisTop-priceAxisBottom),predPlotRg=Math.max(0.000001,predAxisTop-predAxisBottom),priceFlat=Math.abs(mx-mn)<1e-9,predFlat=Math.abs(pmx-pmn)<1e-9,bothFlat=priceFlat&&predFlat,priceY=o=>{{let norm=priceFlat?0.5:(Number(o.price)-priceAxisBottom)/pricePlotRg;return pad.t+ch-norm*ch-(bothFlat?16:0);}},predValY=val=>{{let norm=predFlat?0.5:(val-predAxisBottom)/predPlotRg;return pad.t+ch-norm*ch+(bothFlat?16:0);}},stepFull=cw/Math.max(1,clean.length-1),xAtFull=i=>pad.l+stepFull*i;const drawBudget=accuracyLinePointBudget(cw,clean.length),showMarkers=accuracyShowPointMarkers(cw,clean.length),decimated=decimateAccuracySeries(clean,predVals,drawBudget),drawPts=decimated.points,drawPred=decimated.predVals,stepDraw=cw/Math.max(1,drawPts.length-1),xAtDraw=i=>pad.l+stepDraw*i,denseMode=drawPts.length<clean.length,priceLineWidth=denseMode?1.5:2.6,predLineWidth=denseMode?1.1:2;ctx.strokeStyle='rgba(148,163,184,.22)';ctx.lineWidth=1;for(let i=0;i<=4;i++){{const y=pad.t+ch*i/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke();}}drawAccuracyLeftAxis(ctx,pad,W,H,priceAxisBottom,priceAxisTop);drawAccuracyRightAxis(ctx,pad,W,H,predAxisBottom,predAxisTop);drawAccuracyTimeAxis(ctx,W,H,pad,clean,cw);ctx.beginPath();drawPts.forEach((o,i)=>{{const px=xAtDraw(i),py=predValY(drawPred[i]);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);}});ctx.strokeStyle='rgba(251,191,36,.92)';ctx.lineWidth=predLineWidth;ctx.stroke();ctx.beginPath();drawPts.forEach((o,i)=>{{const px=xAtDraw(i),py=priceY(o);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);}});ctx.strokeStyle='rgba(96,165,250,.95)';ctx.lineWidth=priceLineWidth;ctx.stroke();const paperEq=clean.map(o=>Number(o.paper_equity)).filter(v=>Number.isFinite(v));if(paperEq.length>=2){{const pMn=Math.min(...paperEq),pMx=Math.max(...paperEq),pRg=Math.max(0.01,pMx-pMn),paperY=v=>pad.t+ch-((v-pMn)/pRg)*ch;let started=false;ctx.beginPath();clean.forEach((o,i)=>{{const pe=Number(o.paper_equity);if(!Number.isFinite(pe))return;const px=xAtFull(i),py=paperY(pe);if(!started){{ctx.moveTo(px,py);started=true;}}else ctx.lineTo(px,py);}});if(started){{ctx.strokeStyle='rgba(74,222,128,.92)';ctx.lineWidth=denseMode?1.2:2;ctx.stroke();}}}}const markerPriceRadius=showMarkers?(visibleCount>160?1.6:2.8):0,markerPredRadius=showMarkers?(visibleCount>160?1.4:2.4):0;clean.forEach((o,i)=>{{const px=xAtFull(i),pyPrice=priceY(o),pyPred=predValY(predVals[i]),selected=(o.time||'')===accuracyView.selectedKey;accuracyPlotPoints.push({{x:px,yPrice:pyPrice,yPred:pyPred,predVal:predVals[i],point:o}});if(!showMarkers&&!selected)return;const pr=selected?4.2:(markerPriceRadius||2.8),qr=selected?3.8:(markerPredRadius||2.4);ctx.lineWidth=selected?1.5:1;ctx.strokeStyle='rgba(15,23,42,.85)';ctx.fillStyle=selected?'#22d3ee':(o.hit?'#34d399':'#fb7185');ctx.beginPath();ctx.arc(px,pyPrice,pr,0,Math.PI*2);ctx.fill();ctx.stroke();ctx.strokeStyle='rgba(15,23,42,.85)';ctx.fillStyle=selected?'#fde047':'#fbbf24';ctx.beginPath();ctx.arc(px,pyPred,qr,0,Math.PI*2);ctx.fill();ctx.stroke();}});let selectedPlot=null;if(accuracyView.selectedKey){{selectedPlot=accuracyPlotPoints.find(o=>(o.point.time||'')===accuracyView.selectedKey)||null;if(selectedPlot){{drawAccuracyCrosshair(ctx,pad,W,H,selectedPlot);updateAccuracyPointPanel(selectedPlot.point);}}else{{accuracyView.selectedKey='';updateAccuracyPointPanel(null);}}}}else{{updateAccuracyPointPanel(null);}}ctx.fillStyle='rgba(226,232,240,.92)';ctx.font='12px Segoe UI, Microsoft YaHei';ctx.textAlign='left';ctx.textBaseline='top';ctx.fillText('蓝线：价格',pad.l,pad.t+4);ctx.fillStyle='#4ade80';ctx.fillText('绿线：模拟账户',pad.l+72,pad.t+4);ctx.fillStyle='#fbbf24';ctx.fillText('黄线：预测方向',pad.l+168,pad.t+4);ctx.fillStyle=denseMode?'#fcd34d':'rgba(203,213,225,.72)';ctx.fillText(' · 绘制 '+drawPts.length+'/'+visibleCount+(denseMode?' 已抽稀':' 全量'),pad.l+248,pad.t+4);ctx.textAlign='right';ctx.fillStyle='rgba(203,213,225,.68)';ctx.textBaseline='top';ctx.fillText('总计 '+totalCount+' 点 · 滚轮缩放 · 拖动平移 · 点击选点',W-pad.r,H-26);}}
-	function setupAccuracyChartInteractions(){{const c=document.getElementById('accuracyChart');if(!c||c.dataset.panZoomBound)return;c.dataset.panZoomBound='1';c.addEventListener('wheel',e=>{{if(!accuracyView.points.length)return;e.preventDefault();const rect=c.getBoundingClientRect(),mx=(e.clientX-rect.left)/Math.max(1,rect.width),factor=e.deltaY>0?1.18:0.85,n=accuracyView.points.length;if(e.shiftKey||n<=2){{accuracyView.yZoom=clamp(accuracyView.yZoom/factor,0.35,12);}}else{{const span=accuracyView.end-accuracyView.start,newSpan=clamp(span*factor,accuracyMinTimeSpan(),1),anchor=accuracyView.start+span*mx;accuracyView.start=clamp(anchor-newSpan*mx,0,1-newSpan);accuracyView.end=accuracyView.start+newSpan;}}accuracyView.followLatest=accuracyView.end>=0.995;drawAccuracyChart();}},{{passive:false}});c.addEventListener('mousedown',e=>{{accuracyView.drag={{x:e.clientX,y:e.clientY,start:accuracyView.start,end:accuracyView.end,yPan:accuracyView.yPan,moved:false}};c.classList.add('dragging');}});window.addEventListener('mousemove',e=>{{const g=accuracyView.drag;if(!g)return;const rect=c.getBoundingClientRect(),dx=(e.clientX-g.x)/Math.max(1,rect.width),dy=(e.clientY-g.y)/Math.max(1,rect.height),span=g.end-g.start;if(Math.abs(e.clientX-g.x)>3||Math.abs(e.clientY-g.y)>3)g.moved=true;let ns=clamp(g.start-dx*span,0,1-span),ne=ns+span;accuracyView.start=ns;accuracyView.end=ne;accuracyView.yPan=clamp(g.yPan+dy*1.35,-3,3);accuracyView.followLatest=accuracyView.end>=0.995;drawAccuracyChart();}});window.addEventListener('mouseup',()=>{{if(accuracyView.drag){{setTimeout(function(){{accuracyView.drag=null;}},0);}}c.classList.remove('dragging');}});c.addEventListener('click',e=>{{if(accuracyView.drag&&accuracyView.drag.moved)return;selectAccuracyPoint(e,false);}});c.addEventListener('dblclick',e=>{{if(accuracyView.drag&&accuracyView.drag.moved)return;resetAccuracyView();drawAccuracyChart();}});}}
+	function updateAccuracySummary(s){{const box=document.getElementById('accuracySummary');if(!box)return;s=s||{{}};const pred=s.prediction_accuracy_pct!=null?s.prediction_accuracy_pct:s.decision_accuracy_pct,tradeTotal=s.trade_signal_total??0,tradeDir=s.trade_direction_accuracy_pct,tradePlan=s.trade_signal_accuracy_pct,watchTotal=s.watch_total??0,watchPct=s.watch_reasonable_pct,resolved=s.trade_resolved_total??0,pending=s.pending_total??0,nextPending=s.next_pending_seconds??0,pushWould=s.push_would_total??0,aiTotal=s.ai_forward_total??0,aiDirTotal=s.ai_forward_direction_total??0,aiDirPct=s.ai_forward_direction_accuracy_pct,aiPending=s.ai_forward_pending??0,aiHorizon=s.ai_forward_horizon_minutes??15,aiLine=aiTotal>0?(fmt(aiDirPct,1)+'% / '+aiDirTotal+' · 窗'+aiHorizon+'m'):((s.ai_invoked_total??0)>0?'待验证 '+aiPending+' / 调用 '+(s.ai_invoked_total??0):'暂无 AI 帧'),execLine=tradeTotal>=5?(fmt(s.entry_touch_pct,1)+'% / '+fmt(s.no_fill_pct,1)+'%'):'样本不足',paperPts=s.paper_log_points??0,paperSnap=s.paper_config_from_log_snapshot??0,paperCur=s.paper_config_from_current??0,paperCfgNote=(paperSnap+paperCur)>0?(' · 快照'+paperSnap+'/当前'+paperCur):'',verifiedLine=(s.total??0)+' / '+(s.raw_log_total??s.total??0)+(pending>0?(' · '+pending+'待'):'');const vals=[['模拟账户($10k)',formatPaperSummary(s)+' / '+(s.paper_trade_count??0)+'笔 · '+paperPts+'轮'+paperCfgNote,'paper'],['AI前瞻命中率',aiLine,'ai'],['合并决策准确度',pred!=null?fmt(pred,1)+'% / '+(s.decision_total??s.total??0)+' · UI窗':'--','primary'],['可靠性等级',(s.reliability_level||'--')+' / '+(s.reliability_score!=null?fmt(s.reliability_score,1):'--')],['已验证/日志',verifiedLine],['待验证',pending>0?(nextPending>0?('约'+nextPending+'秒后下一条'):'窗口已够，刷新即验证'):'--'],['AI前瞻(全)',aiTotal>0?(fmt(s.ai_forward_accuracy_pct,1)+'% / '+aiTotal+' · 窗'+aiHorizon+'m'):'--'],['AI前瞻(观望)',(s.ai_forward_watch_total??0)>0?(fmt(s.ai_forward_watch_accuracy_pct,1)+'% / '+(s.ai_forward_watch_total??0)):'--'],['观望准确度',watchPct!=null?fmt(watchPct,1)+'% / '+watchTotal:'--'],['交易方向命中',tradeDir!=null?fmt(tradeDir,1)+'% / '+tradeTotal:'--'],['交易执行合理率',tradePlan!=null?fmt(tradePlan,1)+'% / '+tradeTotal:'--'],['验证窗口',formatHorizonLabel(s.horizon_seconds)+' · 阈值 '+fmt(s.threshold_pct,3)+'%'],['入场触达/未成交',execLine]];if(pushWould>0)vals.splice(4,0,['应推送帧',pushWould+' / '+(s.total??0),'push']);if(resolved>=3)vals.push(['止盈/止损/胜率',fmt(s.take_profit_pct,1)+'% / '+fmt(s.stop_hit_pct,1)+'% / '+fmt(s.trade_win_rate_pct,1)+'% ('+resolved+')']);box.innerHTML=vals.map(v=>'<div class="'+(v[2]==='paper'?'accuracy-paper-primary':(v[2]==='ai'||v[2]==='primary'||v[2]==='push'?'accuracy-primary':''))+'"><span>'+v[0]+'</span><b>'+v[1]+'</b></div>').join('');}}
+	function drawAccuracyChart(points){{if(Array.isArray(points))syncAccuracyPoints(points,{{resetView:true}});const c=document.getElementById('accuracyChart');if(!c)return;accuracyPlotPoints=[];const d=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=Math.max(1,r.width*d);c.height=Math.max(1,r.height*d);const ctx=c.getContext('2d');ctx.setTransform(d,0,0,d,0,0);const W=r.width,H=r.height,pad={{l:58,r:52,t:28,b:40}},cw=W-pad.l-pad.r,ch=H-pad.t-pad.b;ctx.clearRect(0,0,W,H);ctx.fillStyle='#0f172a';ctx.fillRect(0,0,W,H);let clean=visibleAccuracyPoints();if(!clean.length){{updateAccuracyPointPanel(null);ctx.fillStyle='rgba(203,213,225,.82)';ctx.textAlign='center';ctx.textBaseline='middle';ctx.font='13px Segoe UI, Microsoft YaHei';const scopeNow=(document.getElementById('accuracyScope')||{{}}).value||'session',emptyMsg=scopeNow==='replay'?'回放会话暂无数据：请先点击下方「开始回放」，切换范围不会自动启动回放':(scopeNow==='all'?'全部历史暂无已验证点：请确认日志中有该币种数据':'暂无可验证样本：live 监控请启动后选「本次启动后」；离线回放请点「开始回放」后选「回放会话」');ctx.fillText(emptyMsg,W/2,H/2);return;}}const visibleCount=clean.length,totalCount=(accuracyView.points||[]).length;if(clean.length===1)clean=[clean[0],Object.assign({{}},clean[0])];const priceVals=clean.map(o=>Number(o.price)),mn=Math.min(...priceVals),mx=Math.max(...priceVals),basePriceRg=Math.max((mx||1)*0.001,(mx-mn)*1.16,0.01);let confirmAcc=0,forecastAcc=0;const confirmVals=clean.map(o=>{{confirmAcc+=accuracyConfirmValue(o);return confirmAcc;}}),forecastVals=clean.map(o=>{{forecastAcc+=accuracyPredictionValue(o);return forecastAcc;}}),dirMn=Math.min(...confirmVals,...forecastVals),dirMx=Math.max(...confirmVals,...forecastVals),baseDirRg=Math.max(1,(dirMx-dirMn)*1.16,1);const yZoom=Math.max(0.35,accuracyView.yZoom||1),yPan=accuracyView.yPan||0,normTop=0.5+yPan+0.5/yZoom,normBottom=0.5+yPan-0.5/yZoom,priceSpan=Math.max(0.000001,basePriceRg),dirSpan=Math.max(0.000001,baseDirRg),priceAxisBottom=mn+normBottom*priceSpan,priceAxisTop=mn+normTop*priceSpan,dirAxisBottom=dirMn+normBottom*dirSpan,dirAxisTop=dirMn+normTop*dirSpan;accuracyView.priceRg=priceSpan/yZoom;const pricePlotRg=Math.max(0.000001,priceAxisTop-priceAxisBottom),dirPlotRg=Math.max(0.000001,dirAxisTop-dirAxisBottom),priceFlat=Math.abs(mx-mn)<1e-9,dirFlat=Math.abs(dirMx-dirMn)<1e-9,bothFlat=priceFlat&&dirFlat,priceY=o=>{{let norm=priceFlat?0.5:(Number(o.price)-priceAxisBottom)/pricePlotRg;return pad.t+ch-norm*ch-(bothFlat?16:0);}},dirValY=val=>{{let norm=dirFlat?0.5:(val-dirAxisBottom)/dirPlotRg;return pad.t+ch-norm*ch+(bothFlat?16:0);}},stepFull=cw/Math.max(1,clean.length-1),xAtFull=i=>pad.l+stepFull*i;const drawBudget=accuracyLinePointBudget(cw,clean.length),showMarkers=accuracyShowPointMarkers(cw,clean.length),decimated=decimateAccuracySeries(clean,confirmVals,forecastVals,drawBudget),drawPts=decimated.points,drawConfirm=decimated.confirmVals,drawForecast=decimated.forecastVals,stepDraw=cw/Math.max(1,drawPts.length-1),xAtDraw=i=>pad.l+stepDraw*i,denseMode=drawPts.length<clean.length,priceLineWidth=denseMode?1.5:2.6,dirLineWidth=denseMode?1.1:2;ctx.strokeStyle='rgba(148,163,184,.22)';ctx.lineWidth=1;for(let i=0;i<=4;i++){{const y=pad.t+ch*i/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke();}}drawAccuracyLeftAxis(ctx,pad,W,H,priceAxisBottom,priceAxisTop);drawAccuracyRightAxis(ctx,pad,W,H,dirAxisBottom,dirAxisTop);drawAccuracyTimeAxis(ctx,W,H,pad,clean,cw);ctx.beginPath();drawPts.forEach((o,i)=>{{const px=xAtDraw(i),py=dirValY(drawForecast[i]);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);}});ctx.strokeStyle='rgba(167,139,250,.92)';ctx.lineWidth=dirLineWidth;ctx.stroke();ctx.beginPath();drawPts.forEach((o,i)=>{{const px=xAtDraw(i),py=dirValY(drawConfirm[i]);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);}});ctx.strokeStyle='rgba(251,191,36,.92)';ctx.lineWidth=dirLineWidth;ctx.stroke();ctx.beginPath();drawPts.forEach((o,i)=>{{const px=xAtDraw(i),py=priceY(o);if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);}});ctx.strokeStyle='rgba(96,165,250,.95)';ctx.lineWidth=priceLineWidth;ctx.stroke();const paperEq=clean.map(o=>Number(o.paper_equity)).filter(v=>Number.isFinite(v));if(paperEq.length>=2){{const pMn=Math.min(...paperEq),pMx=Math.max(...paperEq),pRg=Math.max(0.01,pMx-pMn),paperY=v=>pad.t+ch-((v-pMn)/pRg)*ch;let started=false;ctx.beginPath();clean.forEach((o,i)=>{{const pe=Number(o.paper_equity);if(!Number.isFinite(pe))return;const px=xAtFull(i),py=paperY(pe);if(!started){{ctx.moveTo(px,py);started=true;}}else ctx.lineTo(px,py);}});if(started){{ctx.strokeStyle='rgba(74,222,128,.92)';ctx.lineWidth=denseMode?1.2:2;ctx.stroke();}}}}const markerPriceRadius=showMarkers?(visibleCount>160?1.6:2.8):0,markerDirRadius=showMarkers?(visibleCount>160?1.4:2.4):0;clean.forEach((o,i)=>{{const px=xAtFull(i),pyPrice=priceY(o),pyConfirm=dirValY(confirmVals[i]),pyForecast=dirValY(forecastVals[i]),selected=(o.time||'')===accuracyView.selectedKey;accuracyPlotPoints.push({{x:px,yPrice:pyPrice,yConfirm:pyConfirm,yForecast:pyForecast,confirmVal:confirmVals[i],forecastVal:forecastVals[i],point:o}});if(o.would_push)drawPushMarker(ctx,px,pyPrice-16,o.push_kind||'spike',o.push_direction||'');if(!showMarkers&&!selected)return;const pr=selected?4.2:(markerPriceRadius||2.8),cr=selected?3.8:(markerDirRadius||2.4),fr=selected?3.6:(markerDirRadius||2.2);ctx.lineWidth=selected?1.5:1;ctx.strokeStyle='rgba(15,23,42,.85)';ctx.fillStyle=selected?'#22d3ee':(o.hit?'#34d399':'#fb7185');ctx.beginPath();ctx.arc(px,pyPrice,pr,0,Math.PI*2);ctx.fill();ctx.stroke();ctx.fillStyle=selected?'#ddd6fe':'#a78bfa';ctx.beginPath();ctx.arc(px,pyForecast,fr,0,Math.PI*2);ctx.fill();ctx.stroke();ctx.fillStyle=selected?'#fde047':'#fbbf24';ctx.beginPath();ctx.arc(px,pyConfirm,cr,0,Math.PI*2);ctx.fill();ctx.stroke();}});let selectedPlot=null;if(accuracyView.selectedKey){{selectedPlot=accuracyPlotPoints.find(o=>(o.point.time||'')===accuracyView.selectedKey)||null;if(selectedPlot){{drawAccuracyCrosshair(ctx,pad,W,H,selectedPlot);updateAccuracyPointPanel(selectedPlot.point);}}else{{accuracyView.selectedKey='';updateAccuracyPointPanel(null);}}}}else{{updateAccuracyPointPanel(null);}}ctx.fillStyle='rgba(226,232,240,.92)';ctx.font='12px Segoe UI, Microsoft YaHei';ctx.textAlign='left';ctx.textBaseline='top';ctx.fillText('蓝线：价格',pad.l,pad.t+4);ctx.fillStyle='#4ade80';ctx.fillText('绿线：模拟账户',pad.l+72,pad.t+4);ctx.fillStyle='#a78bfa';ctx.fillText('紫线：预测方向',pad.l+168,pad.t+4);ctx.fillStyle='#fbbf24';ctx.fillText('黄线：确认方向',pad.l+268,pad.t+4);ctx.fillStyle='rgba(226,232,240,.78)';ctx.font='11px Segoe UI, Microsoft YaHei';ctx.fillText('紫先黄后=预测领先确认 · 应推送 ◆急变 ■观察 △演变 ★结构单',pad.l,pad.t+20);ctx.fillStyle=denseMode?'#fcd34d':'rgba(203,213,225,.72)';ctx.font='12px Segoe UI, Microsoft YaHei';ctx.fillText(' · 绘制 '+drawPts.length+'/'+visibleCount+(denseMode?' 已抽稀':' 全量'),pad.l+420,pad.t+4);ctx.textAlign='right';ctx.fillStyle='rgba(203,213,225,.68)';ctx.textBaseline='top';ctx.fillText('总计 '+totalCount+' 点 · 滚轮缩放 · 拖动平移 · 点击选点',W-pad.r,H-26);}}
+	function setupAccuracyChartInteractions(){{const c=document.getElementById('accuracyChart');if(!c||c.dataset.panZoomBound)return;c.dataset.panZoomBound='1';c.addEventListener('wheel',e=>{{if(!accuracyView.points.length)return;e.preventDefault();const rect=c.getBoundingClientRect(),mx=(e.clientX-rect.left)/Math.max(1,rect.width),factor=e.deltaY>0?1.18:0.85,n=accuracyView.points.length;if(e.shiftKey||n<=2){{accuracyView.yZoom=clamp(accuracyView.yZoom/factor,0.35,12);}}else{{const span=accuracyView.end-accuracyView.start,newSpan=clamp(span*factor,accuracyMinTimeSpan(),1),anchor=accuracyView.start+span*mx;accuracyView.start=clamp(anchor-newSpan*mx,0,1-newSpan);accuracyView.end=accuracyView.start+newSpan;}}syncAccuracyFollowLatestFlag();drawAccuracyChart();}},{{passive:false}});c.addEventListener('mousedown',e=>{{accuracyView.drag={{x:e.clientX,y:e.clientY,start:accuracyView.start,end:accuracyView.end,yPan:accuracyView.yPan,moved:false}};c.classList.add('dragging');}});window.addEventListener('mousemove',e=>{{const g=accuracyView.drag;if(!g)return;const rect=c.getBoundingClientRect(),dx=(e.clientX-g.x)/Math.max(1,rect.width),dy=(e.clientY-g.y)/Math.max(1,rect.height),span=g.end-g.start;if(Math.abs(e.clientX-g.x)>3||Math.abs(e.clientY-g.y)>3)g.moved=true;let ns=clamp(g.start-dx*span,0,1-span),ne=ns+span;accuracyView.start=ns;accuracyView.end=ne;accuracyView.yPan=clamp(g.yPan+dy*1.35,-3,3);syncAccuracyFollowLatestFlag();drawAccuracyChart();}});window.addEventListener('mouseup',()=>{{if(accuracyView.drag){{setTimeout(function(){{accuracyView.drag=null;}},0);}}c.classList.remove('dragging');}});c.addEventListener('click',e=>{{if(accuracyView.drag&&accuracyView.drag.moved)return;selectAccuracyPoint(e,false);}});c.addEventListener('dblclick',e=>{{if(accuracyView.drag&&accuracyView.drag.moved)return;resetAccuracyView();drawAccuracyChart();}});}}
 	setupAccuracyChartInteractions();
 	let virtualTick=0;
 let configuredMonitorInsts={json.dumps(selected_instruments, ensure_ascii=False)};
@@ -4458,7 +4696,7 @@ function monitorSpanHours(points){{if(!points||points.length<2)return 0;const a=
 function monitorSpanDays(points){{return monitorSpanHours(points)/24;}}
 function monitorSameDay(left,right){{const a=parsePointTime(left),b=parsePointTime(right);return a.getFullYear()===b.getFullYear()&&a.getMonth()===b.getMonth()&&a.getDate()===b.getDate();}}
 function monitorSpansMultipleDays(points){{if(!points||points.length<2)return false;return !monitorSameDay(points[0].time,points[points.length-1].time);}}
-function monitorTimeLabel(t,spanHours,bar,points){{if(!t)return '--';const hours=Number(spanHours)||0,period=String(bar||monitorBar||'1m'),multiDay=monitorSpansMultipleDays(points);if(hours>=24*5||period==='4H')return chartDate(t);if(multiDay||hours>=18||period==='1H'||period==='15m')return compactTime(t);if(hours>=6)return compactTime(t);return shortTime(t);}}
+function monitorTimeLabel(t,spanHours,bar,points){{if(!t)return '--';const hours=Number(spanHours)||0,period=String(bar||monitorBar||'1m'),multiDay=monitorSpansMultipleDays(points);if(hours>=24*5||period==='4H'||period==='1D'||period==='1W')return chartDate(t);if(multiDay||hours>=18||period==='1H'||period==='15m')return compactTime(t);if(hours>=6)return compactTime(t);return shortTime(t);}}
 function timeAxisX(p,cw,points,index,candleMode){{if(candleMode)return p.l+(cw/points.length)*(index+0.5);return p.l+cw*index/Math.max(1,points.length-1);}}
 function drawTimeAxis(x,W,H,p,points,cw,options){{options=options||{{}};if(!points||points.length<2)return;const spanHours=monitorSpanHours(points),maxLabels=Math.max(2,Math.min(8,Math.floor(W/120))),step=Math.max(1,Math.floor((points.length-1)/(maxLabels-1))),candleMode=!!options.candleMode,labelFn=function(t){{return monitorTimeLabel(t,spanHours,options.bar||monitorBar,points);}};x.fillStyle='rgba(229,231,235,.9)';x.font='11px Segoe UI, Microsoft YaHei, Arial';x.textAlign='center';x.textBaseline='top';for(let i=0;i<points.length;i+=step){{const px=timeAxisX(p,cw,points,i,candleMode);x.fillText(labelFn(points[i].time),px,H-26);}}const lastIndex=points.length-1;if(lastIndex%step!==0){{x.fillText(labelFn(points[lastIndex].time),timeAxisX(p,cw,points,lastIndex,candleMode),H-26);}}}}
 function displayValue(v){{return v===undefined||v===null||v===''?'--':v;}}
@@ -4482,13 +4720,14 @@ function mergeClientPoints(existing,incoming,maxPoints){{const merged=[],indexBy
 function setMonitorSeries(points){{return setMonitorCandles(points);}}
 function drawMonitorSeries(metaText){{return drawMonitorCandles(metaText);}}
 function drawMonitorCandles(metaText){{if(metaText)monitorMetaText=metaText;const series=currentMonitorSeries();if(!series.length)return false;drawCandleChart('monitorChart',series,document.getElementById('monitorPrice'),document.getElementById('monitorMeta'),document.getElementById('monitorLoading'));const t=document.getElementById('monitorTitle');if(t)t.textContent=monitorTitleText();const m=document.getElementById('monitorMeta');if(m&&monitorMetaText)m.textContent=monitorMetaText;return true;}}
-function formatDecisionSource(v){{const key=String(v||'').toLowerCase();if(key==='ai')return 'AI';if(key==='local')return '本地';if(key==='local_fallback')return '本地兜底';return displayValue(v);}}
+function formatDecisionSource(v){{const key=String(v||'').toLowerCase();if(key==='ai')return 'AI前瞻';if(key==='local_screening')return '本地筛查';if(key==='local')return '本地';if(key==='local_fallback')return '本地兜底';return displayValue(v);}}
 function formatPushRecommendation(v){{const text=String(v||'none').toLowerCase();return text==='none'?'none':text;}}
-function formatSnapshotDirection(point){{const finalDir=point.final_direction||point.direction||'--',localHint=point.local_hint_direction||point.raw_direction;if(localHint&&localHint!==finalDir)return escHtml(finalDir)+' (本地 '+escHtml(localHint)+')';return escHtml(finalDir);}}
+function formatSnapshotDirection(point){{const op=point.forward_direction||point.final_direction||point.direction||'--',localBias=point.local_bias||point.local_hint_direction||point.raw_direction;if(String(point.decision_source||'').toLowerCase()==='ai'&&point.forward_direction)return escHtml(op);if(localBias&&localBias!==op)return escHtml(op)+' (本地 '+escHtml(localBias)+')';return escHtml(op);}}
+function formatDualTrack(point){{const localBias=displayValue(point.local_bias||point.local_hint_direction||point.raw_direction),forecastDir=displayValue(point.structure_forecast_direction),forwardDir=displayValue(point.forward_direction),forwardProb=point.forward_probability!=null&&point.forward_probability!==''?('P='+fmtScore(point.forward_probability)):'';const aiPart=forwardDir!=='--'?forwardDir+(forwardProb?' · '+forwardProb:''):'--';return '本地回顾 '+localBias+(forecastDir!=='--'?' · 演变 '+forecastDir:'')+' · AI前瞻 '+aiPart;}}
 function formatTrend15m(point){{const profile=displayValue(point.trend_profile_15m),simple=displayValue(point.trend_simple_15m);if(profile!=='--'&&simple!=='--'&&profile!==simple)return escHtml(profile)+' · trends '+escHtml(simple);return escHtml(profile!=='--'?profile:simple);}}
 function candleChangeText(open,close){{const chg=close-open,pct=open?chg/open*100:0;return (chg>=0?'+':'')+fmt(chg,2)+' / '+(pct>=0?'+':'')+fmt(pct,2)+'%';}}
 function candleInfoHtml(point){{if(!point)return '<strong>选中K线</strong><div class="snapshot-grid"><span>时间</span><b>--</b></div>';const o=candleOhlc(point);if(!o)return '<strong>选中K线</strong><div class="snapshot-grid"><span>数据</span><b>--</b></div>';const bar=point.bar||monitorBar,up=o.close>=o.open,color=up?'#fb7185':'#22c55e',vol=point.volume!=null&&point.volume!==''?fmt(point.volume,2):'--',confirmed=String(point.confirmed)==='1'?'已确认':(String(point.confirmed)==='0'?'未确认':'--'),amp=o.low?((o.high-o.low)/o.low*100):0;return '<strong>选中K线 · '+escHtml(bar)+'</strong><div class="snapshot-grid"><span>时间</span><b>'+compactTime(point.time)+'</b><span>开盘</span><b>'+fmt(o.open,2)+'</b><span>最高</span><b>'+fmt(o.high,2)+'</b><span>最低</span><b>'+fmt(o.low,2)+'</b><span>收盘</span><b style="color:'+color+'">'+fmt(o.close,2)+'</b><span>涨跌</span><b style="color:'+color+'">'+candleChangeText(o.open,o.close)+'</b><span>振幅</span><b>'+fmt(amp,2)+'%</b><span>成交量</span><b>'+vol+'</b><span>状态</span><b>'+confirmed+'</b></div>';}}
-function analysisSnapshotHtml(point){{if(!point)return '<strong>最新快照</strong><div class="snapshot-grid"><span>状态</span><b>启动监控后显示分析结果</b><span>提示</span><b>点击 K 线查看 OHLC</b></div>';const hasMetrics=point.raw_total_score!==undefined&&point.raw_total_score!==null,kind=point.kind==='realtime'?'实时分析':(hasMetrics?'历史回放':'日志快照'),localRef=hasMetrics?('观察 '+fmtScore(point.raw_total_score)+' / 本地 '+fmtScore(point.local_final_trade_score??point.final_trade_score)):'--',qualityText=(point.data_quality_reliable===true?'可靠':(point.data_quality_reliable===false?'不足':'--'))+' / 15m K '+displayValue(point.data_quality_count),warmup='OI '+fmtBool(point.oi_warmup_ready)+' / 费率 '+fmtBool(point.funding_warmup_ready),signals=compactList(point.signals,3),levels=displayValue(point.entry)+' · SL '+displayValue(point.stop_loss)+' · TP '+displayValue(point.take_profit),summary=point.summary?String(point.summary).trim():'',aiFlag=point.ai_called===true?'是':(point.ai_called===false?'否':'--');let html='<strong>最新快照 · '+kind+'</strong><div class="snapshot-grid"><span>时间</span><b>'+compactTime(point.time)+'</b><span>价格</span><b>'+fmt(point.price,2)+'</b><span>方向</span><b>'+formatSnapshotDirection(point)+'</b><span>置信度</span><b>'+fmtScore(point.confidence??point.final_trade_score)+'</b><span>推送</span><b>'+formatPushRecommendation(point.push_recommendation||point.trade_action_level)+'</b><span>来源</span><b>'+formatDecisionSource(point.decision_source)+'</b><span>AI</span><b>'+aiFlag+'</b><span>触发</span><b>'+displayValue(point.trigger_level)+'</b><span>本地参考</span><b>'+localRef+'</b><span>15m趋势</span><b>'+formatTrend15m(point)+'</b><span>市场/策略</span><b>'+displayValue(point.market_regime)+' / '+displayValue(point.strategy_label||point.strategy_template)+'</b><span>风险</span><b>'+displayValue(point.risk_level)+'</b><span>入场/止损/止盈</span><b>'+levels+'</b><span>数据质量</span><b>'+qualityText+'</b><span>预热</span><b>'+warmup+'</b><span>触发信号</span><b>'+signals+'</b></div>';if(summary)html+='<div class="snapshot-note">'+escHtml(summary)+'</div>';return html;}}
+function analysisSnapshotHtml(point){{if(!point)return '<strong>最新快照</strong><div class="snapshot-grid"><span>状态</span><b>启动监控后显示分析结果</b><span>提示</span><b>点击 K 线查看 OHLC</b></div>';const hasMetrics=point.raw_total_score!==undefined&&point.raw_total_score!==null,kind=point.kind==='realtime'?'实时分析':(hasMetrics?'历史回放':'日志快照'),localRef=hasMetrics?('观察 '+fmtScore(point.raw_total_score)+' / 本地 '+fmtScore(point.local_final_trade_score??point.final_trade_score)):'--',dualTrack=formatDualTrack(point),qualityText=(point.data_quality_reliable===true?'可靠':(point.data_quality_reliable===false?'不足':'--'))+' / 15m K '+displayValue(point.data_quality_count),warmup='OI '+fmtBool(point.oi_warmup_ready)+' / 费率 '+fmtBool(point.funding_warmup_ready),signals=compactList(point.signals,3),levels=displayValue(point.entry)+' · SL '+displayValue(point.stop_loss)+' · TP '+displayValue(point.take_profit),summary=point.summary?String(point.summary).trim():'',aiFlag=point.ai_called===true?'是':(point.ai_called===false?'否':'--');let html='<strong>最新快照 · '+kind+'</strong><div class="snapshot-grid"><span>时间</span><b>'+compactTime(point.time)+'</b><span>价格</span><b>'+fmt(point.price,2)+'</b><span>操作方向</span><b>'+formatSnapshotDirection(point)+'</b><span>双轨</span><b>'+dualTrack+'</b><span>置信度</span><b>'+fmtScore(point.confidence??point.final_trade_score)+'</b><span>推送</span><b>'+formatPushRecommendation(point.push_recommendation||point.trade_action_level)+'</b><span>来源</span><b>'+formatDecisionSource(point.decision_source)+'</b><span>AI</span><b>'+aiFlag+'</b><span>触发</span><b>'+displayValue(point.trigger_level)+'</b><span>本地分数</span><b>'+localRef+'</b><span>15m趋势</span><b>'+formatTrend15m(point)+'</b><span>市场/策略</span><b>'+displayValue(point.market_regime)+' / '+displayValue(point.strategy_label||point.strategy_template)+'</b><span>风险</span><b>'+displayValue(point.risk_level)+'</b><span>入场/止损/止盈</span><b>'+levels+'</b><span>数据质量</span><b>'+qualityText+'</b><span>预热</span><b>'+warmup+'</b><span>触发信号</span><b>'+signals+'</b></div>';if(summary)html+='<div class="snapshot-note">'+escHtml(summary)+'</div>';return html;}}
 function refreshMonitorSnapshotPanel(){{const panel=document.getElementById('snapshotPanel');if(!panel)return;if(monitorSelectedKey){{const hit=monitorPlotPoints.find(function(o){{return (o.point.time||'')===monitorSelectedKey;}});if(hit){{panel.innerHTML=candleInfoHtml(hit.point);return;}}monitorSelectedKey='';}}panel.innerHTML=analysisSnapshotHtml(monitorLatestSnapshot);}}
 function drawMonitorTimeAxis(x,W,H,p,points,cw){{drawTimeAxis(x,W,H,p,points,cw,{{candleMode:true,bar:monitorBar}});}}
 function drawAccuracyTimeAxis(x,W,H,p,points,cw){{if(!points||points.length<2)return;const spanHours=accuracySpanHours(points),maxLabels=Math.max(2,Math.min(10,Math.floor(W/110))),step=Math.max(1,Math.floor((points.length-1)/(maxLabels-1)));x.fillStyle='rgba(229,231,235,.9)';x.font='12px Segoe UI, Microsoft YaHei, Arial';x.textAlign='center';x.textBaseline='top';for(let i=0;i<points.length;i+=step){{const px=p.l+cw*i/(points.length-1);x.fillText(accuracyTimeLabel(points[i].time,spanHours),px,H-24);}}const lastIndex=points.length-1;if((lastIndex%step)!==0){{x.fillText(accuracyTimeLabel(points[lastIndex].time,spanHours),W-p.r,H-24);}}}}
@@ -5154,8 +5393,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/config/save":
             try:
-                saved_path = update_from_form(form)
-                self.send_json({"ok": True, "path": str(saved_path), "inst_ids": configured_instruments()})
+                saved_path, _, config_changed = update_from_form(form)
+                running = bool(monitor_status()["running"])
+                requires_restart = config_changed and running
+                restart_hint = ""
+                if requires_restart:
+                    restart_hint = "监控仍在运行且配置已变更，请停止后重新「开始监控」以生效。"
+                elif config_changed:
+                    restart_hint = "配置已保存；下次启动监控时生效。"
+                self.send_json(
+                    {
+                        "ok": True,
+                        "path": str(saved_path),
+                        "inst_ids": configured_instruments(),
+                        "config_changed": config_changed,
+                        "requires_monitor_restart": requires_restart,
+                        "restart_hint": restart_hint,
+                    }
+                )
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=400)
             return
@@ -5231,7 +5486,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_html(render_page(f"保存账号失败：{exc}"))
             return
         try:
-            env_path = update_from_form(form)
+            _, env_path, config_changed = update_from_form(form)
         except Exception as exc:
             self.send_html(render_page(f"保存失败：{exc}"))
             return
@@ -5239,7 +5494,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_html(render_page(f"配置已保存，{start_monitor()}。"))
         else:
             note = "" if env_path == PORTABLE_ENV_FILE else f" 密钥已保存到用户目录：{env_path}"
-            self.send_html(render_page(f"配置已保存。{note}"))
+            restart_note = " 监控若已在运行，请重新启动以加载新配置。" if config_changed else ""
+            self.send_html(render_page(f"配置已保存。{note}{restart_note}"))
 
 
 class PanelHTTPServer(ThreadingHTTPServer):
