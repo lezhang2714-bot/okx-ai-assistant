@@ -75,6 +75,7 @@ class DecisionPipelineTests(unittest.TestCase):
         assistant = make_assistant()
         score = {
             "direction": LONG,
+            "final_direction": LONG,
             "raw_total_score": 72,
             "final_trade_score": 72,
             "risk_level": "\u4e2d",
@@ -83,7 +84,67 @@ class DecisionPipelineTests(unittest.TestCase):
         trigger = {"level": "L1", "ai_invoked": False, "reasons": ["funding_hot"]}
         decision = assistant.merge_final_decision(None, score, [{"type": "funding_hot"}], trigger, {})
         self.assertEqual(decision["decision_source"], "local_screening")
-        self.assertEqual(decision["direction"], WATCH)
+        self.assertEqual(decision["direction"], LONG)
+        self.assertNotEqual(decision["push_recommendation"], "trade")
+
+    def test_strong_local_decision_can_push_trade_without_ai(self):
+        assistant = make_assistant()
+        score = {
+            "direction": LONG,
+            "final_direction": LONG,
+            "raw_total_score": 84,
+            "final_trade_score": 82,
+            "entry": "100 - 101",
+            "stop_loss": "98",
+            "take_profit": "104 / 106",
+            "risk_level": "\u4e2d",
+            "entry_plan": {"quality": "breakout_valid"},
+            "strategy_views": {"scalp": {}},
+        }
+        trigger = {"level": "L1", "ai_invoked": False, "reasons": ["trade_signal"]}
+        signals = [{"type": "structure_break", "desc": "breakout up"}]
+        decision = assistant.merge_final_decision(None, score, signals, trigger, {})
+        self.assertEqual(decision["direction"], LONG)
+        self.assertEqual(decision["confidence"], 82)
+        self.assertEqual(decision["push_recommendation"], "trade")
+        self.assertEqual(decision["entry"], "100 - 101")
+        self.assertEqual(decision["rule_audit"]["local_trade_threshold"], 80)
+        self.assertTrue(decision["rule_audit"]["local_trade_eligible"])
+        self.assertEqual(assistant.push_gate(decision, signals, score), "trade")
+        self.assertEqual(
+            assistant._wechat_push_block_reason("trade", decision, {}, score, signals, trigger, None),
+            "",
+        )
+
+    def test_ai_failure_uses_strong_local_fallback(self):
+        assistant = make_assistant()
+        score = {
+            "direction": SHORT,
+            "final_direction": SHORT,
+            "raw_total_score": 86,
+            "final_trade_score": 81,
+            "risk_level": "\u4e2d",
+            "entry_plan": {
+                "quality": "breakout_valid",
+                "entry": "100",
+                "stop_loss": "102",
+                "take_profit": "96",
+            },
+            "strategy_views": {"scalp": {}},
+        }
+        trigger = {"level": "L2", "ai_invoked": True, "reasons": ["multi_signal"]}
+        analysis = {"valid_json": False, "error": "timeout"}
+        decision = assistant.merge_final_decision(
+            analysis,
+            score,
+            [{"type": "volume_spike", "desc": "volume"}],
+            trigger,
+            {},
+        )
+        self.assertEqual(decision["decision_source"], "local_fallback")
+        self.assertEqual(decision["direction"], SHORT)
+        self.assertEqual(decision["push_recommendation"], "trade")
+        self.assertTrue(decision["ai_called"])
 
     def test_push_gate_blocks_misaligned_ai_trade(self):
         assistant = make_assistant(forward_require_forecast_alignment=True)
@@ -228,6 +289,184 @@ class DecisionPipelineTests(unittest.TestCase):
         self.assertIn("structure_forecast_active", trigger["reasons"])
         self.assertTrue(trigger["should_call_ai"])
 
+    def test_swing_l2_blocks_weak_multi_signal(self):
+        assistant = make_assistant(strategy_mode="swing", risk_preference="aggressive")
+        score = {
+            "direction": LONG,
+            "raw_direction": LONG,
+            "final_direction": LONG,
+            "direction_score": 62,
+            "raw_total_score": 65,
+            "structure_forecast": {"active": False},
+            "strategy_views": {"scalp": {}},
+        }
+        signals = [
+            {"type": "macd_momentum_change", "desc": "macd"},
+            {"type": "order_book_imbalance", "desc": "book"},
+        ]
+        trigger = assistant.evaluate_ai_trigger(
+            "BTC-USDT-SWAP",
+            signals,
+            score,
+            {
+                "funding_rate": 0.0001,
+                "trend_profiles": {"15m": {"trend": "up"}, "1H": {"trend": "up"}},
+                "market_context": {"regime": "trend_up"},
+            },
+        )
+        self.assertEqual(trigger["level"], "L1")
+        self.assertEqual(trigger.get("candidate_level"), "L2")
+        self.assertFalse(trigger["should_call_ai"])
+        self.assertEqual(trigger.get("skip_reason"), "l2_not_qualified")
+
+    def test_swing_l2_allows_mature_structure_signal(self):
+        assistant = make_assistant(strategy_mode="swing", risk_preference="aggressive")
+        score = {
+            "direction": LONG,
+            "raw_direction": LONG,
+            "final_direction": LONG,
+            "direction_score": 49,
+            "raw_total_score": 62,
+            "structure_forecast": {"active": False},
+            "strategy_views": {"scalp": {}},
+        }
+        trigger = assistant.evaluate_ai_trigger(
+            "BTC-USDT-SWAP",
+            [{"type": "structure_break", "desc": "break up"}],
+            score,
+            {
+                "funding_rate": 0.0001,
+                "trend_profiles": {"15m": {"trend": "up"}, "1H": {"trend": "mixed"}},
+                "market_context": {"regime": "trend_up"},
+            },
+        )
+        self.assertEqual(trigger["level"], "L2")
+        self.assertTrue(trigger["should_call_ai"])
+        self.assertEqual(trigger.get("effective_ai_call_min_interval"), 300)
+
+    def test_swing_l2_cooldown_ignores_fingerprint_changes(self):
+        assistant = make_assistant(strategy_mode="swing", risk_preference="aggressive")
+        inst = "BTC-USDT-SWAP"
+        assistant.last_ai_fingerprint[inst] = "old:fingerprint"
+        assistant.last_ai_call_at[inst] = assistant._now_ts()
+        score = {
+            "direction": SHORT,
+            "raw_direction": SHORT,
+            "final_direction": SHORT,
+            "direction_score": 60,
+            "raw_total_score": 64,
+            "structure_forecast": {"active": False},
+            "strategy_views": {"scalp": {}},
+        }
+        trigger = assistant.evaluate_ai_trigger(
+            inst,
+            [{"type": "structure_break", "desc": "break down"}],
+            score,
+            {
+                "funding_rate": 0.0001,
+                "trend_profiles": {"15m": {"trend": "down"}, "1H": {"trend": "mixed"}},
+                "market_context": {"regime": "trend_down"},
+            },
+        )
+        self.assertFalse(trigger["should_call_ai"])
+        self.assertEqual(trigger.get("skip_reason"), "fingerprint_cooldown")
+
+    def test_swing_sustained_displacement_triggers_once(self):
+        assistant = make_assistant(strategy_mode="swing", risk_preference="aggressive")
+        score = {
+            "direction": LONG,
+            "raw_direction": LONG,
+            "final_direction": LONG,
+            "prior_direction": LONG,
+            "direction_score": 46,
+            "raw_total_score": 52,
+            "structure_forecast": {"active": False},
+            "strategy_views": {"scalp": {}},
+        }
+        snapshot = {
+            "funding_rate": 0.0001,
+            "trend_profiles": {
+                "15m": {"trend": "up"},
+                "1H": {"trend": "mixed", "atr_pct": 0.80},
+            },
+            "market_context": {
+                "regime": "mixed",
+                "pressure_windows": {"moves": {"30m": 0.55, "45m": 0.72, "60m": 0.78}},
+            },
+        }
+        first = assistant.evaluate_ai_trigger("BTC-USDT-SWAP", [], score, snapshot)
+        second = assistant.evaluate_ai_trigger("BTC-USDT-SWAP", [], score, snapshot)
+        self.assertEqual(first["level"], "L2")
+        self.assertIn("sustained_displacement", first["reasons"])
+        self.assertTrue(first["should_call_ai"])
+        self.assertEqual(second["level"], "L0")
+
+    def test_swing_high_probability_forecast_can_trigger_without_strong_signal(self):
+        assistant = make_assistant(strategy_mode="swing", risk_preference="aggressive")
+        score = {
+            "direction": SHORT,
+            "raw_direction": SHORT,
+            "final_direction": SHORT,
+            "prior_direction": SHORT,
+            "direction_score": 46,
+            "raw_total_score": 52,
+            "structure_forecast": {
+                "active": True,
+                "scenario": "swing_structure_down",
+                "direction": SHORT,
+                "probability": 68,
+                "effective_push_threshold": 58,
+            },
+            "strategy_views": {"scalp": {}},
+        }
+        trigger = assistant.evaluate_ai_trigger(
+            "BTC-USDT-SWAP",
+            [{"type": "macd_momentum_change", "desc": "macd"}],
+            score,
+            {
+                "funding_rate": 0.0001,
+                "trend_profiles": {
+                    "15m": {"trend": "down"},
+                    "1H": {"trend": "mixed", "atr_pct": 0.8},
+                },
+                "market_context": {"regime": "mixed", "pressure_windows": {"moves": {}}},
+            },
+        )
+        self.assertEqual(trigger["level"], "L2")
+        self.assertIn("high_probability_forecast", trigger["reasons"])
+        self.assertTrue(trigger["should_call_ai"])
+
+    def test_swing_direction_reversal_bypasses_cooldown_once(self):
+        assistant = make_assistant(strategy_mode="swing", risk_preference="aggressive")
+        inst = "BTC-USDT-SWAP"
+        assistant.last_ai_call_at[inst] = assistant._now_ts()
+        assistant.last_ai_direction[inst] = SHORT
+        score = {
+            "direction": LONG,
+            "raw_direction": LONG,
+            "final_direction": LONG,
+            "prior_direction": SHORT,
+            "direction_score": 48,
+            "raw_total_score": 54,
+            "structure_forecast": {"active": False},
+            "strategy_views": {"scalp": {}},
+        }
+        trigger = assistant.evaluate_ai_trigger(
+            inst,
+            [{"type": "macd_momentum_change", "desc": "macd"}],
+            score,
+            {
+                "funding_rate": 0.0001,
+                "trend_profiles": {
+                    "15m": {"trend": "up"},
+                    "1H": {"trend": "mixed", "atr_pct": 0.8},
+                },
+                "market_context": {"regime": "mixed", "pressure_windows": {"moves": {}}},
+            },
+        )
+        self.assertIn("direction_reversal", trigger["reasons"])
+        self.assertTrue(trigger["should_call_ai"])
+
     def test_l3_respects_fingerprint_cooldown(self):
         assistant = make_assistant()
         score = {
@@ -250,6 +489,109 @@ class DecisionPipelineTests(unittest.TestCase):
         self.assertEqual(trigger["level"], "L3")
         self.assertFalse(trigger["should_call_ai"])
         self.assertEqual(trigger.get("skip_reason"), "fingerprint_cooldown")
+
+    def test_swing_spike_requires_two_confirmed_rounds(self):
+        assistant = make_assistant(strategy_mode="swing", spike_push_score=62)
+        score = {
+            "direction": SHORT,
+            "raw_direction": SHORT,
+            "final_direction": SHORT,
+            "raw_total_score": 70,
+            "strategy_views": {
+                "scalp": {
+                    "action_level": "\u6025\u901f\u5f02\u52a8",
+                    "score": 76,
+                    "direction": SHORT,
+                    "move_pct_5m": -0.30,
+                    "move_pct_10m": -0.45,
+                }
+            },
+        }
+        signals = [{"type": "structure_break", "desc": "break down"}]
+        snapshot = {
+            "funding_rate": 0.0001,
+            "trend_profiles": {"15m": {"trend": "down"}},
+            "market_context": {"regime": "trend_down"},
+        }
+        first = assistant.evaluate_ai_trigger("BTC-USDT-SWAP", signals, score, snapshot)
+        second = assistant.evaluate_ai_trigger("BTC-USDT-SWAP", signals, score, snapshot)
+        third = assistant.evaluate_ai_trigger("BTC-USDT-SWAP", signals, score, snapshot)
+        self.assertNotEqual(first["level"], "L3")
+        self.assertEqual(first.get("spike_filter_reason"), "strategy_spike_confirming(1/2)")
+        self.assertEqual(second["level"], "L3")
+        self.assertIn("scalp_spike", second["reasons"])
+        self.assertEqual(second.get("effective_spike_score"), 72)
+        self.assertNotEqual(third["level"], "L3")
+        self.assertEqual(third.get("spike_filter_reason"), "strategy_spike_event_active")
+        score["strategy_views"]["scalp"]["score"] = 60
+        assistant.evaluate_ai_trigger("BTC-USDT-SWAP", signals, score, snapshot)
+        score["strategy_views"]["scalp"]["score"] = 76
+        assistant.evaluate_ai_trigger("BTC-USDT-SWAP", signals, score, snapshot)
+        retriggered = assistant.evaluate_ai_trigger("BTC-USDT-SWAP", signals, score, snapshot)
+        self.assertEqual(retriggered["level"], "L3")
+
+    def test_swing_spike_rejects_single_macd_without_large_move(self):
+        assistant = make_assistant(strategy_mode="swing", spike_push_score=62)
+        score = {
+            "direction": SHORT,
+            "raw_direction": SHORT,
+            "final_direction": SHORT,
+            "raw_total_score": 70,
+            "strategy_views": {
+                "scalp": {
+                    "action_level": "\u6025\u901f\u5f02\u52a8",
+                    "score": 90,
+                    "direction": SHORT,
+                    "move_pct_5m": -0.05,
+                    "move_pct_10m": -0.08,
+                }
+            },
+        }
+        trigger = assistant.evaluate_ai_trigger(
+            "BTC-USDT-SWAP",
+            [{"type": "macd_momentum_change", "desc": "macd"}],
+            score,
+            {
+                "funding_rate": 0.0001,
+                "trend_profiles": {"15m": {"trend": "down"}},
+                "market_context": {"regime": "trend_down"},
+            },
+        )
+        self.assertNotEqual(trigger["level"], "L3")
+        self.assertEqual(trigger.get("spike_filter_reason"), "strategy_spike_requires_strong_evidence")
+
+    def test_swing_spike_wechat_requires_strategy_qualification(self):
+        assistant = make_assistant(strategy_mode="swing", spike_push_score=62)
+        score = {
+            "final_direction": SHORT,
+            "strategy_views": {
+                "scalp": {
+                    "action_level": "\u6025\u901f\u5f02\u52a8",
+                    "score": 68,
+                    "direction": SHORT,
+                    "move_pct_5m": -0.30,
+                    "move_pct_10m": -0.45,
+                }
+            },
+        }
+        decision = {
+            "decision_source": "ai",
+            "direction": SHORT,
+            "confidence": 80,
+            "push_recommendation": "spike",
+        }
+        signals = [{"type": "structure_break"}]
+        reason = assistant._wechat_push_block_reason(
+            "spike",
+            decision,
+            {},
+            score,
+            signals,
+            {"level": "L3", "ai_invoked": True, "reasons": ["scalp_spike"]},
+            {"valid_json": True},
+        )
+        self.assertIn("strategy_spike_score", reason)
+        self.assertEqual(assistant._push_cooldown_seconds("spike"), 1800)
 
     def test_sentiment_signals_single_high_strength_qualifies(self):
         assistant = make_assistant()
@@ -355,6 +697,41 @@ class AiPayloadTests(unittest.TestCase):
 
 
 class AiForwardStatsTests(unittest.TestCase):
+    def test_accuracy_activity_stats_counts_calls_and_tokens(self):
+        from web_control_panel import accuracy_activity_stats  # noqa: WPS433
+
+        items = [
+            {
+                "local_trigger": {"ai_invoked": False},
+                "analysis": None,
+            },
+            {
+                "local_trigger": {"ai_invoked": True},
+                "analysis": {
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 20,
+                        "total_tokens": 120,
+                    }
+                },
+            },
+            {
+                "local_trigger": {"ai_invoked": True},
+                "analysis": {
+                    "usage": {
+                        "prompt_tokens": 80,
+                        "completion_tokens": 10,
+                    }
+                },
+            },
+        ]
+        stats = accuracy_activity_stats(items)
+        self.assertEqual(stats["analysis_total"], 3)
+        self.assertEqual(stats["ai_call_total"], 2)
+        self.assertEqual(stats["ai_token_total"], 210)
+        self.assertEqual(stats["ai_prompt_token_total"], 180)
+        self.assertEqual(stats["ai_completion_token_total"], 30)
+
     def test_ai_off_chart_uses_local_score_without_mutating_decision(self):
         from web_control_panel import effective_fields_from_log_item  # noqa: WPS433
 

@@ -3,6 +3,15 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Set, Tuple
 
+LOCAL_TRADE_PUSH_MARGIN = 5
+SWING_SPIKE_SCORE_MARGIN = 10
+LONG_SPIKE_SCORE_MARGIN = 15
+SWING_SPIKE_CONFIRM_ROUNDS = 2
+SWING_SPIKE_COOLDOWN_SECONDS = 1800
+SWING_AI_CALL_MIN_INTERVAL_SECONDS = 300
+LONG_AI_CALL_MIN_INTERVAL_SECONDS = 600
+SWING_AI_SUSTAINED_REVIEW_INTERVAL_SECONDS = 300
+
 # Single source for monitor/Web CLI behavior defaults (must match SignalConfig + default_config).
 MONITOR_BEHAVIOR_DEFAULTS: Dict[str, Any] = {
     "interval": 5,
@@ -123,7 +132,14 @@ def build_log_config_snapshot(
         "short_push_score": int(short_push_score),
         "watch_push_score": int(getattr(cfg, "watch_push_score", 65)),
         "spike_push_score": int(getattr(cfg, "spike_push_score", 62)),
+        "swing_spike_score_margin": SWING_SPIKE_SCORE_MARGIN,
+        "swing_spike_confirm_rounds": SWING_SPIKE_CONFIRM_ROUNDS,
+        "swing_spike_cooldown_seconds": SWING_SPIKE_COOLDOWN_SECONDS,
+        "swing_ai_call_min_interval_seconds": SWING_AI_CALL_MIN_INTERVAL_SECONDS,
+        "long_ai_call_min_interval_seconds": LONG_AI_CALL_MIN_INTERVAL_SECONDS,
+        "swing_ai_sustained_review_interval_seconds": SWING_AI_SUSTAINED_REVIEW_INTERVAL_SECONDS,
         "forecast_push_score": int(getattr(cfg, "forecast_push_score", 58)),
+        "local_trade_push_margin": LOCAL_TRADE_PUSH_MARGIN,
         "ai_enabled": bool(ai_enabled),
         "push_enabled": bool(push_enabled),
     }
@@ -184,7 +200,11 @@ def build_effective_config_lines(
             f"push_scores long={push_score} short={short_push_score} "
             f"watch={getattr(cfg, 'watch_push_score', '-')} "
             f"spike={getattr(cfg, 'spike_push_score', '-')} "
-            f"forecast={getattr(cfg, 'forecast_push_score', '-')}"
+            f"forecast={getattr(cfg, 'forecast_push_score', '-')} "
+            f"local_trade_margin=+{LOCAL_TRADE_PUSH_MARGIN} "
+            f"swing_spike=+{SWING_SPIKE_SCORE_MARGIN}/{SWING_SPIKE_CONFIRM_ROUNDS}rounds "
+            f"ai_interval swing={SWING_AI_CALL_MIN_INTERVAL_SECONDS}s long={LONG_AI_CALL_MIN_INTERVAL_SECONDS}s "
+            f"sustained_review={SWING_AI_SUSTAINED_REVIEW_INTERVAL_SECONDS}s"
         ),
         (
             f"paper_ai_only={getattr(cfg, 'paper_follow_ai_only', True)} "

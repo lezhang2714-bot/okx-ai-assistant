@@ -55,7 +55,18 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from runtime_identity import format_runtime_identity
-from monitor_config_summary import build_effective_config_lines, build_log_config_snapshot
+from monitor_config_summary import (
+    LOCAL_TRADE_PUSH_MARGIN,
+    LONG_SPIKE_SCORE_MARGIN,
+    LONG_AI_CALL_MIN_INTERVAL_SECONDS,
+    SWING_SPIKE_CONFIRM_ROUNDS,
+    SWING_SPIKE_COOLDOWN_SECONDS,
+    SWING_SPIKE_SCORE_MARGIN,
+    SWING_AI_CALL_MIN_INTERVAL_SECONDS,
+    SWING_AI_SUSTAINED_REVIEW_INTERVAL_SECONDS,
+    build_effective_config_lines,
+    build_log_config_snapshot,
+)
 
 try:
     import okx.MarketData as MarketData
@@ -545,7 +556,7 @@ def analysis_console_excerpt(analysis: Dict[str, Any], score: Dict[str, Any], li
 DECISION_SOURCE_LABELS = {
     "ai": "AI前瞻",
     "local": "本地筛查",
-    "local_screening": "本地筛查",
+    "local_screening": "本地确认",
     "local_fallback": "本地兜底",
     "structure_forecast": "结构演变",
 }
@@ -658,7 +669,7 @@ def format_ai_analysis_lines(
 
 def format_local_decision_line(final_decision: Dict[str, Any]) -> str:
     source = str(final_decision.get("decision_source", "local_screening") or "local_screening")
-    label = "本地兜底" if source == "local_fallback" else "本地筛查"
+    label = "本地兜底" if source == "local_fallback" else "本地确认"
     screening = final_decision.get("local_screening") if isinstance(final_decision.get("local_screening"), dict) else {}
     local_bias = screening.get("local_bias") or final_decision.get("local_bias") or final_decision.get("direction", "-")
     parts = [
@@ -2199,7 +2210,7 @@ FORECAST_SCENARIO_LABELS = {
 DECISION_SOURCE_LABELS = {
     "ai": "AI前瞻",
     "local": "本地筛查",
-    "local_screening": "本地筛查",
+    "local_screening": "本地确认",
     "local_fallback": "本地兜底",
     "structure_forecast": "结构演变",
 }
@@ -2379,6 +2390,11 @@ class OkxAiShortTermAssistant:
         self._last_runtime_cache_prune_at = 0.0
         self.last_ai_call_at: Dict[str, float] = {}
         self.last_ai_fingerprint: Dict[str, str] = {}
+        self.last_ai_direction: Dict[str, str] = {}
+        self._ai_supplemental_latched: Set[str] = set()
+        self._ai_supplemental_last_at: Dict[str, float] = {}
+        self._spike_candidate_streak: Dict[str, int] = {}
+        self._spike_event_latched: Set[str] = set()
         self.replay_ai_cache: Dict[str, Dict[str, Any]] = {}
 
         # 回放/录制：录制保存 collect_snapshot 原始输入；回放时注入同一套 collect/analyze 链路。
@@ -6444,17 +6460,40 @@ class OkxAiShortTermAssistant:
             result["usage"] = usage
         return result
 
-    def _ai_call_min_interval(self) -> int:
-        return max(15, env_int("AI_CALL_MIN_INTERVAL_SECONDS", DEFAULT_AI_CALL_MIN_INTERVAL_SECONDS))
+    def _ai_call_min_interval(self, level: str = "L2") -> int:
+        base = max(15, env_int("AI_CALL_MIN_INTERVAL_SECONDS", DEFAULT_AI_CALL_MIN_INTERVAL_SECONDS))
+        if level == "L3":
+            return base
+        if self._strategy_mode() == "swing":
+            return max(base, SWING_AI_CALL_MIN_INTERVAL_SECONDS)
+        if self._strategy_mode() == "long":
+            return max(base, LONG_AI_CALL_MIN_INTERVAL_SECONDS)
+        return base
 
-    def _ai_call_dedup_allows(self, inst_id: str, fingerprint: str) -> bool:
+    def _ai_call_dedup_allows(
+        self,
+        inst_id: str,
+        fingerprint: str,
+        level: str = "L2",
+        *,
+        direction_reversal: bool = False,
+        direction: str = "",
+    ) -> bool:
         last_fp = self.last_ai_fingerprint.get(inst_id, "")
         last_at = self.last_ai_call_at.get(inst_id, 0.0)
-        return (
-            fingerprint != last_fp
-            or last_at <= 0
-            or self._now_ts() - last_at >= self._ai_call_min_interval()
-        )
+        if (
+            direction_reversal
+            and direction in ("做多", "做空")
+            and self.last_ai_direction.get(inst_id) != direction
+        ):
+            return True
+        if last_at <= 0 or self._now_ts() - last_at >= self._ai_call_min_interval(level):
+            return True
+        if level == "L3":
+            return fingerprint != last_fp
+        if self._strategy_mode() in ("swing", "long"):
+            return False
+        return fingerprint != last_fp
 
     def _structure_forecast_active(self, score: Dict[str, Any]) -> bool:
         forecast = score.get("structure_forecast") if isinstance(score.get("structure_forecast"), dict) else {}
@@ -6473,7 +6512,8 @@ class OkxAiShortTermAssistant:
         score: Dict[str, Any],
         snapshot: Dict[str, Any],
     ) -> Dict[str, Any]:
-        if not signals:
+        supplemental_reasons = self._higher_timeframe_ai_supplemental_reasons(inst_id, score, snapshot)
+        if not signals and not supplemental_reasons:
             return {
                 "level": "L0",
                 "should_call_ai": False,
@@ -6484,17 +6524,33 @@ class OkxAiShortTermAssistant:
             }
 
         signal_types = {item.get("type", "") for item in signals}
-        reasons: List[str] = []
+        reasons: List[str] = list(supplemental_reasons)
         scalp_view = score.get("strategy_views", {}).get("scalp", {})
-        level = "L1"
+        level = "L2" if supplemental_reasons else "L1"
+        spike_filter_reason = ""
+        spike_confirm_streak = 0
 
         if (
             self.config.signal_spike_enabled
             and scalp_view.get("action_level") in ("急速异动", "可短打")
             and scalp_view.get("score", 0) >= self.config.spike_push_score
         ):
-            level = "L3"
-            reasons.append("scalp_spike")
+            spike_confirmed, spike_filter_reason, spike_confirm_streak = self._strategy_spike_confirmed(
+                inst_id,
+                score,
+                signals,
+                snapshot,
+            )
+            if spike_confirmed:
+                level = "L3"
+                reasons.append("scalp_spike")
+        elif self._strategy_mode() in ("swing", "long"):
+            for old_key in list(self._spike_candidate_streak):
+                if old_key.startswith(f"{inst_id}:"):
+                    self._spike_candidate_streak.pop(old_key, None)
+            for old_key in list(self._spike_event_latched):
+                if old_key.startswith(f"{inst_id}:"):
+                    self._spike_event_latched.discard(old_key)
 
         if "funding_hot" in signal_types and abs(to_float(snapshot.get("funding_rate"))) >= self.config.funding_abs_threshold * 1.25:
             level = "L3"
@@ -6541,14 +6597,28 @@ class OkxAiShortTermAssistant:
         fingerprint = self._signal_fingerprint(signals, score)
         should_call_ai = False
         skip_reason = ""
+        candidate_level = level
+        l2_qualified: Optional[bool] = None
+        if level == "L2":
+            l2_qualified = self._l2_qualifies_ai_call(reasons, signal_types, score, snapshot)
+            if self._strategy_mode() in ("swing", "long") and not l2_qualified:
+                level = "L1"
+                skip_reason = "l2_not_qualified"
         if self.ai_enabled and level in ("L2", "L3"):
-            qualifies = level == "L3" or self._l2_qualifies_ai_call(reasons, signal_types, score, snapshot)
-            if qualifies and self._ai_call_dedup_allows(inst_id, fingerprint):
+            qualifies = level == "L3" or bool(l2_qualified)
+            trigger_direction = str(score.get("final_direction", score.get("direction", "")) or "")
+            if trigger_direction not in ("做多", "做空"):
+                trigger_direction = str(score.get("raw_direction", "") or "")
+            if qualifies and self._ai_call_dedup_allows(
+                inst_id,
+                fingerprint,
+                level,
+                direction_reversal="direction_reversal" in reasons,
+                direction=trigger_direction,
+            ):
                 should_call_ai = True
             elif qualifies:
                 skip_reason = "fingerprint_cooldown"
-            elif level == "L2":
-                skip_reason = "l2_not_qualified"
 
         result = {
             "level": level,
@@ -6558,6 +6628,14 @@ class OkxAiShortTermAssistant:
             "fingerprint": fingerprint,
             "local_hint": self.build_local_hint(score, signals),
         }
+        if spike_filter_reason:
+            result["spike_filter_reason"] = spike_filter_reason
+        if spike_confirm_streak:
+            result["spike_confirm_streak"] = spike_confirm_streak
+        if candidate_level != level:
+            result["candidate_level"] = candidate_level
+        result["effective_spike_score"] = self._strategy_spike_score_threshold()
+        result["effective_ai_call_min_interval"] = self._ai_call_min_interval(level)
         if skip_reason:
             result["skip_reason"] = skip_reason
         return result
@@ -6644,6 +6722,104 @@ class OkxAiShortTermAssistant:
             and int(scalp_view.get("score", 0) or 0) >= self.config.spike_push_score
         )
 
+    def _strategy_spike_score_threshold(self) -> int:
+        mode = self._strategy_mode()
+        margin = SWING_SPIKE_SCORE_MARGIN if mode == "swing" else LONG_SPIKE_SCORE_MARGIN if mode == "long" else 0
+        return min(100, int(self.config.spike_push_score) + margin)
+
+    def _strategy_spike_has_strong_evidence(
+        self,
+        signals: List[Dict[str, Any]],
+        scalp_view: Dict[str, Any],
+    ) -> bool:
+        if self._strategy_mode() not in ("swing", "long"):
+            return True
+        signal_types = {str(item.get("type", "") or "") for item in signals}
+        if signal_types.intersection({"volume_spike", "structure_break", "oi_change"}):
+            return True
+        threshold_5m, threshold_10m = self._scalp_move_thresholds()
+        return (
+            abs(float(scalp_view.get("move_pct_5m", 0.0) or 0.0)) >= threshold_5m * 1.35
+            or abs(float(scalp_view.get("move_pct_10m", 0.0) or 0.0)) >= threshold_10m * 1.25
+        )
+
+    def _strategy_spike_direction_aligned(
+        self,
+        score: Dict[str, Any],
+        scalp_view: Dict[str, Any],
+        snapshot: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if self._strategy_mode() not in ("swing", "long"):
+            return True
+        scalp_direction = str(scalp_view.get("direction", "") or "")
+        if scalp_direction not in ("做多", "做空"):
+            return False
+        local_direction = str(score.get("final_direction", score.get("direction", "")) or "")
+        if local_direction == scalp_direction:
+            return True
+        profiles = (snapshot or {}).get("trend_profiles", {})
+        if not isinstance(profiles, dict):
+            return False
+        confirm_bar = "15m" if self._strategy_mode() == "swing" else "1H"
+        confirm_trend = str((profiles.get(confirm_bar) or {}).get("trend", "") or "")
+        return (scalp_direction == "做多" and confirm_trend == "up") or (
+            scalp_direction == "做空" and confirm_trend == "down"
+        )
+
+    def _strategy_spike_qualification(
+        self,
+        score: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, str]:
+        scalp_view = self._scalp_view(score)
+        threshold = self._strategy_spike_score_threshold()
+        scalp_score = int(scalp_view.get("score", 0) or 0)
+        if scalp_score < threshold:
+            return False, f"strategy_spike_score({scalp_score}<{threshold})"
+        if not self._strategy_spike_has_strong_evidence(signals, scalp_view):
+            return False, "strategy_spike_requires_strong_evidence"
+        if not self._strategy_spike_direction_aligned(score, scalp_view, snapshot):
+            return False, "strategy_spike_not_aligned"
+        return True, ""
+
+    def _strategy_spike_confirmed(
+        self,
+        inst_id: str,
+        score: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        snapshot: Dict[str, Any],
+    ) -> Tuple[bool, str, int]:
+        qualified, reason = self._strategy_spike_qualification(score, signals, snapshot)
+        mode = self._strategy_mode()
+        scalp_view = self._scalp_view(score)
+        scalp_direction = str(scalp_view.get("direction", "") or "")
+        key = f"{inst_id}:{scalp_direction}"
+        if mode not in ("swing", "long"):
+            return qualified, reason, 1 if qualified else 0
+        if not qualified:
+            reset_score = max(0, self._strategy_spike_score_threshold() - 8)
+            if int(scalp_view.get("score", 0) or 0) < reset_score:
+                for old_key in list(self._spike_event_latched):
+                    if old_key.startswith(f"{inst_id}:"):
+                        self._spike_event_latched.discard(old_key)
+            for old_key in list(self._spike_candidate_streak):
+                if old_key.startswith(f"{inst_id}:"):
+                    self._spike_candidate_streak.pop(old_key, None)
+            return False, reason, 0
+        for old_key in list(self._spike_candidate_streak):
+            if old_key.startswith(f"{inst_id}:") and old_key != key:
+                self._spike_candidate_streak.pop(old_key, None)
+        streak = self._spike_candidate_streak.get(key, 0) + 1
+        self._spike_candidate_streak[key] = streak
+        required = SWING_SPIKE_CONFIRM_ROUNDS
+        if streak < required:
+            return False, f"strategy_spike_confirming({streak}/{required})", streak
+        if key in self._spike_event_latched:
+            return False, "strategy_spike_event_active", streak
+        self._spike_event_latched.add(key)
+        return True, "", streak
+
     def _trade_signals_qualify_l2(self, signal_types: set) -> bool:
         if not signal_types.intersection(TRADE_TRIGGER_SIGNALS):
             return False
@@ -6711,6 +6887,13 @@ class OkxAiShortTermAssistant:
         score: Dict[str, Any],
         snapshot: Dict[str, Any],
     ) -> bool:
+        if self._strategy_mode() in ("swing", "long"):
+            return self._higher_timeframe_l2_qualifies_ai_call(
+                trigger_reasons,
+                signal_types,
+                score,
+                snapshot,
+            )
         reason_set = set(trigger_reasons or [])
         if reason_set.intersection(
             {
@@ -6745,9 +6928,187 @@ class OkxAiShortTermAssistant:
                 return True
         return False
 
+    def _higher_timeframe_l2_score_floor(self) -> int:
+        base = 53 if self._strategy_mode() == "swing" else 57
+        adjustment = {"conservative": 4, "standard": 0, "aggressive": -4}.get(self._risk_preference(), 0)
+        return max(45, min(80, base + adjustment))
+
+    def _higher_timeframe_ai_supplemental_reasons(
+        self,
+        inst_id: str,
+        score: Dict[str, Any],
+        snapshot: Dict[str, Any],
+    ) -> List[str]:
+        if self._strategy_mode() not in ("swing", "long"):
+            return []
+
+        reasons: List[str] = []
+        direction = str(score.get("final_direction", score.get("direction", "")) or "")
+        if direction not in ("做多", "做空"):
+            direction = str(score.get("raw_direction", "") or "")
+        direction_score = int(score.get("direction_score", score.get("raw_total_score", 0)) or 0)
+        floor = self._higher_timeframe_l2_score_floor()
+        aligned = self._higher_timeframe_l2_direction_aligned(direction, snapshot)
+
+        context = snapshot.get("market_context", {}) if isinstance(snapshot.get("market_context"), dict) else {}
+        pressure_moves = (
+            (context.get("pressure_windows") or {}).get("moves", {})
+            if isinstance(context.get("pressure_windows"), dict)
+            else {}
+        )
+        if self._strategy_mode() == "swing":
+            move_values = [to_float(pressure_moves.get(label)) for label in ("30m", "45m", "60m")]
+            atr_pct = to_float((snapshot.get("trend_profiles", {}).get("1H") or {}).get("atr_pct"))
+            atr_factor = {"conservative": 1.0, "standard": 0.9, "aggressive": 0.8}.get(
+                self._risk_preference(),
+                0.9,
+            )
+            displacement_floor = max(0.45, atr_pct * atr_factor)
+        else:
+            move_values = [to_float(pressure_moves.get(label)) for label in ("4H", "8H")]
+            atr_pct = to_float((snapshot.get("trend_profiles", {}).get("4H") or {}).get("atr_pct"))
+            displacement_floor = max(0.8, atr_pct * 0.9)
+        strongest_move = max(move_values, key=abs) if move_values else 0.0
+        move_direction = "做多" if strongest_move > 0 else "做空" if strongest_move < 0 else ""
+        displacement_active = (
+            abs(strongest_move) >= displacement_floor
+            and move_direction == direction
+            and direction_score >= floor - 4
+            and aligned
+        )
+        displacement_key = f"{inst_id}:sustained_displacement:{move_direction}"
+        if displacement_active:
+            last_displacement_at = self._ai_supplemental_last_at.get(displacement_key, 0.0)
+            if (
+                last_displacement_at <= 0
+                or self._now_ts() - last_displacement_at >= SWING_AI_SUSTAINED_REVIEW_INTERVAL_SECONDS
+            ):
+                reasons.append("sustained_displacement")
+                self._ai_supplemental_last_at[displacement_key] = self._now_ts()
+        elif abs(strongest_move) < displacement_floor * 0.65:
+            for key in list(self._ai_supplemental_last_at):
+                if key.startswith(f"{inst_id}:sustained_displacement:"):
+                    self._ai_supplemental_last_at.pop(key, None)
+
+        forecast = score.get("structure_forecast") if isinstance(score.get("structure_forecast"), dict) else {}
+        forecast_direction = str(forecast.get("direction", "") or "")
+        forecast_probability = int(
+            forecast.get("calibrated_probability", forecast.get("probability", 0)) or 0
+        )
+        forecast_threshold = int(
+            forecast.get("effective_push_threshold", self.config.forecast_push_score)
+            or self.config.forecast_push_score
+        )
+        forecast_active = (
+            str(forecast.get("scenario", "none") or "none") not in ("none", "")
+            and forecast_direction == direction
+            and forecast_probability >= forecast_threshold + 5
+            and direction_score >= floor - 4
+            and aligned
+        )
+        forecast_key = f"{inst_id}:high_probability_forecast:{forecast_direction}"
+        if forecast_active:
+            if forecast_key not in self._ai_supplemental_latched:
+                reasons.append("high_probability_forecast")
+                self._ai_supplemental_latched.add(forecast_key)
+        elif not forecast.get("active") or forecast_probability < forecast_threshold:
+            for key in list(self._ai_supplemental_latched):
+                if key.startswith(f"{inst_id}:high_probability_forecast:"):
+                    self._ai_supplemental_latched.discard(key)
+
+        prior_direction = str(score.get("prior_direction", "") or "")
+        if (
+            prior_direction in ("做多", "做空")
+            and direction in ("做多", "做空")
+            and prior_direction != direction
+            and direction_score >= floor - 2
+            and aligned
+        ):
+            reasons.append("direction_reversal")
+        return reasons
+
+    def _higher_timeframe_l2_direction_aligned(
+        self,
+        direction: str,
+        snapshot: Dict[str, Any],
+    ) -> bool:
+        if direction not in ("做多", "做空"):
+            return False
+        profiles = snapshot.get("trend_profiles", {}) if isinstance(snapshot.get("trend_profiles"), dict) else {}
+        if self._strategy_mode() == "swing":
+            lead_trend = str((profiles.get("15m") or {}).get("trend", "") or "")
+            target_trend = str((profiles.get("1H") or {}).get("trend", "") or "")
+        else:
+            lead_trend = str((profiles.get("4H") or {}).get("trend", "") or "")
+            target_trend = str((profiles.get("1D") or {}).get("trend", "") or "")
+        wanted = "up" if direction == "做多" else "down"
+        opposite = "down" if wanted == "up" else "up"
+        return lead_trend != opposite and target_trend != opposite and wanted in (lead_trend, target_trend)
+
+    def _higher_timeframe_l2_qualifies_ai_call(
+        self,
+        trigger_reasons: List[str],
+        signal_types: set,
+        score: Dict[str, Any],
+        snapshot: Dict[str, Any],
+    ) -> bool:
+        reason_set = set(trigger_reasons or [])
+        if reason_set.intersection(
+            {"sustained_displacement", "high_probability_forecast", "direction_reversal"}
+        ):
+            return True
+        strong_types = signal_types.intersection({"volume_spike", "structure_break", "oi_change"})
+        if not strong_types:
+            return False
+
+        direction = str(score.get("final_direction", score.get("direction", "")) or "")
+        if direction not in ("做多", "做空"):
+            direction = str(score.get("raw_direction", "") or "")
+        direction_score = int(score.get("direction_score", score.get("raw_total_score", 0)) or 0)
+        floor = self._higher_timeframe_l2_score_floor()
+        aligned = self._higher_timeframe_l2_direction_aligned(direction, snapshot)
+
+        if len(strong_types) >= 2 and direction_score >= floor - 4 and aligned:
+            return True
+        if direction_score >= floor and aligned:
+            return True
+
+        forecast = score.get("structure_forecast") if isinstance(score.get("structure_forecast"), dict) else {}
+        forecast_direction = str(forecast.get("direction", "") or "")
+        forecast_probability = int(
+            forecast.get("calibrated_probability", forecast.get("probability", 0)) or 0
+        )
+        forecast_threshold = int(
+            forecast.get("effective_push_threshold", self.config.forecast_push_score)
+            or self.config.forecast_push_score
+        )
+        if (
+            "structure_forecast_active" in reason_set
+            and forecast.get("active")
+            and forecast_direction == direction
+            and forecast_probability >= max(50, forecast_threshold - 2)
+            and direction_score >= floor - 3
+            and aligned
+        ):
+            return True
+
+        sentiment_meta = score.get("sentiment_meta") if isinstance(score.get("sentiment_meta"), dict) else {}
+        if reason_set.intersection({"sentiment_leading", "sentiment_structure_conflict"}):
+            return (
+                int(sentiment_meta.get("strength", 0) or 0) >= 3
+                and direction_score >= floor - 2
+                and aligned
+            )
+        return False
+
     def _push_cooldown_seconds(self, push_kind: str) -> int:
         if push_kind == "spike":
-            return max(0, int(self.runtime_config.spike_push_cooldown_seconds))
+            cooldown = max(0, int(self.runtime_config.spike_push_cooldown_seconds))
+            if self._strategy_mode() == "swing":
+                return max(cooldown, SWING_SPIKE_COOLDOWN_SECONDS)
+            if self._strategy_mode() == "long":
+                return max(cooldown, SWING_SPIKE_COOLDOWN_SECONDS * 2)
+            return cooldown
         if push_kind == "watch":
             return max(0, int(self.runtime_config.watch_push_cooldown_seconds))
         if push_kind == "forecast":
@@ -6811,6 +7172,8 @@ class OkxAiShortTermAssistant:
             audited["post_audit"] = audit
             audited["scalp_direction"] = scalp_dir
             audited["scalp_score"] = int(scalp_view.get("score", 0) or 0)
+            audited["strategy_spike_qualified"] = True
+            audited["effective_spike_score"] = self._strategy_spike_score_threshold()
             return audited
 
         direction = str(audited.get("direction", "观望") or "观望")
@@ -6831,6 +7194,18 @@ class OkxAiShortTermAssistant:
         if push == "spike" and scalp_active:
             audited["confidence"] = max(confidence, int(scalp_view.get("score", 0) or 0))
             confidence = int(audited.get("confidence", 0) or 0)
+
+        if push == "spike" and self._strategy_mode() in ("swing", "long"):
+            spike_qualified, spike_reason = self._strategy_spike_qualification(score, signals, snapshot)
+            same_direction = direction == scalp_dir and direction in ("做多", "做空")
+            if not spike_qualified or not same_direction:
+                audited["push_recommendation"] = self._downgrade_push_recommendation("spike", confidence)
+                audit["action"] = "blocked"
+                audit["reasons"].append(spike_reason or "strategy_spike_direction_mismatch")
+                push = str(audited.get("push_recommendation", "none") or "none")
+            else:
+                audited["strategy_spike_qualified"] = True
+                audited["effective_spike_score"] = self._strategy_spike_score_threshold()
 
         if self.config.ai_conflict_guard and push in ("trade", "spike"):
             blocked = False
@@ -7003,24 +7378,66 @@ class OkxAiShortTermAssistant:
         decision_source: str = "local_screening",
         ai_called: bool = False,
     ) -> Dict[str, Any]:
-        push_recommendation = self._local_push_recommendation(score, signals)
         screening = self.build_local_screening(snapshot or {}, signals, score, trigger)
         local_bias = str(screening.get("local_bias", "观望") or "观望")
-        direction = "观望"
-        confidence = int(score.get("raw_total_score", 0) or 0)
+        direction = str(score.get("final_direction", score.get("direction", "观望")) or "观望")
+        if direction not in ("做多", "做空", "观望"):
+            direction = "观望"
+
+        raw_score = int(score.get("raw_total_score", 0) or 0)
+        trade_score = int(score.get("final_trade_score", raw_score) or 0)
+        confidence = trade_score if direction in ("做多", "做空") else raw_score
+        local_trade_threshold = (
+            min(100, self.trade_push_score(direction) + LOCAL_TRADE_PUSH_MARGIN)
+            if direction in ("做多", "做空")
+            else None
+        )
+        entry_plan = score.get("entry_plan") if isinstance(score.get("entry_plan"), dict) else {}
+        entry_quality = str(entry_plan.get("quality", "") or "")
+        local_trade_eligible = bool(
+            direction in ("做多", "做空")
+            and local_trade_threshold is not None
+            and trade_score >= local_trade_threshold
+            and not score.get("direction_guard")
+            and not score.get("direction_downgraded")
+            and entry_quality != "no_trade"
+        )
+
+        push_recommendation = self._local_push_recommendation(score, signals)
+        if local_trade_eligible:
+            push_recommendation = "trade"
+        elif direction in ("做多", "做空"):
+            local_watch_score = max(raw_score, trade_score)
+            push_recommendation = (
+                "watch"
+                if self.config.signal_watch_enabled and local_watch_score >= self.config.watch_push_score
+                else "none"
+            )
+
+        has_trade_direction = direction in ("做多", "做空")
+        source_label = "AI失败·本地兜底" if decision_source == "local_fallback" else "本地确认"
+        summary = str(screening.get("summary", "本地分析与信号筛查") or "本地分析与信号筛查")
+        if has_trade_direction:
+            summary = f"{source_label}：{direction}，本地交易分 {trade_score}"
         return {
             "direction": direction,
             "local_bias": local_bias,
             "local_screening": screening,
             "confidence": max(0, min(100, confidence)),
             "push_recommendation": push_recommendation,
-            "entry": "-",
-            "stop_loss": "-",
-            "take_profit": "-",
+            "entry": score.get("entry", entry_plan.get("entry", "-")) if has_trade_direction else "-",
+            "stop_loss": score.get("stop_loss", entry_plan.get("stop_loss", "-")) if has_trade_direction else "-",
+            "take_profit": score.get("take_profit", entry_plan.get("take_profit", "-")) if has_trade_direction else "-",
             "risk_level": score.get("risk_level", "中"),
-            "summary": screening.get("summary", "本地回顾与信号筛查"),
+            "summary": summary,
             "reasons": [item.get("desc", item.get("type", "")) for item in signals[:3]],
-            "rule_audit": {"overall": "本地筛查", "warnings": []},
+            "rule_audit": {
+                "overall": source_label,
+                "warnings": [],
+                "local_trade_eligible": local_trade_eligible,
+                "local_trade_threshold": local_trade_threshold,
+                "local_trade_score": trade_score,
+            },
             "decision_source": decision_source,
             "ai_called": ai_called,
             "trigger_level": trigger.get("level", "L0"),
@@ -7129,8 +7546,15 @@ class OkxAiShortTermAssistant:
         if recommendation == "spike":
             if not self.config.signal_spike_enabled:
                 return ""
-            if confidence < self.config.spike_push_score:
+            threshold = self._strategy_spike_score_threshold()
+            if confidence < threshold:
                 return ""
+            if self._strategy_mode() in ("swing", "long"):
+                qualified = bool(final_decision.get("strategy_spike_qualified"))
+                if not qualified:
+                    qualified, _ = self._strategy_spike_qualification(score, signals)
+                if not qualified:
+                    return ""
             return "spike"
 
         if recommendation == "watch":
@@ -7229,8 +7653,15 @@ class OkxAiShortTermAssistant:
         if recommendation == "spike":
             if not self.config.signal_spike_enabled:
                 return "spike_disabled"
-            if confidence < self.config.spike_push_score:
-                return f"confidence_below_threshold({confidence}<{self.config.spike_push_score})"
+            threshold = self._strategy_spike_score_threshold()
+            if confidence < threshold:
+                return f"confidence_below_threshold({confidence}<{threshold})"
+            if self._strategy_mode() in ("swing", "long"):
+                qualified = bool(final_decision.get("strategy_spike_qualified"))
+                if not qualified:
+                    qualified, reason = self._strategy_spike_qualification(score, signals)
+                    if not qualified:
+                        return reason
         elif recommendation == "watch":
             if not self.config.signal_watch_enabled:
                 return "watch_disabled"
@@ -7336,10 +7767,26 @@ class OkxAiShortTermAssistant:
             confidence = int(decision.get("confidence", 0) or 0)
             if confidence < self.config.watch_push_score + WECHAT_WATCH_AI_MIN_MARGIN:
                 return f"watch_confidence_below_wechat({confidence})"
+            if self._strategy_mode() in ("swing", "long") and "scalp_spike" in (trigger.get("reasons") or []):
+                scalp_view = self._scalp_view(score)
+                if decision.get("direction") != scalp_view.get("direction"):
+                    return "strategy_spike_watch_direction_mismatch"
+                qualified, reason = self._strategy_spike_qualification(score, signals)
+                if not qualified:
+                    return reason
             return ""
 
         if kind == "spike":
             confidence = self._effective_push_confidence(decision, score, "spike")
+            threshold = self._strategy_spike_score_threshold()
+            if confidence < threshold:
+                return f"spike_below_strategy_threshold({confidence}<{threshold})"
+            if self._strategy_mode() in ("swing", "long"):
+                qualified = bool(decision.get("strategy_spike_qualified"))
+                if not qualified:
+                    qualified, reason = self._strategy_spike_qualification(score, signals)
+                    if not qualified:
+                        return reason
             post_audit = decision.get("post_audit") if isinstance(decision.get("post_audit"), dict) else {}
             l3_local = post_audit.get("action") == "l3_local_spike"
             if ai_invoked and str(decision.get("push_recommendation", "")) in ("spike", "trade"):
@@ -7964,6 +8411,11 @@ class OkxAiShortTermAssistant:
             trigger["ai_invoked"] = True
             self.last_ai_call_at[inst_id] = self._now_ts()
             self.last_ai_fingerprint[inst_id] = trigger["fingerprint"]
+            ai_direction = str(score.get("final_direction", score.get("direction", "")) or "")
+            if ai_direction not in ("做多", "做空"):
+                ai_direction = str(score.get("raw_direction", "") or "")
+            if ai_direction in ("做多", "做空"):
+                self.last_ai_direction[inst_id] = ai_direction
 
         final_decision = self.merge_final_decision(analysis, score, signals, trigger, snapshot)
         final_decision = self._apply_decision_post_audit(final_decision, score, signals, trigger, snapshot)

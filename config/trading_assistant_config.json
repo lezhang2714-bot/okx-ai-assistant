@@ -16,6 +16,7 @@
   "forecast_push_score": 58,
   "forecast_horizon_minutes": 15,
   "signal_forecast_enabled": true,
+  "signal_watch_enabled": false,
   "calibration_enabled": true,
   "calibration_min_samples": 8,
   "calibration_blend_weight": 0.65,
