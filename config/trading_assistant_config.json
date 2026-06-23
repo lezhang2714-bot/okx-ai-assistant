@@ -1,31 +1,12 @@
 {
   "inst_ids": [
-    "BTC-USDT-SWAP",
     "ETH-USDT-SWAP"
   ],
-  "interval": 5,
   "record_replay_enabled": false,
-  "strategy_mode": "short",
-  "risk_preference": "standard",
+  "strategy_mode": "swing",
+  "risk_preference": "aggressive",
   "ai_enabled": false,
   "push_enabled": false,
-  "push_score": 75,
-  "short_push_score": 75,
-  "watch_push_score": 65,
-  "spike_push_score": 60,
-  "forecast_push_score": 58,
-  "forecast_horizon_minutes": 15,
-  "signal_forecast_enabled": true,
-  "signal_watch_enabled": false,
-  "calibration_enabled": true,
-  "calibration_min_samples": 8,
-  "calibration_blend_weight": 0.65,
-  "calibration_disable_below_hit_rate": 0.38,
-  "ai_conflict_guard": true,
-  "l3_local_spike_push": true,
-  "l2_require_volume_or_structure": true,
-  "spike_push_cooldown_seconds": 450,
-  "watch_push_cooldown_seconds": 900,
-  "reverse_trade_cooldown_seconds": 300,
-  "forecast_push_cooldown_seconds": 1200
+  "push_score": 70,
+  "short_push_score": 68
 }

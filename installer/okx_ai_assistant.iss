@@ -2,7 +2,7 @@
 ; Build via build_installer_windows.bat (requires Inno Setup 6).
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.2.0"
+  #define MyAppVersion "1.3.0"
 #endif
 #ifndef MyAppName
   #define MyAppName "OKX AI Assistant"

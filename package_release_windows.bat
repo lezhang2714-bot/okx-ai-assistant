@@ -34,18 +34,26 @@ echo [release] date    : !BUILD_DATE!
 echo [release] bundle  : !RELEASE_NAME!.zip
 echo.
 
+call :ensure_app_icon
+if !ERRORLEVEL! NEQ 0 (
+    pause
+    exit /b 1
+)
+
 if exist "!STAGING_ROOT!" rmdir /s /q "!STAGING_ROOT!"
 mkdir "!STAGING_DIR!" 2>nul
 mkdir "!OUTPUT_DIR!" 2>nul
 
-call :copy_required "web_control_panel.py"
-call :copy_required "okx_signal_monitor.py"
-call :copy_required "tray_launcher.py"
-call :copy_required "launch_web_control_panel.vbs"
-call :copy_required "setup_windows_runtime.bat"
-call :copy_required "start_web_control_panel_windows.bat"
-call :copy_required "launch_web_control_panel.vbs"
-call :copy_required "restart_web_control_panel_windows.bat"
+call :copy_required "web_control_panel.py" || goto :fail
+call :copy_required "okx_signal_monitor.py" || goto :fail
+call :copy_required "monitor_config_summary.py" || goto :fail
+call :copy_required "monitor_design_docs.py" || goto :fail
+call :copy_required "runtime_identity.py" || goto :fail
+call :copy_required "tray_launcher.py" || goto :fail
+call :copy_required "launch_web_control_panel.vbs" || goto :fail
+call :copy_required "setup_windows_runtime.bat" || goto :fail
+call :copy_required "start_web_control_panel_windows.bat" || goto :fail
+call :copy_required "restart_web_control_panel_windows.bat" || goto :fail
 
 if exist "%~dp0config" (
     mkdir "!STAGING_DIR!\config" 2>nul
@@ -56,6 +64,11 @@ if exist "%~dp0config" (
 
 if exist "%~dp0web_assets" (
     xcopy /e /i /y /q "%~dp0web_assets" "!STAGING_DIR!\web_assets\" >nul
+) else (
+    mkdir "!STAGING_DIR!\web_assets" 2>nul
+)
+if not exist "!STAGING_DIR!\web_assets\app.ico" (
+    if exist "%~dp0web_assets\app.ico" copy /y "%~dp0web_assets\app.ico" "!STAGING_DIR!\web_assets\app.ico" >nul
 )
 
 call :write_readme "!STAGING_DIR!\README.txt"
@@ -84,10 +97,14 @@ if exist "!STAGING_ROOT!" rmdir /s /q "!STAGING_ROOT!"
 pause
 exit /b 0
 
+:fail
+echo [release] staging failed.
+pause
+exit /b 1
+
 :copy_required
 if not exist "%~dp0%~1" (
     echo [release] missing required file: %~1
-    pause
     exit /b 1
 )
 copy /y "%~dp0%~1" "!STAGING_DIR!\" >nul
@@ -103,4 +120,27 @@ exit /b 0
 >> "%~1" echo.
 >> "%~1" echo Web console: http://127.0.0.1:8765
 >> "%~1" echo Default login: admin / admin123
+exit /b 0
+
+:ensure_app_icon
+if exist "%~dp0web_assets\app_icon.png" (
+    echo [release] building app.ico from web_assets\app_icon.png...
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0installer\png_to_ico.ps1" -PngPath "%~dp0web_assets\app_icon.png" -IcoPath "%~dp0web_assets\app.ico"
+    if !ERRORLEVEL! NEQ 0 (
+        echo [release] failed to convert app_icon.png to app.ico
+        exit /b 1
+    )
+    if exist "%~dp0web_assets\app.ico" exit /b 0
+)
+if exist "%~dp0web_assets\app.ico" exit /b 0
+echo [release] web_assets\app.ico not found, generating default icon...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0installer\generate_app_icon.ps1" -OutputPath "%~dp0web_assets\app.ico"
+if !ERRORLEVEL! NEQ 0 (
+    echo [release] failed to generate app.ico
+    exit /b 1
+)
+if not exist "%~dp0web_assets\app.ico" (
+    echo [release] failed to generate app.ico
+    exit /b 1
+)
 exit /b 0

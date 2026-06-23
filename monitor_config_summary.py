@@ -12,24 +12,65 @@ SWING_AI_CALL_MIN_INTERVAL_SECONDS = 300
 LONG_AI_CALL_MIN_INTERVAL_SECONDS = 600
 SWING_AI_SUSTAINED_REVIEW_INTERVAL_SECONDS = 300
 
+# 轮询间隔与策略周期绑定：更慢周期不必高频 REST 轮询。
+STRATEGY_DEFAULT_INTERVAL_SECONDS: Dict[str, int] = {
+    "scalp": 5,
+    "short": 5,
+    "swing": 60,
+    "long": 180,
+}
+
+
+def recommended_interval_for_strategy(strategy_mode: str) -> int:
+    mode = str(strategy_mode or "short").strip().lower()
+    return max(1, int(STRATEGY_DEFAULT_INTERVAL_SECONDS.get(mode, STRATEGY_DEFAULT_INTERVAL_SECONDS["short"])))
+
+# 压测验证窗口与策略周期绑定：与主周期/前瞻 horizon 对齐。
+STRATEGY_DEFAULT_ACCURACY_HORIZON_SECONDS: Dict[str, int] = {
+    "scalp": 5,
+    "short": 900,
+    "swing": 3600,
+    "long": 14400,
+}
+
+STRATEGY_ACCURACY_HORIZON_HINTS: Dict[str, str] = {
+    "scalp": "轮询级",
+    "short": "短线推荐",
+    "swing": "中线推荐",
+    "long": "长线推荐",
+}
+
+
+def recommended_accuracy_horizon_for_strategy(strategy_mode: str) -> int:
+    mode = str(strategy_mode or "swing").strip().lower()
+    return max(
+        5,
+        int(
+            STRATEGY_DEFAULT_ACCURACY_HORIZON_SECONDS.get(
+                mode,
+                STRATEGY_DEFAULT_ACCURACY_HORIZON_SECONDS["swing"],
+            )
+        ),
+    )
+
 # Single source for monitor/Web CLI behavior defaults (must match SignalConfig + default_config).
 MONITOR_BEHAVIOR_DEFAULTS: Dict[str, Any] = {
     "interval": 5,
-    "push_score": 75,
-    "short_push_score": 75,
+    "push_score": 70,
+    "short_push_score": 68,
     "watch_push_score": 65,
     "spike_push_score": 62,
     "forecast_push_score": 58,
-    "forecast_horizon_minutes": 15,
-    "push_cooldown_seconds": 900,
-    "spike_push_cooldown_seconds": 900,
-    "watch_push_cooldown_seconds": 900,
-    "reverse_trade_cooldown_seconds": 300,
-    "forecast_push_cooldown_seconds": 1800,
-    "strategy_mode": "short",
-    "risk_preference": "standard",
+    "forecast_horizon_minutes": 240,
+    "push_cooldown_seconds": 1800,
+    "spike_push_cooldown_seconds": 1200,
+    "watch_push_cooldown_seconds": 1800,
+    "reverse_trade_cooldown_seconds": 600,
+    "forecast_push_cooldown_seconds": 3600,
+    "strategy_mode": "swing",
+    "risk_preference": "aggressive",
     "signal_trade_enabled": True,
-    "signal_watch_enabled": True,
+    "signal_watch_enabled": False,
     "signal_spike_enabled": True,
     "signal_forecast_enabled": True,
     "ai_conflict_guard": True,
@@ -98,7 +139,51 @@ ACCURACY_METRIC_SCOPES: Dict[str, str] = {
 }
 
 
+# Fixed in code; not exposed on Web config UI (always applied via apply_fixed_behavior_defaults).
+FIXED_BEHAVIOR_KEYS: frozenset = frozenset(
+    {
+        "signal_watch_enabled",
+        "watch_push_score",
+        "spike_push_score",
+        "ai_conflict_guard",
+        "l3_local_spike_push",
+        "l2_require_volume_or_structure",
+        "push_cooldown_seconds",
+        "spike_push_cooldown_seconds",
+        "watch_push_cooldown_seconds",
+        "reverse_trade_cooldown_seconds",
+        "signal_forecast_enabled",
+        "forecast_push_score",
+        "forecast_horizon_minutes",
+        "forecast_push_cooldown_seconds",
+        "calibration_enabled",
+        "calibration_min_samples",
+        "calibration_blend_weight",
+        "calibration_disable_below_hit_rate",
+        "paper_follow_ai_only",
+        "paper_fee_bps",
+        "forward_require_forecast_alignment",
+        "replay_ai_cache_enabled",
+    }
+)
+
+
+def apply_fixed_behavior_defaults(config: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(config)
+    for key in FIXED_BEHAVIOR_KEYS:
+        merged[key] = MONITOR_BEHAVIOR_DEFAULTS[key]
+    return merged
+
+
+def sync_strategy_bound_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    merged = apply_fixed_behavior_defaults(config)
+    merged["interval"] = recommended_interval_for_strategy(merged.get("strategy_mode"))
+    return merged
+
+
 def config_value(config: Any, key: str, default: Any = None) -> Any:
+    if key in FIXED_BEHAVIOR_KEYS:
+        return MONITOR_BEHAVIOR_DEFAULTS[key]
     if isinstance(config, dict) and key in config:
         return config[key]
     if default is not None:

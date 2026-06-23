@@ -69,11 +69,13 @@ mkdir "!OUTPUT_DIR!" 2>nul
 
 call :copy_required "web_control_panel.py" || goto :fail
 call :copy_required "okx_signal_monitor.py" || goto :fail
+call :copy_required "monitor_config_summary.py" || goto :fail
+call :copy_required "monitor_design_docs.py" || goto :fail
+call :copy_required "runtime_identity.py" || goto :fail
 call :copy_required "tray_launcher.py" || goto :fail
 call :copy_required "launch_web_control_panel.vbs" || goto :fail
 call :copy_required "setup_windows_runtime.bat" || goto :fail
 call :copy_required "start_web_control_panel_windows.bat" || goto :fail
-call :copy_required "launch_web_control_panel.vbs" || goto :fail
 call :copy_required "restart_web_control_panel_windows.bat" || goto :fail
 
 if exist "%~dp0config" (

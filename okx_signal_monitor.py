@@ -3,7 +3,7 @@
 OKX AI short-term trading assistant V1.
 
 Scope:
-    - Monitor OKX USDT perpetual swaps (default BTC/ETH; configurable via Web or --inst-ids).
+    - Monitor OKX USDT perpetual swaps (default ETH; configurable via Web or --inst-ids).
     - Provide analysis and suggestions only.
     - No auto order, no martingale, no grid.
 
@@ -20,7 +20,7 @@ Production tuning:
     export RETRY_TIMES=3
     export PUSH_COOLDOWN_SECONDS=900
     export LOG_MAX_BYTES=524288000
-    export LOG_TOTAL_MAX_BYTES=1572864000
+    export LOG_TOTAL_MAX_BYTES=8589934592
     export VOLUME_MULTIPLIER=2.0
     export OI_CHANGE_PCT_15M=5.0
     export AI_REQUEST_TIMEOUT=30
@@ -64,8 +64,12 @@ from monitor_config_summary import (
     SWING_SPIKE_SCORE_MARGIN,
     SWING_AI_CALL_MIN_INTERVAL_SECONDS,
     SWING_AI_SUSTAINED_REVIEW_INTERVAL_SECONDS,
+    apply_fixed_behavior_defaults,
     build_effective_config_lines,
     build_log_config_snapshot,
+    config_value,
+    recommended_interval_for_strategy,
+    sync_strategy_bound_config,
 )
 
 try:
@@ -77,6 +81,7 @@ except ImportError:
 
 # 默认快捷合约；Web 控制台与 --inst-ids 可配置其他 OKX USDT 永续。
 PRESET_INSTRUMENTS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
+DEFAULT_MONITOR_INSTRUMENTS = ("ETH-USDT-SWAP",)
 SUPPORTED_INSTRUMENTS = PRESET_INSTRUMENTS
 INST_ID_PATTERN = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+-SWAP$")
 
@@ -103,11 +108,15 @@ DEFAULT_AI_PROBE_INTERVAL_SECONDS = 60
 DEFAULT_AI_ABNORMAL_ALERT_SECONDS = 300
 DEFAULT_AI_ABNORMAL_ALERT_COOLDOWN_SECONDS = 3600
 DEFAULT_AI_RATE_LIMIT_BACKOFF_SECONDS = 30.0
-DEFAULT_PUSH_COOLDOWN_SECONDS = 900
-DEFAULT_SPIKE_PUSH_COOLDOWN_SECONDS = 900
-DEFAULT_WATCH_PUSH_COOLDOWN_SECONDS = 900
-DEFAULT_REVERSE_TRADE_COOLDOWN_SECONDS = 300
-DEFAULT_FORECAST_PUSH_COOLDOWN_SECONDS = 1800
+DEFAULT_PUSH_COOLDOWN_SECONDS = 1800
+DEFAULT_SPIKE_PUSH_COOLDOWN_SECONDS = 1200
+DEFAULT_WATCH_PUSH_COOLDOWN_SECONDS = 1800
+DEFAULT_REVERSE_TRADE_COOLDOWN_SECONDS = 600
+DEFAULT_FORECAST_PUSH_COOLDOWN_SECONDS = 3600
+DEFAULT_WATCH_PUSH_SCORE = 65
+DEFAULT_SPIKE_PUSH_SCORE = 62
+DEFAULT_FORECAST_PUSH_SCORE = 58
+DEFAULT_FORECAST_HORIZON_MINUTES = 240
 DEFAULT_WECHAT_MIN_INTERVAL_SECONDS = 600
 WECHAT_PUSH_KIND_PRIORITY = ("trade", "spike", "forecast")
 WECHAT_WATCH_AI_MIN_MARGIN = 5
@@ -120,7 +129,7 @@ DEFAULT_AI_CALL_MIN_INTERVAL_SECONDS = 60
 # 500MB；12h 写入量约 177MB，留足余量避免过早轮转导致 Web 图表/压测丢数据。
 DEFAULT_LOG_MAX_BYTES = 500 * 1024 * 1024
 # 默认总容量 1.5GB（约 3 个 500MB 分卷）；超过后删除最旧分卷。
-DEFAULT_LOG_TOTAL_MAX_BYTES = 1500 * 1024 * 1024
+DEFAULT_LOG_TOTAL_MAX_BYTES = 8 * 1024 * 1024 * 1024
 MIN_LOG_MAX_BYTES = 50 * 1024 * 1024
 WECHAT_PUSH_MAX_DESP = 28000
 TRADE_TRIGGER_SIGNALS = frozenset(
@@ -1087,10 +1096,10 @@ class SignalConfig:
     # 多头或空头占比超过75%，认为市场情绪极端。
     long_short_extreme: float = 0.75
 
-    strategy_mode: str = "short"
-    risk_preference: str = "standard"
+    strategy_mode: str = "swing"
+    risk_preference: str = "aggressive"
     signal_trade_enabled: bool = True
-    signal_watch_enabled: bool = True
+    signal_watch_enabled: bool = False
     signal_spike_enabled: bool = True
     ai_output_style: str = "steady"
     allow_scalp_trade: bool = False
@@ -1098,14 +1107,14 @@ class SignalConfig:
     allow_oi_divergence_momentum: bool = False
     scalp_move_pct_5m: float = 0.22
     scalp_move_pct_10m: float = 0.35
-    watch_push_score: int = DEFAULT_PUSH_SCORE
-    spike_push_score: int = 62
+    watch_push_score: int = DEFAULT_WATCH_PUSH_SCORE
+    spike_push_score: int = DEFAULT_SPIKE_PUSH_SCORE
     ai_conflict_guard: bool = True
     l3_local_spike_push: bool = False
     l2_require_volume_or_structure: bool = True
     signal_forecast_enabled: bool = True
-    forecast_push_score: int = 58
-    forecast_horizon_minutes: int = 15
+    forecast_push_score: int = DEFAULT_FORECAST_PUSH_SCORE
+    forecast_horizon_minutes: int = DEFAULT_FORECAST_HORIZON_MINUTES
     calibration_enabled: bool = True
     calibration_min_samples: int = 8
     calibration_blend_weight: float = 0.65
@@ -10965,13 +10974,14 @@ def short_count_greater(trends: Dict[str, str]) -> bool:
 
 
 def _assistant_from_user_config(config: Dict[str, Any]) -> OkxAiShortTermAssistant:
-    inst_ids = config.get("inst_ids") or list(PRESET_INSTRUMENTS)
+    config = sync_strategy_bound_config(config)
+    inst_ids = config.get("inst_ids") or list(DEFAULT_MONITOR_INSTRUMENTS)
     if isinstance(inst_ids, str):
         inst_ids = [inst_ids]
     try:
         instruments = validate_instruments(order_configured_instruments(inst_ids))
     except ValueError:
-        instruments = list(PRESET_INSTRUMENTS)
+        instruments = list(DEFAULT_MONITOR_INSTRUMENTS)
     push_score = int(config.get("push_score", DEFAULT_PUSH_SCORE))
     short_push_score = int(config.get("short_push_score", push_score))
     watch_push_score = int(config.get("watch_push_score", 65))
@@ -11259,7 +11269,7 @@ def okx_swap_instrument_exists(inst_id: str) -> bool:
 def validate_instruments(instruments: List[str]) -> List[str]:
     ordered = order_configured_instruments(instruments)
     if not ordered:
-        return list(PRESET_INSTRUMENTS)
+        return list(DEFAULT_MONITOR_INSTRUMENTS)
     invalid_format = [inst for inst in ordered if not is_valid_inst_id_format(inst)]
     if invalid_format:
         raise ValueError(f"Invalid instrument format: {', '.join(invalid_format)}")
@@ -11273,7 +11283,7 @@ def parse_instruments(value: str) -> List[str]:
     try:
         instruments = parse_inst_id_tokens(value)
         if not instruments:
-            return list(PRESET_INSTRUMENTS)
+            return list(DEFAULT_MONITOR_INSTRUMENTS)
         return validate_instruments(instruments)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
@@ -11285,10 +11295,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--inst-ids",
         type=parse_instruments,
-        default=parse_instruments(os.getenv("OKX_INST_IDS", ",".join(PRESET_INSTRUMENTS))),
+        default=parse_instruments(os.getenv("OKX_INST_IDS", ",".join(DEFAULT_MONITOR_INSTRUMENTS))),
         help="Comma-separated OKX USDT swap instIds, e.g. BTC-USDT-SWAP,SOL-USDT-SWAP",
     )
-    parser.add_argument("--interval", type=int, default=int(os.getenv("OKX_INTERVAL", str(DEFAULT_INTERVAL_SECONDS))))
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=int(os.getenv("OKX_INTERVAL", str(DEFAULT_INTERVAL_SECONDS))),
+        help="Deprecated: interval follows --strategy-mode (scalp/short=5s, swing=60s, long=180s)",
+    )
     parser.add_argument("--runtime", type=int, default=int(os.getenv("OKX_RUNTIME", "0")))
     parser.add_argument("--flag", default=os.getenv("OKX_FLAG", "0"), choices=("0", "1"))
     parser.add_argument("--ai", action="store_true", default=os.getenv("AI_ENABLED", "0") == "1")
@@ -11316,12 +11331,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--funding-threshold", type=float, default=env_float("FUNDING_ABS_THRESHOLD", 0.0008))
     parser.add_argument("--funding-change-threshold", type=float, default=env_float("FUNDING_CHANGE_THRESHOLD", 0.0003))
     parser.add_argument("--long-short-extreme", type=float, default=env_float("LONG_SHORT_EXTREME", 0.75))
-    parser.add_argument("--strategy-mode", choices=tuple(STRATEGY_PROFILES.keys()), default=os.getenv("STRATEGY_MODE", "short"))
-    parser.add_argument("--risk-preference", choices=("conservative", "standard", "aggressive"), default=os.getenv("RISK_PREFERENCE", "standard"))
+    parser.add_argument("--strategy-mode", choices=tuple(STRATEGY_PROFILES.keys()), default=os.getenv("STRATEGY_MODE", "swing"))
+    parser.add_argument("--risk-preference", choices=("conservative", "standard", "aggressive"), default=os.getenv("RISK_PREFERENCE", "aggressive"))
     parser.add_argument("--ai-output-style", choices=("steady", "momentum", "trend"), default=os.getenv("AI_OUTPUT_STYLE", "steady"))
     parser.add_argument("--trade-signals", action="store_true", default=os.getenv("TRADE_SIGNALS_ENABLED", "1") == "1")
     parser.add_argument("--no-trade-signals", action="store_false", dest="trade_signals")
-    parser.add_argument("--watch-signals", action="store_true", default=os.getenv("WATCH_SIGNALS_ENABLED", "1") == "1")
+    parser.add_argument("--watch-signals", action="store_true", default=os.getenv("WATCH_SIGNALS_ENABLED", "0") == "1")
     parser.add_argument("--no-watch-signals", action="store_false", dest="watch_signals")
     parser.add_argument("--spike-alerts", action="store_true", default=os.getenv("SPIKE_ALERTS_ENABLED", "1") == "1")
     parser.add_argument("--no-spike-alerts", action="store_false", dest="spike_alerts")
@@ -11330,8 +11345,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-oi-divergence-momentum", action="store_true", default=os.getenv("ALLOW_OI_DIVERGENCE_MOMENTUM", "0") == "1")
     parser.add_argument("--scalp-move-pct-5m", type=float, default=env_float("SCALP_MOVE_PCT_5M", 0.22))
     parser.add_argument("--scalp-move-pct-10m", type=float, default=env_float("SCALP_MOVE_PCT_10M", 0.35))
-    parser.add_argument("--watch-push-score", type=int, default=env_int("WATCH_PUSH_SCORE", DEFAULT_PUSH_SCORE))
-    parser.add_argument("--spike-push-score", type=int, default=env_int("SPIKE_PUSH_SCORE", 62))
+    parser.add_argument("--watch-push-score", type=int, default=env_int("WATCH_PUSH_SCORE", DEFAULT_WATCH_PUSH_SCORE))
+    parser.add_argument("--spike-push-score", type=int, default=env_int("SPIKE_PUSH_SCORE", DEFAULT_SPIKE_PUSH_SCORE))
     parser.add_argument(
         "--ai-conflict-guard",
         action="store_true",
@@ -11342,7 +11357,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--l3-local-spike-push",
         action="store_true",
-        default=os.getenv("L3_LOCAL_SPIKE_PUSH", "1") == "1",
+        default=os.getenv("L3_LOCAL_SPIKE_PUSH", "0") == "1",
         help="On L3 scalp_spike, prefer local spike push without waiting for AI",
     )
     parser.add_argument("--no-l3-local-spike-push", action="store_false", dest="l3_local_spike_push")
@@ -11375,8 +11390,8 @@ def parse_args() -> argparse.Namespace:
         help="Enable parallel structure evolution forecast track",
     )
     parser.add_argument("--no-forecast-alerts", action="store_false", dest="forecast_alerts")
-    parser.add_argument("--forecast-push-score", type=int, default=env_int("FORECAST_PUSH_SCORE", 58))
-    parser.add_argument("--forecast-horizon-minutes", type=int, default=env_int("FORECAST_HORIZON_MINUTES", 15))
+    parser.add_argument("--forecast-push-score", type=int, default=env_int("FORECAST_PUSH_SCORE", DEFAULT_FORECAST_PUSH_SCORE))
+    parser.add_argument("--forecast-horizon-minutes", type=int, default=env_int("FORECAST_HORIZON_MINUTES", DEFAULT_FORECAST_HORIZON_MINUTES))
     parser.add_argument(
         "--forecast-push-cooldown",
         type=int,
@@ -11459,9 +11474,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     # 程序入口：解析参数，创建助手实例，进入循环。
     args = parse_args()
+    interval = max(recommended_interval_for_strategy(args.strategy_mode), 1)
     assistant = OkxAiShortTermAssistant(
         instruments=args.inst_ids,
-        interval=max(args.interval, 1),
+        interval=interval,
         flag=args.flag,
         ai_enabled=args.ai,
         push_enabled=args.push,
