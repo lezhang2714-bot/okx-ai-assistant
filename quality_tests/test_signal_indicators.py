@@ -17,6 +17,7 @@ from okx_signal_monitor import (  # noqa: E402
     kdj,
     macd,
     rsi,
+    to_float,
     trend_profile_from_candles,
 )
 
@@ -40,6 +41,58 @@ def sample_candles(count=140):
             "volume": 100 + (index % 13) * 7,
             "confirmed": "1",
         })
+    return rows
+
+
+def sharp_crash_1m_candles():
+    """模拟 15m 结构仍偏多、但当前 1m 正在急跌（未收盘）。"""
+    rows = []
+    for index in range(25):
+        close = 102.0 - index * 0.03
+        rows.append({
+            "time": f"2026-01-01 00:{index % 60:02d}:00",
+            "open": close + 0.02,
+            "high": close + 0.05,
+            "low": close - 0.04,
+            "close": close,
+            "volume": 100,
+            "confirmed": "1",
+        })
+    rows.insert(0, {
+        "time": "2026-01-01 00:58:00",
+        "open": 101.5,
+        "high": 101.6,
+        "low": 99.0,
+        "close": 101.2,
+        "volume": 150,
+        "confirmed": "0",
+    })
+    return rows
+
+
+def sharp_rally_1m_candles():
+    """模拟 15m 未完全同向，但 1m 正在急涨。"""
+    rows = []
+    for index in range(25):
+        close = 98.0 + index * 0.12
+        rows.append({
+            "time": f"2026-01-01 01:{index % 60:02d}:00",
+            "open": close - 0.02,
+            "high": close + 0.05,
+            "low": close - 0.04,
+            "close": close,
+            "volume": 100,
+            "confirmed": "1",
+        })
+    rows.insert(0, {
+        "time": "2026-01-01 01:58:00",
+        "open": 100.8,
+        "high": 102.5,
+        "low": 100.7,
+        "close": 102.2,
+        "volume": 180,
+        "confirmed": "0",
+    })
     return rows
 
 
@@ -433,6 +486,7 @@ class IndicatorTests(unittest.TestCase):
         )
         self.assertEqual(context["recent_price_pressure"], "down")
         self.assertEqual(context["bias"], "neutral")
+        self.assertTrue(context.get("bias_softened"))
         self.assertEqual(context["structural_bias"], "long")
         self.assertEqual(context["trend_phase"], "pullback_in_uptrend")
         self.assertEqual(context["strategy_template"], "bullish_pullback_wait_reclaim")
@@ -588,6 +642,200 @@ class IndicatorTests(unittest.TestCase):
             },
         )
         self.assertEqual(reason, "snapshot_quality_insufficient")
+
+    def test_tactical_profile_reacts_before_15m_close(self):
+        rows = sample_candles(140)
+        rows[0]["confirmed"] = "0"
+        anchor_close = to_float(rows[5]["close"])
+        rows[0]["close"] = anchor_close * 1.002
+        rows[0]["high"] = rows[0]["close"] * 1.001
+        live_price = anchor_close * 0.965
+        confirmed = trend_profile_from_candles(rows, "15m")
+        tactical = trend_profile_from_candles(rows, "15m", tactical=True, live_price=live_price)
+        self.assertTrue(tactical.get("data_quality", {}).get("includes_forming_bar"))
+        self.assertLess(to_float(tactical.get("ema_slope_pct")), to_float(confirmed.get("ema_slope_pct")))
+        self.assertLess(to_float(tactical.get("macd", {}).get("hist")), to_float(confirmed.get("macd", {}).get("hist")))
+
+    def test_falling_price_prefers_short_when_structure_still_bullish(self):
+        assistant = assistant_for_tests()
+        candles = {bar: sample_candles() for bar in ("1m", "3m", "5m", "15m", "1H", "4H")}
+        candles["1m"] = falling_1m_candles()
+        profiles = {bar: bullish_profile() for bar in candles}
+        profiles["5m"] = profile_with_trend("mixed")
+        profiles["15m"] = profile_with_trend("mixed")
+        snapshot = {
+            "price": 100.0,
+            "candles": candles,
+            "trend_profiles": profiles,
+            "market_context": {
+                "bias": "neutral",
+                "structural_bias": "long",
+                "regime": "mixed",
+                "recent_price_pressure": "down",
+                "trade_up": 0,
+                "trade_down": 1,
+                "recent_move_pct": {"5m": -0.15, "10m": -0.22, "15m": -0.28, "20m": -0.30},
+            },
+            "volume": {"direction": "down", "trend": "flat", "multiplier": 1.0},
+            "order_book": {"available": False},
+            "long_short_ratio": {"long_ratio": 0.5, "short_ratio": 0.5},
+            "funding_rate": 0.0,
+            "oi_change_pct_15m": 0.0,
+            "oi_warmup_ready": True,
+        }
+        score = assistant.score_snapshot(snapshot, [])
+        self.assertEqual(score["raw_direction"], SHORT)
+
+    def test_intrabar_crash_detects_before_15m_close(self):
+        assistant = assistant_for_tests()
+        candles = {bar: sample_candles() for bar in ("1m", "3m", "5m", "15m", "1H", "4H")}
+        candles["1m"] = sharp_crash_1m_candles()
+        profiles = {bar: bullish_profile() for bar in candles}
+        profiles["5m"] = profile_with_trend("up")
+        profiles["15m"] = profile_with_trend("up")
+        snapshot = {
+            "price": 99.2,
+            "candles": candles,
+            "trend_profiles": profiles,
+            "trend_profiles_live": profiles,
+            "market_context": {
+                "bias": "long",
+                "structural_bias": "long",
+                "regime": "trend_up",
+                "recent_price_pressure": "down",
+                "trade_up": 2,
+                "trade_down": 0,
+                "recent_move_pct": {"5m": -0.35, "10m": -0.55, "15m": -0.80, "20m": -1.10},
+            },
+            "volume": {"direction": "down", "trend": "up", "multiplier": 1.4},
+            "order_book": {"available": False},
+            "long_short_ratio": {"long_ratio": 0.55, "short_ratio": 0.45},
+            "funding_rate": 0.0,
+            "oi_change_pct_15m": -0.5,
+            "oi_warmup_ready": True,
+        }
+        score = assistant.score_snapshot(snapshot, [])
+        self.assertEqual(score["raw_direction"], SHORT)
+        self.assertIn(score.get("direction_tier"), ("intrabar_crash", "intrabar_drop", "price_leading"))
+        self.assertEqual(score["final_direction"], SHORT)
+
+    def test_swing_after_long_small_pullback_stays_watch_not_short(self):
+        assistant = assistant_for_tests()
+        assistant.config.strategy_mode = "swing"
+        candles = {bar: sample_candles() for bar in ("1m", "3m", "5m", "15m", "1H", "4H")}
+        closes = [101.0, 100.98, 101.02, 100.97, 101.0, 100.99, 100.96, 101.01, 100.95, 101.0]
+        candles["1m"] = [
+            {
+                "time": f"2026-01-01 04:{i % 60:02d}:00",
+                "open": c + 0.01,
+                "high": c + 0.03,
+                "low": c - 0.03,
+                "close": c,
+                "volume": 100,
+                "confirmed": "1",
+            }
+            for i, c in enumerate(closes)
+        ]
+        profiles = {bar: bullish_profile() for bar in candles}
+        profiles["15m"] = profile_with_trend("up")
+        assistant._remember_direction("BTC-USDT-SWAP", LONG)
+        snapshot = {
+            "inst_id": "BTC-USDT-SWAP",
+            "price": 101.0,
+            "candles": candles,
+            "trend_profiles": profiles,
+            "trend_profiles_live": profiles,
+            "market_context": {
+                "bias": "long",
+                "regime": "trend_up",
+                "recent_price_pressure": "down",
+                "trade_up": 2,
+                "trade_down": 0,
+                "recent_move_pct": {"5m": -0.04, "10m": -0.05, "15m": -0.06, "20m": -0.07},
+            },
+            "volume": {"direction": "flat", "trend": "flat", "multiplier": 1.0},
+            "order_book": {"available": False},
+            "long_short_ratio": {"long_ratio": 0.5, "short_ratio": 0.5},
+            "funding_rate": 0.0,
+            "oi_change_pct_15m": 0.0,
+            "oi_warmup_ready": True,
+        }
+        score = assistant.score_snapshot(snapshot, [])
+        self.assertNotEqual(score["raw_direction"], SHORT)
+
+    def test_swing_after_long_large_drop_short_without_15m_down(self):
+        assistant = assistant_for_tests()
+        assistant.config.strategy_mode = "swing"
+        candles = {bar: sample_candles() for bar in ("1m", "3m", "5m", "15m", "1H", "4H")}
+        candles["1m"] = sharp_crash_1m_candles()
+        profiles = {bar: bullish_profile() for bar in candles}
+        profiles["15m"] = profile_with_trend("up")
+        assistant._remember_direction("BTC-USDT-SWAP", LONG)
+        snapshot = {
+            "inst_id": "BTC-USDT-SWAP",
+            "price": 99.2,
+            "candles": candles,
+            "trend_profiles": profiles,
+            "trend_profiles_live": profiles,
+            "market_context": {
+                "bias": "long",
+                "regime": "trend_up",
+                "recent_price_pressure": "down",
+                "trade_up": 2,
+                "trade_down": 0,
+                "recent_move_pct": {"5m": -0.40, "10m": -0.65, "15m": -0.90, "20m": -1.10},
+            },
+            "volume": {"direction": "down", "trend": "up", "multiplier": 1.4},
+            "order_book": {"available": False},
+            "long_short_ratio": {"long_ratio": 0.5, "short_ratio": 0.5},
+            "funding_rate": 0.0,
+            "oi_change_pct_15m": 0.0,
+            "oi_warmup_ready": True,
+        }
+        score = assistant.score_snapshot(snapshot, [])
+        self.assertEqual(score["raw_direction"], SHORT)
+        self.assertIn(
+            score.get("direction_tier"),
+            ("swing_exit_short", "intrabar_crash", "intrabar_drop", "price_pullback"),
+        )
+
+    def test_swing_after_watch_large_rise_long_without_15m_up(self):
+        assistant = assistant_for_tests()
+        assistant.config.strategy_mode = "swing"
+        candles = {bar: sample_candles() for bar in ("1m", "3m", "5m", "15m", "1H", "4H")}
+        candles["1m"] = sharp_rally_1m_candles()
+        profiles = {bar: profile_with_trend("mixed") for bar in candles}
+        profiles["1H"] = profile_with_trend("up")
+        profiles["4H"] = profile_with_trend("up")
+        profiles["15m"] = profile_with_trend("mixed")
+        assistant._remember_direction("BTC-USDT-SWAP", WATCH)
+        snapshot = {
+            "inst_id": "BTC-USDT-SWAP",
+            "price": 102.2,
+            "candles": candles,
+            "trend_profiles": profiles,
+            "trend_profiles_live": profiles,
+            "market_context": {
+                "bias": "neutral",
+                "regime": "mixed",
+                "recent_price_pressure": "up",
+                "trade_up": 1,
+                "trade_down": 0,
+                "recent_move_pct": {"5m": 0.45, "10m": 0.70, "15m": 0.95, "20m": 1.20},
+            },
+            "volume": {"direction": "up", "trend": "up", "multiplier": 1.3},
+            "order_book": {"available": False},
+            "long_short_ratio": {"long_ratio": 0.5, "short_ratio": 0.5},
+            "funding_rate": 0.0,
+            "oi_change_pct_15m": 0.0,
+            "oi_warmup_ready": True,
+        }
+        score = assistant.score_snapshot(snapshot, [])
+        self.assertEqual(score["raw_direction"], LONG)
+        self.assertIn(
+            score.get("direction_tier"),
+            ("swing_entry_long", "intrabar_rally", "developing", "momentum", "aligned"),
+        )
 
 
 if __name__ == "__main__":

@@ -48,7 +48,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
@@ -698,11 +698,12 @@ STRATEGY_PROFILES = {
         "background_bars": ["4H"],
         "ignore_bars": [],
         "score_weights": {
-            "trend": 1.0,
-            "momentum": 1.0,
-            "volume_price": 1.0,
-            "derivatives": 1.15,
-            "orderbook": 0.8,
+            "trend": 1.2,
+            "momentum": 1.15,
+            "volume_price": 0.95,
+            "derivatives": 1.1,
+            "orderbook": 0.75,
+            "higher_timeframe": 1.35,
             "risk_control": 1.0,
         },
         "entry_style": "pullback_or_breakout",
@@ -715,12 +716,13 @@ STRATEGY_PROFILES = {
         "background_bars": [],
         "ignore_bars": ["1m"],
         "score_weights": {
-            "trend": 1.4,
-            "momentum": 0.7,
-            "volume_price": 0.7,
-            "derivatives": 1.2,
-            "orderbook": 0.3,
-            "risk_control": 1.3,
+            "trend": 1.55,
+            "momentum": 1.05,
+            "volume_price": 0.65,
+            "derivatives": 1.1,
+            "orderbook": 0.25,
+            "higher_timeframe": 1.5,
+            "risk_control": 1.2,
         },
         "entry_style": "trend_structure",
         "holding_time": "数小时-数天",
@@ -744,13 +746,25 @@ STRATEGY_PROFILES = {
     },
 }
 
+# 价格领先方向层级：不因质量/结构滞后把快速做空降级为观望。
+FAST_PRICE_DIRECTION_TIERS = frozenset({
+    "intrabar_crash",
+    "intrabar_drop",
+    "price_leading",
+    "price_pullback",
+    "swing_exit_short",
+    "swing_exit_watch",
+    "swing_entry_long",
+    "swing_entry_watch",
+})
+
 TREND_PROFILE_PARAMS: Dict[str, Dict[str, Any]] = {
     "1m": {"ema": (6, 13, 34, 89), "slope_bars": 5, "slope_floor_pct": 0.04, "atr_floor_pct": 0.035, "structure_lookback": 15},
     "3m": {"ema": (8, 21, 55, 120), "slope_bars": 5, "slope_floor_pct": 0.05, "atr_floor_pct": 0.05, "structure_lookback": 18},
     "5m": {"ema": (9, 20, 60, 120), "slope_bars": 4, "slope_floor_pct": 0.06, "atr_floor_pct": 0.06, "structure_lookback": 20},
     "15m": {"ema": (9, 20, 60, 120), "slope_bars": 4, "slope_floor_pct": 0.08, "atr_floor_pct": 0.08, "structure_lookback": 20},
-    "1H": {"ema": (9, 21, 55, 120), "slope_bars": 3, "slope_floor_pct": 0.12, "atr_floor_pct": 0.12, "structure_lookback": 24},
-    "4H": {"ema": (8, 21, 55, 120), "slope_bars": 3, "slope_floor_pct": 0.22, "atr_floor_pct": 0.18, "structure_lookback": 30},
+    "1H": {"ema": (9, 21, 55, 120), "slope_bars": 3, "slope_floor_pct": 0.09, "atr_floor_pct": 0.10, "structure_lookback": 24},
+    "4H": {"ema": (8, 21, 55, 120), "slope_bars": 3, "slope_floor_pct": 0.16, "atr_floor_pct": 0.15, "structure_lookback": 30},
     "1D": {"ema": (8, 21, 55, 120), "slope_bars": 3, "slope_floor_pct": 0.45, "atr_floor_pct": 0.35, "structure_lookback": 40},
     "1W": {"ema": (6, 13, 34, 89), "slope_bars": 2, "slope_floor_pct": 0.90, "atr_floor_pct": 0.70, "structure_lookback": 52},
 }
@@ -1261,6 +1275,27 @@ def confirmed_candles(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return confirmed or candles
 
 
+def tactical_candles(candles: List[Dict[str, Any]], live_price: float = 0.0) -> List[Dict[str, Any]]:
+    """方向判断用：保留未收盘K线，并把最新价写入正在形成的K线。
+
+    已收盘K线算出来的 EMA/MACD 在 15m 周期内会滞后一整根K线；
+    这里用实时价刷新当前根，让盘中下跌不必等到 15m 收盘才反映到趋势里。
+    量价/校准仍走 confirmed_candles，两者分工不同。
+    """
+    if not candles:
+        return []
+    rows = [dict(item) for item in candles]
+    if live_price <= 0:
+        return rows
+    latest = dict(rows[0])
+    latest["close"] = live_price
+    latest["high"] = max(to_float(latest.get("high")), live_price)
+    low = to_float(latest.get("low"))
+    latest["low"] = min(low, live_price) if low > 0 else live_price
+    rows[0] = latest
+    return rows
+
+
 def ema(values: List[float], period: int) -> float:
     # 指数均线用于判断趋势方向和斜率。数据不足时用已有数据计算，宁可粗略也不返回异常。
     clean = [value for value in values if isinstance(value, (int, float))]
@@ -1698,12 +1733,21 @@ def candle_to_dict(raw: List[Any]) -> Dict[str, Any]:
     }
 
 
-def trend_from_candles(candles: List[Dict[str, Any]], lookback: int = 5) -> str:
+def trend_from_candles(
+    candles: List[Dict[str, Any]],
+    lookback: int = 5,
+    *,
+    tactical: bool = False,
+    live_price: float = 0.0,
+) -> str:
     # 兼容旧字段的轻量趋势判断：比较最近收盘价和lookback窗口最后一根收盘价。
     # 新版评分不再只依赖它，而是由trend_profile_from_candles计算EMA、ATR、结构位和K线质量。
     if len(candles) < 2:
         return "unknown"
-    sample = confirmed_candles(candles)[:lookback]
+    if tactical and live_price > 0:
+        sample = tactical_candles(candles, live_price)[:lookback]
+    else:
+        sample = confirmed_candles(candles)[:lookback]
     latest = sample[0]["close"]
     oldest = sample[-1]["close"]
     if latest > oldest:
@@ -1713,10 +1757,16 @@ def trend_from_candles(candles: List[Dict[str, Any]], lookback: int = 5) -> str:
     return "flat"
 
 
-def trend_profile_from_candles(candles: List[Dict[str, Any]], bar: str = "15m") -> Dict[str, Any]:
+def trend_profile_from_candles(
+    candles: List[Dict[str, Any]],
+    bar: str = "15m",
+    *,
+    tactical: bool = False,
+    live_price: float = 0.0,
+) -> Dict[str, Any]:
     # 单周期趋势画像。这里故意不只返回up/down，而是把“趋势、波动、结构、K线质量”都拆开。
     # 原因是短线交易里，同样是上涨，可能是稳定趋势、放量突破、尾端加速或高波动震荡，入场方式完全不同。
-    rows = confirmed_candles(candles)
+    rows = tactical_candles(candles, live_price) if tactical else confirmed_candles(candles)
     closes = [to_float(item.get("close")) for item in rows]
     params = TREND_PROFILE_PARAMS.get(bar, TREND_PROFILE_PARAMS["15m"])
     ema_periods = tuple(params["ema"])
@@ -1726,7 +1776,9 @@ def trend_profile_from_candles(candles: List[Dict[str, Any]], bar: str = "15m") 
 
     # 判断K线质量，从这组k线中计算出来在指标是否可靠
     data_quality = {
-        "confirmed_count": len(rows),        # k线个数
+        "confirmed_count": len(confirmed_candles(candles)),
+        "analysis_count": len(rows),
+        "includes_forming_bar": tactical,
         "ema120_ready": len(rows) >= 120,    # 兼容旧字段
         "anchor_ema_ready": len(rows) >= anchor_period,
         "macd_ready": len(rows) >= 35,
@@ -1811,6 +1863,40 @@ def trend_profile_from_candles(candles: List[Dict[str, Any]], bar: str = "15m") 
     else:
         trend = "mixed"
 
+    if trend in ("mixed", "range"):
+        indicator_hint = indicator_direction_scores(
+            {
+                "trend": trend,
+                "ema_fast": fast,
+                "ema_slow": slow,
+                "ema_slope_pct": slope_pct,
+                "rsi": rsi_values,
+                "macd": macd_values,
+                "kdj": kdj_values,
+                "boll": boll_values,
+                "adx": adx_values,
+                "divergence": divergence,
+                "data_quality": data_quality,
+            }
+        )
+        plus_di = to_float(adx_values.get("plus_di"))
+        minus_di = to_float(adx_values.get("minus_di"))
+        hist = to_float(macd_values.get("hist"))
+        if (
+            indicator_hint["net"] >= 22
+            and adx_values["adx"] >= 20
+            and plus_di > minus_di
+            and hist > 0
+        ):
+            trend = "up"
+        elif (
+            indicator_hint["net"] <= -22
+            and adx_values["adx"] >= 20
+            and minus_di > plus_di
+            and hist < 0
+        ):
+            trend = "down"
+
     return {
         "trend": trend,
         "bar": bar,
@@ -1862,6 +1948,163 @@ def detect_rsi_divergence(candles: List[Dict[str, Any]], current_rsi: float) -> 
     if latest < previous_low and current_rsi > previous_rsi + 3:
         return "bullish"
     return "none"
+
+
+def indicator_direction_scores(profile: Dict[str, Any]) -> Dict[str, Any]:
+    """单周期 EMA/RSI/MACD/KDJ/BOLL/ADX 综合方向评分，用于降低纯价格确认的滞后。"""
+    if not profile or profile.get("trend") == "unknown":
+        return {"long": 0.0, "short": 0.0, "net": 0.0, "strength": 0, "direction": "neutral"}
+
+    long_pts = 0.0
+    short_pts = 0.0
+    data_quality = profile.get("data_quality", {}) if isinstance(profile.get("data_quality"), dict) else {}
+    reliable = bool(data_quality.get("is_reliable", False))
+
+    trend = str(profile.get("trend", "mixed") or "mixed")
+    ema_slope = to_float(profile.get("ema_slope_pct"))
+    if trend == "up":
+        long_pts += 14
+    elif trend == "down":
+        short_pts += 14
+    elif ema_slope > 0.05:
+        long_pts += 6
+    elif ema_slope < -0.05:
+        short_pts += 6
+
+    ema_fast = to_float(profile.get("ema_fast"))
+    ema_slow = to_float(profile.get("ema_slow"))
+    if trend not in ("up", "down"):
+        if ema_fast > ema_slow > 0:
+            long_pts += 5
+        elif 0 < ema_fast < ema_slow:
+            short_pts += 5
+
+    macd_values = profile.get("macd", {}) if isinstance(profile.get("macd"), dict) else {}
+    hist = to_float(macd_values.get("hist"))
+    hist_slope = to_float(macd_values.get("hist_slope"))
+    dif = to_float(macd_values.get("dif"))
+    dea = to_float(macd_values.get("dea"))
+    if hist > 0:
+        long_pts += 6
+        if hist_slope >= 0:
+            long_pts += 6
+    elif hist < 0:
+        short_pts += 6
+        if hist_slope <= 0:
+            short_pts += 6
+    if dif > dea:
+        long_pts += 4
+    elif dif < dea:
+        short_pts += 4
+
+    rsi_values = profile.get("rsi", {}) if isinstance(profile.get("rsi"), dict) else {}
+    rsi_14 = to_float(rsi_values.get("14"), 50.0)
+    if rsi_14 >= 55:
+        long_pts += min(8.0, (rsi_14 - 52.0) * 0.35)
+    elif rsi_14 <= 45:
+        short_pts += min(8.0, (48.0 - rsi_14) * 0.35)
+
+    kdj_values = profile.get("kdj", {}) if isinstance(profile.get("kdj"), dict) else {}
+    k_val = to_float(kdj_values.get("k"), 50.0)
+    d_val = to_float(kdj_values.get("d"), 50.0)
+    if k_val > d_val:
+        long_pts += 6
+    elif k_val < d_val:
+        short_pts += 6
+
+    adx_values = profile.get("adx", {}) if isinstance(profile.get("adx"), dict) else {}
+    adx_val = to_float(adx_values.get("adx"))
+    plus_di = to_float(adx_values.get("plus_di"))
+    minus_di = to_float(adx_values.get("minus_di"))
+    if adx_val >= 16:
+        adx_weight = min(1.2, adx_val / 25.0)
+        if plus_di > minus_di:
+            long_pts += 10.0 * adx_weight
+        elif minus_di > plus_di:
+            short_pts += 10.0 * adx_weight
+
+    boll_values = profile.get("boll", {}) if isinstance(profile.get("boll"), dict) else {}
+    boll_pos = to_float(boll_values.get("position"), 0.5)
+    bandwidth = to_float(boll_values.get("bandwidth_pct"))
+    if bandwidth >= 0.08:
+        if boll_pos >= 0.55:
+            long_pts += 5
+        elif boll_pos <= 0.45:
+            short_pts += 5
+
+    divergence = str(profile.get("divergence", "none") or "none")
+    if divergence == "bearish":
+        long_pts -= 6
+        short_pts += 3
+    elif divergence == "bullish":
+        short_pts -= 6
+        long_pts += 3
+
+    if not reliable:
+        long_pts *= 0.65
+        short_pts *= 0.65
+
+    net = long_pts - short_pts
+    strength = int(round(max(long_pts, short_pts)))
+    if net >= 18:
+        direction = "long"
+    elif net <= -18:
+        direction = "short"
+    else:
+        direction = "neutral"
+    return {
+        "long": round(long_pts, 2),
+        "short": round(short_pts, 2),
+        "net": round(net, 2),
+        "strength": strength,
+        "direction": direction,
+    }
+
+
+def indicator_direction_consensus(
+    profiles: Dict[str, Dict[str, Any]],
+    bar_weights: Dict[str, float],
+) -> Dict[str, Any]:
+    long_weighted = 0.0
+    short_weighted = 0.0
+    total_weight = 0.0
+    bars: Dict[str, Dict[str, Any]] = {}
+    for bar, weight in bar_weights.items():
+        w = max(0.0, to_float(weight, 0.0))
+        if w <= 0:
+            continue
+        scores = indicator_direction_scores(profiles.get(bar, {}))
+        bars[bar] = scores
+        long_weighted += scores["long"] * w
+        short_weighted += scores["short"] * w
+        total_weight += w
+    if total_weight <= 0:
+        return {
+            "long": 0.0,
+            "short": 0.0,
+            "net": 0.0,
+            "strength": 0,
+            "direction": "neutral",
+            "bars": bars,
+            "total_weight": 0.0,
+        }
+    net = (long_weighted - short_weighted) / total_weight
+    strength = int(round(max(long_weighted, short_weighted) / total_weight))
+    if net >= 18:
+        direction = "long"
+    elif net <= -18:
+        direction = "short"
+    else:
+        direction = "neutral"
+    return {
+        "long": round(long_weighted / total_weight, 2),
+        "short": round(short_weighted / total_weight, 2),
+        "net": round(net, 2),
+        "strength": strength,
+        "direction": direction,
+        "bars": bars,
+        "total_weight": round(total_weight, 2),
+    }
 
 
 def symbol_ccy(inst_id: str) -> str:
@@ -2119,6 +2362,9 @@ class OkxAiShortTermAssistant:
         # 方向跟单模拟账户：监控/回放会话开始时重置为 $10,000，按 final_direction 满仓跟单。
         self.paper_session_started_at = ""
         self.paper_accounts: Dict[str, Dict[str, Any]] = {}
+
+        # 中线方向记忆：上一轮 final_direction，用于持多后按跌幅转空/观望。
+        self._direction_memory: Dict[str, str] = {}
 
         # AI 连接状态：请求重试 + client 重建 + 熔断探活。
         self._ai_client: Any = None
@@ -2482,8 +2728,18 @@ class OkxAiShortTermAssistant:
             else 0.0
         )
 
-        # 计算K线走势
+        # 计算K线走势：confirmed 用于稳定指标；live 用于方向判断（含未收盘K线+最新价）。
+        price = to_float(ticker.get("last"))
         profiles = {bar: trend_profile_from_candles(rows, bar) for bar, rows in candles.items()}
+        tactical_bars = self._tactical_profile_bars()
+        profiles_live = {
+            bar: (
+                trend_profile_from_candles(rows, bar, tactical=True, live_price=price)
+                if bar in tactical_bars
+                else profiles.get(bar, {})
+            )
+            for bar, rows in candles.items()
+        }
 
         # 计算波动强度：高中低，便于后续判断止损止盈区间
         volatility = self._volatility_context(inst_id, profiles)
@@ -2495,9 +2751,10 @@ class OkxAiShortTermAssistant:
             str(context_bars.get("regime", "15m")),
         )
         market_context = self._market_context(
-            price=ticker.get("last", 0.0),
+            price=price,
             candles=candles,
             profiles=profiles,
+            profiles_live=profiles_live,
             volume=volume,
             open_interest=open_interest,
             oi_change_pct_15m=oi_change_pct_15m,
@@ -2564,6 +2821,7 @@ class OkxAiShortTermAssistant:
             "long_short_ratio": long_short,
             "order_book": order_book,
             "trend_profiles": profiles,
+            "trend_profiles_live": profiles_live,
             "volatility": volatility,
             "dynamic_thresholds": dynamic_thresholds,
             "data_sources": source_meta,
@@ -2709,27 +2967,35 @@ class OkxAiShortTermAssistant:
         # 而是先识别市场状态，再给出方向倾向、入场质量、失效条件。
         # 评分仍然只用于“提醒强弱”和“是否推送”，不是自动交易指令。
 
-        # 趋势判断，通过当前收盘价和21条K线的最早收盘价，判断时间范围内的up/down/flat/unkonw状态
+        # 趋势判断：短周期用盘中实时价，避免等 15m 收盘才翻转。
+        live_price = to_float(snapshot.get("price"))
+        candles_map = snapshot.get("candles", {})
+        tactical_bars = {"1m", "3m", "5m", "15m"}
         trends = {
-            "1m": trend_from_candles(snapshot["candles"]["1m"]),
-            "3m": trend_from_candles(snapshot["candles"].get("3m", [])),
-            "5m": trend_from_candles(snapshot["candles"]["5m"]),
-            "15m": trend_from_candles(snapshot["candles"]["15m"]),
-            "1H": trend_from_candles(snapshot["candles"]["1H"]),
-            "4H": trend_from_candles(snapshot["candles"].get("4H", [])),
-            "1D": trend_from_candles(snapshot["candles"].get("1D", [])),
-            "1W": trend_from_candles(snapshot["candles"].get("1W", [])),
+            bar: trend_from_candles(
+                candles_map.get(bar, []),
+                tactical=(bar in tactical_bars and live_price > 0),
+                live_price=live_price,
+            )
+            for bar in ("1m", "3m", "5m", "15m", "1H", "4H", "1D", "1W")
         }
 
-        profiles = snapshot.get("trend_profiles", {})
+        profiles = self._direction_profiles(snapshot)
+        inst_id = str(snapshot.get("inst_id", "") or "")
+        prior_direction = self._prior_direction(inst_id)
         context = dict(snapshot.get("market_context", {}))
+        context["prior_direction"] = prior_direction
+        if not isinstance(context.get("indicator_consensus"), dict):
+            context["indicator_consensus"] = self._htf_indicator_consensus(profiles)
+        if not isinstance(context.get("indicator_alignment"), dict):
+            context["indicator_alignment"] = self._htf_indicator_alignment_flags(profiles)
         sentiment_meta = self._sentiment_direction_meta(snapshot, context)
         context["sentiment_meta"] = sentiment_meta
         snapshot["market_context"] = context
         volatility = snapshot.get("volatility", {})
         signal_types = {item["type"] for item in signals}
         strategy_profile = self._strategy_profile()
-        raw_direction = self._raw_direction_for_mode(snapshot, context)
+        raw_direction, direction_tier, direction_summary = self._raw_direction_meta_for_mode(snapshot, context)
         layer_scores = self._layer_scores(snapshot, signals, raw_direction, trends)
         trend_score = min(50, layer_scores["trend_score"] + layer_scores["momentum_score"])
         capital_score = min(30, layer_scores["volume_price_score"] + layer_scores["derivatives_score"] + layer_scores["orderbook_score"])
@@ -2772,6 +3038,16 @@ class OkxAiShortTermAssistant:
             direction_score,
             sentiment_led=sentiment_led,
         )
+        fast_price_led = (
+            direction_tier in FAST_PRICE_DIRECTION_TIERS
+            and raw_direction in ("做多", "做空")
+            and (
+                (raw_direction == "做空" and context.get("recent_price_pressure") == "down")
+                or (raw_direction == "做多" and context.get("recent_price_pressure") == "up")
+            )
+        )
+        if downgraded_by_quality and fast_price_led:
+            downgraded_by_quality = False
         if downgraded_by_quality:
             final_direction = "观望"
             entry_plan = self._strategy_entry_plan(snapshot, final_direction)
@@ -2797,6 +3073,8 @@ class OkxAiShortTermAssistant:
             "raw_direction": raw_direction,
             "final_direction": final_direction,
             "direction": final_direction,
+            "direction_tier": direction_tier,
+            "direction_summary": direction_summary,
             "entry": entry_plan["entry"],
             "stop_loss": entry_plan["stop_loss"],
             "take_profit": entry_plan["take_profit"],
@@ -2832,6 +3110,8 @@ class OkxAiShortTermAssistant:
             snapshot,
             self._evaluate_structure_evolution(snapshot, signals, score),
         )
+        self._remember_direction(inst_id, final_direction)
+        score["prior_direction"] = prior_direction
         return score
 
     def _layer_scores(
@@ -2843,7 +3123,7 @@ class OkxAiShortTermAssistant:
     ) -> Dict[str, int]:
         # 七层评分用于替代旧版“趋势/资金/风险”三段式。
         # 每一层只处理自己负责的问题，避免一个指标在多个地方重复加分导致假自信。
-        profiles = snapshot.get("trend_profiles", {})
+        profiles = self._direction_profiles(snapshot)
         context = snapshot.get("market_context", {})
         volume = snapshot.get("volume", {})
         order_book = snapshot.get("order_book", {})
@@ -2855,6 +3135,8 @@ class OkxAiShortTermAssistant:
         snapshot_quality = snapshot.get("snapshot_quality", {}) if isinstance(snapshot.get("snapshot_quality"), dict) else {}
         quality_overall = str(snapshot_quality.get("overall", "sufficient") or "sufficient")
         data_sources = snapshot.get("data_sources", {}) if isinstance(snapshot.get("data_sources"), dict) else {}
+        indicator_consensus = context.get("indicator_consensus") if isinstance(context.get("indicator_consensus"), dict) else {}
+        alignment = context.get("indicator_alignment") if isinstance(context.get("indicator_alignment"), dict) else {}
         pressure_against_direction = (
             (direction == "\u505a\u591a" and recent_pressure == "down")
             or (direction == "\u505a\u7a7a" and recent_pressure == "up")
@@ -2887,6 +3169,7 @@ class OkxAiShortTermAssistant:
         profile_background = profiles.get(score_bars["background"], {})
         profile_momentum = profiles.get(score_bars["momentum"], profile_primary)
         profile_entry = profiles.get(score_bars["entry"], {})
+        profile_htf = profiles.get("1H", {}) if self._strategy_mode() in ("short", "swing") else {}
         data_quality = profile_primary.get("data_quality", {})
         adx_primary = profile_primary.get("adx", {})
         if profile_primary.get("trend") == profile_higher.get("trend") and profile_primary.get("trend") in ("up", "down"):
@@ -2901,7 +3184,9 @@ class OkxAiShortTermAssistant:
             trend_score -= 4
         if not data_quality.get("is_reliable", False):
             trend_score -= 3
-        if pressure_against_direction:
+        if pressure_against_direction and not self._htf_indicator_supports(
+            indicator_consensus, direction, alignment=alignment, min_net=24.0,
+        ):
             trend_score -= 5
         phase = str(context.get("trend_phase", "transition") or "transition")
         if direction == "做多" and phase == "trend_accelerating_up":
@@ -2938,8 +3223,24 @@ class OkxAiShortTermAssistant:
                     ht_adjust -= 2
             trend_score += int(round(ht_adjust * ht_factor))
 
+        indicator_net = to_float(indicator_consensus.get("net"))
+        if direction == "做多" and indicator_net >= 20 and alignment.get("long"):
+            trend_score += min(4, int(round(indicator_net * 0.15)))
+            momentum_score_bonus = min(3, int(round(indicator_net * 0.12)))
+        elif direction == "做空" and indicator_net <= -20 and alignment.get("short"):
+            trend_score += min(4, int(round(abs(indicator_net) * 0.15)))
+            momentum_score_bonus = min(3, int(round(abs(indicator_net) * 0.12)))
+        else:
+            momentum_score_bonus = 0
+
         # 3. 动量层：RSI、MACD、KDJ和K线实体质量，判断趋势有没有“油门”。
-        momentum_score = 6
+        momentum_score = 6 + momentum_score_bonus
+        if profile_htf:
+            htf_scores = indicator_direction_scores(profile_htf)
+            if direction == "做多" and htf_scores["net"] >= 16:
+                momentum_score += 1
+            elif direction == "做空" and htf_scores["net"] <= -16:
+                momentum_score += 1
         rsi_14 = to_float(profile_momentum.get("rsi", {}).get("14"), 50.0)
         macd_values = profile_momentum.get("macd", {})
         kdj_values = profile_entry.get("kdj", {})
@@ -3080,6 +3381,22 @@ class OkxAiShortTermAssistant:
         mode = str(getattr(self.config, "strategy_mode", "short") or "short").lower()
         return mode if mode in STRATEGY_PROFILES else "short"
 
+    def _tactical_profile_bars(self) -> Set[str]:
+        """参与实时战术画像的周期：方向判断读 live，不等到大周期收盘。"""
+        mode = self._strategy_mode()
+        if mode == "swing":
+            return {"1m", "3m", "5m", "15m", "1H", "4H"}
+        if mode == "long":
+            return {"4H", "1D", "1W"}
+        return {"1m", "3m", "5m", "15m", "1H"}
+
+    def _direction_profiles(self, snapshot: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        live = snapshot.get("trend_profiles_live")
+        if isinstance(live, dict) and live:
+            return live
+        confirmed = snapshot.get("trend_profiles", {})
+        return confirmed if isinstance(confirmed, dict) else {}
+
     def _risk_preference(self) -> str:
         risk = str(getattr(self.config, "risk_preference", "standard") or "standard").lower()
         return risk if risk in ("conservative", "standard", "aggressive") else "standard"
@@ -3152,6 +3469,586 @@ class OkxAiShortTermAssistant:
             direction = "观望"
         return direction
 
+    def _htf_indicator_bar_weights(self) -> Dict[str, float]:
+        mode = self._strategy_mode()
+        if mode == "swing":
+            return {"1H": 1.5, "4H": 1.8}
+        if mode == "long":
+            return {"4H": 1.4, "1D": 1.8, "1W": 1.2}
+        return {"1H": 1.4, "4H": 1.7}
+
+    def _htf_indicator_consensus(self, profiles: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        return indicator_direction_consensus(profiles, self._htf_indicator_bar_weights())
+
+    def _htf_indicator_bar_alignment(
+        self,
+        profiles: Dict[str, Dict[str, Any]],
+        direction: str,
+        *,
+        min_bar_net: float = 10.0,
+    ) -> bool:
+        expected = "long" if direction == "做多" else "short"
+        matched = 0
+        required = 0
+        for bar in self._htf_indicator_bar_weights():
+            required += 1
+            scores = indicator_direction_scores(profiles.get(bar, {}))
+            if scores.get("direction") == expected and abs(to_float(scores.get("net"))) >= min_bar_net:
+                matched += 1
+        return required > 0 and matched == required
+
+    def _htf_indicator_alignment_flags(self, profiles: Dict[str, Dict[str, Any]]) -> Dict[str, bool]:
+        return {
+            "long": self._htf_indicator_bar_alignment(profiles, "做多"),
+            "short": self._htf_indicator_bar_alignment(profiles, "做空"),
+        }
+
+    def _htf_indicator_supports(
+        self,
+        consensus: Dict[str, Any],
+        direction: str,
+        *,
+        alignment: Optional[Dict[str, bool]] = None,
+        min_net: float = 20.0,
+    ) -> bool:
+        key = "long" if direction == "做多" else "short"
+        if alignment is not None and not alignment.get(key):
+            return False
+        if consensus.get("direction") != key:
+            return False
+        net = to_float(consensus.get("net"))
+        if direction == "做多":
+            return net >= min_net
+        if direction == "做空":
+            return net <= -min_net
+        return False
+
+    def _strategy_price_moves(self, snapshot: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, float]:
+        candles = snapshot.get("candles", {})
+        price = to_float(snapshot.get("price"))
+        moves = context.get("recent_move_pct") if isinstance(context.get("recent_move_pct"), dict) else {}
+        mode = self._strategy_mode()
+        if mode == "swing":
+            live = price if price > 0 else 0.0
+            return {
+                "fast": self._recent_move_pct(candles.get("1m", []), 15, live_price=live),
+                "medium": self._recent_move_pct(candles.get("1m", []), 30, live_price=live),
+                "slow": self._recent_move_pct(candles.get("1m", []), 45, live_price=live),
+            }
+        live = price if price > 0 else 0.0
+        if live > 0:
+            return {
+                "fast": self._recent_move_pct(candles.get("1m", []), 3, live_price=live),
+                "medium": self._recent_move_pct(candles.get("1m", []), 8, live_price=live),
+                "slow": self._recent_move_pct(candles.get("1m", []), 15, live_price=live),
+            }
+        return {
+            "fast": to_float(moves.get("5m"), self._recent_move_pct(candles.get("1m", []), 5)),
+            "medium": to_float(moves.get("10m"), self._recent_move_pct(candles.get("1m", []), 10)),
+            "slow": to_float(moves.get("15m"), self._recent_move_pct(candles.get("1m", []), 15)),
+        }
+
+    def _price_move_floors(self, snapshot: Dict[str, Any]) -> Tuple[float, float]:
+        """返回 (short_floor, long_floor)；做空门槛 deliberately 低于做多。"""
+        profiles = self._direction_profiles(snapshot)
+        factor = self._risk_adjustment()
+        if self._strategy_mode() == "swing":
+            atr_pct = max(to_float(profiles.get("1H", {}).get("atr_pct")), 0.15)
+            short_floor = max(0.10, atr_pct * 0.22) * factor
+            long_floor = max(0.18, atr_pct * 0.42) * factor
+        else:
+            atr_pct = max(to_float(profiles.get("15m", {}).get("atr_pct")), 0.08)
+            short_floor = max(0.06, atr_pct * 0.20) * factor
+            long_floor = max(0.12, atr_pct * 0.40) * factor
+        return short_floor, long_floor
+
+    def _intrabar_move_direction_meta(
+        self,
+        snapshot: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Optional[Tuple[str, str, str]]:
+        """1m 盘中急跌/急涨检测：不等待 15m K 线收盘。"""
+        if self._strategy_mode() == "long":
+            return None
+
+        price = to_float(snapshot.get("price"))
+        if price <= 0:
+            return None
+
+        candles_1m = snapshot.get("candles", {}).get("1m", [])
+        if len(candles_1m) < 3:
+            return None
+
+        pressure = context.get("recent_price_pressure", "neutral")
+        short_floor, long_floor = self._price_move_floors(snapshot)
+        move_1 = self._recent_move_pct(candles_1m, 1, live_price=price)
+        move_3 = self._recent_move_pct(candles_1m, 3, live_price=price)
+        move_5 = self._recent_move_pct(candles_1m, 5, live_price=price)
+        move_8 = self._recent_move_pct(candles_1m, 8, live_price=price)
+        drawdown_5 = self._recent_drawdown_pct(candles_1m, 5, live_price=price)
+        drawdown_10 = self._recent_drawdown_pct(candles_1m, 10, live_price=price)
+        worst = min(move_1, move_3, move_5, move_8, drawdown_5, drawdown_10)
+
+        prior = str(
+            context.get("prior_direction")
+            or self._prior_direction(str(snapshot.get("inst_id", "") or ""))
+            or "观望"
+        )
+        profiles = self._direction_profiles(snapshot)
+        trend_5m = profiles.get("5m", {}).get("trend")
+        trend_15m = profiles.get("15m", {}).get("trend")
+
+        crash_line = -short_floor * 0.28
+        drop_line = -short_floor * 0.42
+        if self._strategy_mode() == "swing" and prior == "做多":
+            watch_drop, short_drop, crash_drop = self._swing_long_to_short_lines(snapshot)
+            drop_mag = abs(min(worst, drawdown_5, drawdown_10, 0.0))
+            if not self._swing_15m_bearish_aligned(profiles):
+                if drop_mag < crash_drop * 1.20:
+                    return None
+                crash_line = -crash_drop * 1.20
+                drop_line = -crash_drop * 1.20
+            else:
+                if drop_mag < short_drop * 1.02:
+                    return None
+                crash_line = -crash_drop * 1.05
+                drop_line = -short_drop * 1.12
+
+        if worst <= crash_line:
+            return (
+                "做空",
+                "intrabar_crash",
+                f"1m盘中急跌约{abs(worst):.2f}%（未等15m收盘），按下跌处理。",
+            )
+        if pressure == "down" and worst <= drop_line:
+            return (
+                "做空",
+                "intrabar_drop",
+                f"盘中回落约{abs(worst):.2f}%，价格领先于{str(trend_15m or '滞后')}结构。",
+            )
+        if pressure == "down" and worst <= drop_line * 0.82 and trend_5m != "up":
+            return (
+                "做空",
+                "intrabar_drop",
+                f"短窗转弱约{abs(worst):.2f}%且5m未确认向上。",
+            )
+
+        rebound_5 = self._recent_rebound_pct(candles_1m, 5, live_price=price)
+        best = max(move_1, move_3, move_5, rebound_5)
+        rally_line = long_floor * 1.05
+        if self._strategy_mode() == "swing" and prior in ("做空", "观望"):
+            watch_rise, long_rise, surge_rise = self._swing_short_to_long_lines(snapshot)
+            rise_mag = max(best, rebound_5, 0.0)
+            if not self._swing_15m_bullish_aligned(profiles):
+                if rise_mag < surge_rise * 1.20:
+                    return None
+                rally_line = surge_rise * 1.20
+            else:
+                if rise_mag < long_rise * 1.02:
+                    return None
+                rally_line = long_rise * 1.12
+        if pressure == "up" and best >= rally_line:
+            return (
+                "做多",
+                "intrabar_rally",
+                f"盘中上冲约{best:.2f}%，价格领先于结构。",
+            )
+        return None
+
+    def _raw_direction_meta_for_mode(
+        self,
+        snapshot: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Tuple[str, str, str]:
+        mode = self._strategy_mode()
+        prior = str(
+            context.get("prior_direction")
+            or self._prior_direction(str(snapshot.get("inst_id", "") or ""))
+            or "观望"
+        )
+        context["prior_direction"] = prior
+        profiles = self._direction_profiles(snapshot)
+
+        if mode == "swing" and prior == "做多":
+            exit_meta = self._swing_exit_from_long_meta(snapshot, context, profiles)
+            if exit_meta:
+                return exit_meta
+
+        if mode == "swing" and prior in ("做空", "观望"):
+            entry_meta = self._swing_entry_to_long_meta(snapshot, context, profiles, prior)
+            if entry_meta:
+                return entry_meta
+
+        fast = self._intrabar_move_direction_meta(snapshot, context)
+        if fast:
+            direction, tier, summary = fast
+            if (
+                mode == "swing"
+                and prior == "做多"
+                and direction == "做空"
+                and not self._swing_drop_supports_short(snapshot, profiles, context, for_intrabar=True)
+            ):
+                pass
+            elif (
+                mode == "swing"
+                and prior in ("做空", "观望")
+                and direction == "做多"
+                and not self._swing_rise_supports_long(snapshot, profiles, context, for_intrabar=True)
+            ):
+                pass
+            else:
+                return fast
+        if mode == "scalp":
+            direction = self._scalp_raw_direction(snapshot, context)
+            return direction, "scalp", ""
+        if mode == "swing":
+            return self._swing_direction_meta(snapshot, context)
+        if mode == "long":
+            return self._long_direction_meta(snapshot, context)
+        return self._short_direction_meta(snapshot, context)
+
+    def _price_led_direction_meta(
+        self,
+        snapshot: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Optional[Tuple[str, str, str]]:
+        """价格已走出的方向优先于滞后指标，修正「跌了仍做多/观望」。"""
+        pressure = context.get("recent_price_pressure", "neutral")
+        if pressure not in ("up", "down"):
+            return None
+
+        moves = self._strategy_price_moves(snapshot, context)
+        short_floor, long_floor = self._price_move_floors(snapshot)
+        bearish_move = min(moves["fast"], moves["medium"], moves["slow"])
+        bullish_move = max(moves["fast"], moves["medium"], moves["slow"])
+        profiles = self._direction_profiles(snapshot)
+        score_bars = self._strategy_score_bars()
+        trend_primary = profiles.get(score_bars["primary"], {}).get("trend")
+        trend_entry = profiles.get(score_bars["entry"], {}).get("trend")
+        structural = str(context.get("structural_bias", context.get("bias", "neutral")) or "neutral")
+        swing_tight = self._strategy_mode() == "swing"
+        short_mult = 1.35 if swing_tight else 1.0
+        long_mult = 1.25 if swing_tight else 1.0
+
+        if pressure == "down":
+            if bearish_move <= -short_floor * 0.32 * short_mult:
+                return (
+                    "做空",
+                    "price_leading",
+                    f"短窗压力向下且跌幅约{abs(bearish_move):.2f}%，价格领先于滞后指标。",
+                )
+            if structural == "long" and bearish_move <= -short_floor * 0.22 * short_mult:
+                return (
+                    "做空",
+                    "price_pullback",
+                    "大周期结构仍偏多，但价格已回落，按短窗下跌跟踪。",
+                )
+            if bearish_move <= -short_floor * 0.55 * short_mult and trend_entry != "up":
+                return (
+                    "做空",
+                    "price_leading",
+                    f"价格走弱约{abs(bearish_move):.2f}%且{score_bars['entry']}未确认向上。",
+                )
+
+        if pressure == "up":
+            if bullish_move >= long_floor * long_mult:
+                return (
+                    "做多",
+                    "price_leading",
+                    f"短窗压力向上且涨幅约{bullish_move:.2f}%，价格领先于滞后指标。",
+                )
+            if bullish_move >= long_floor * 0.90 * long_mult and trend_entry in ("up", "mixed") and trend_primary != "down":
+                return (
+                    "做多",
+                    "price_leading",
+                    f"价格上涨约{bullish_move:.2f}%且{score_bars['entry']}配合。",
+                )
+        return None
+
+    def _prior_direction(self, inst_id: str) -> str:
+        prior = self._direction_memory.get(inst_id, "观望")
+        return prior if prior in ("做多", "做空", "观望") else "观望"
+
+    def _remember_direction(self, inst_id: str, direction: str) -> None:
+        if inst_id and direction in ("做多", "做空", "观望"):
+            self._direction_memory[inst_id] = direction
+
+    def _swing_live_move_metrics(self, snapshot: Dict[str, Any]) -> Dict[str, float]:
+        live = to_float(snapshot.get("price"))
+        candles = snapshot.get("candles", {}).get("1m", [])
+        live_price = live if live > 0 else 0.0
+        move_10m = self._recent_move_pct(candles, 10, live_price=live_price)
+        move_15m = self._recent_move_pct(candles, 15, live_price=live_price)
+        move_30m = self._recent_move_pct(candles, 30, live_price=live_price)
+        drawdown_8 = self._recent_drawdown_pct(candles, 8, live_price=live_price)
+        drawdown_15 = self._recent_drawdown_pct(candles, 15, live_price=live_price)
+        rebound_8 = self._recent_rebound_pct(candles, 8, live_price=live_price)
+        rebound_15 = self._recent_rebound_pct(candles, 15, live_price=live_price)
+        worst = min(move_10m, move_15m, move_30m, drawdown_8, drawdown_15, 0.0)
+        best = max(move_10m, move_15m, move_30m, rebound_8, rebound_15, 0.0)
+        return {
+            "move_10m": move_10m,
+            "move_15m": move_15m,
+            "move_30m": move_30m,
+            "drawdown_8": drawdown_8,
+            "drawdown_15": drawdown_15,
+            "rebound_8": rebound_8,
+            "rebound_15": rebound_15,
+            "drop_pct": abs(worst),
+            "rise_pct": best,
+        }
+
+    def _swing_live_drop_metrics(self, snapshot: Dict[str, Any]) -> Dict[str, float]:
+        metrics = self._swing_live_move_metrics(snapshot)
+        return {**metrics, "drop_pct": metrics["drop_pct"]}
+
+    def _swing_long_to_short_lines(self, snapshot: Dict[str, Any]) -> Tuple[float, float, float]:
+        """持多后转空/观望的跌幅门槛（正数，单位 %）。"""
+        short_floor, _ = self._price_move_floors(snapshot)
+        threshold_30m, _ = self._swing_move_thresholds(snapshot)
+        noise_cap = max(short_floor * 2.35, threshold_30m * 0.78, 0.22)
+        watch_drop = noise_cap * 0.92
+        short_drop = max(short_floor * 0.68, threshold_30m * 0.88)
+        crash_drop = max(short_floor * 0.95, threshold_30m * 1.15)
+        return watch_drop, short_drop, crash_drop
+
+    def _swing_short_to_long_lines(self, snapshot: Dict[str, Any]) -> Tuple[float, float, float]:
+        """持空/观望后做多的涨幅门槛（正数，单位 %），与跌幅门槛对称。"""
+        _, long_floor = self._price_move_floors(snapshot)
+        threshold_30m, _ = self._swing_move_thresholds(snapshot)
+        noise_cap = max(long_floor * 2.1, threshold_30m * 0.78, 0.22)
+        watch_rise = noise_cap * 0.92
+        long_rise = max(long_floor * 0.62, threshold_30m * 0.88)
+        surge_rise = max(long_floor * 0.92, threshold_30m * 1.15)
+        return watch_rise, long_rise, surge_rise
+
+    def _swing_15m_bullish_aligned(self, profiles: Dict[str, Dict[str, Any]]) -> bool:
+        trend_15m = profiles.get("15m", {}).get("trend")
+        if trend_15m == "up":
+            return True
+        scores_15m = indicator_direction_scores(profiles.get("15m", {}))
+        ema_slope = to_float(profiles.get("15m", {}).get("ema_slope_pct"))
+        hist_slope = to_float(profiles.get("15m", {}).get("macd", {}).get("hist_slope"))
+        if scores_15m.get("direction") == "long" and abs(to_float(scores_15m.get("net"))) >= 22:
+            return True
+        if ema_slope > 0.08 and hist_slope > 0.02:
+            return True
+        return False
+
+    def _swing_15m_bearish_aligned(self, profiles: Dict[str, Dict[str, Any]]) -> bool:
+        trend_15m = profiles.get("15m", {}).get("trend")
+        if trend_15m == "down":
+            return True
+        scores_15m = indicator_direction_scores(profiles.get("15m", {}))
+        ema_slope = to_float(profiles.get("15m", {}).get("ema_slope_pct"))
+        hist_slope = to_float(profiles.get("15m", {}).get("macd", {}).get("hist_slope"))
+        if scores_15m.get("direction") == "short" and abs(to_float(scores_15m.get("net"))) >= 22:
+            return True
+        if ema_slope < -0.08 and hist_slope < -0.02:
+            return True
+        return False
+
+    def _swing_rise_supports_long(
+        self,
+        snapshot: Dict[str, Any],
+        profiles: Dict[str, Dict[str, Any]],
+        context: Dict[str, Any],
+        *,
+        for_intrabar: bool = False,
+    ) -> bool:
+        """15m 未同向看多时，需达到合理涨幅才允许做多（过滤低位小振荡）。"""
+        metrics = self._swing_live_move_metrics(snapshot)
+        rise_pct = metrics["rise_pct"]
+        watch_rise, long_rise, surge_rise = self._swing_short_to_long_lines(snapshot)
+        pressure = context.get("recent_price_pressure", "neutral")
+        scores_15m = indicator_direction_scores(profiles.get("15m", {}))
+        ema_slope = to_float(profiles.get("15m", {}).get("ema_slope_pct"))
+        soft_bullish = (
+            to_float(scores_15m.get("net")) >= 12
+            or ema_slope > 0.04
+            or self._swing_15m_bullish_aligned(profiles)
+        )
+
+        if self._swing_15m_bullish_aligned(profiles):
+            required = long_rise * (0.82 if for_intrabar else 0.92)
+            return rise_pct >= required and pressure == "up"
+
+        if rise_pct >= surge_rise * 1.18 and pressure == "up":
+            return True
+        if rise_pct >= long_rise * 1.28 and pressure == "up" and soft_bullish:
+            return True
+        return False
+
+    def _swing_entry_to_long_meta(
+        self,
+        snapshot: Dict[str, Any],
+        context: Dict[str, Any],
+        profiles: Dict[str, Dict[str, Any]],
+        prior: str,
+    ) -> Optional[Tuple[str, str, str]]:
+        """持空/观望后做多：15m 同向可较快转多；否则按涨幅比例区分观望/做多。"""
+        if prior == "做多":
+            return None
+
+        metrics = self._swing_live_move_metrics(snapshot)
+        rise_pct = metrics["rise_pct"]
+        watch_rise, long_rise, surge_rise = self._swing_short_to_long_lines(snapshot)
+        pressure = context.get("recent_price_pressure", "neutral")
+        aligned_15m = self._swing_15m_bullish_aligned(profiles)
+        scores_15m = indicator_direction_scores(profiles.get("15m", {}))
+        ema_slope = to_float(profiles.get("15m", {}).get("ema_slope_pct"))
+        hist_slope = to_float(profiles.get("15m", {}).get("macd", {}).get("hist_slope"))
+        soft_bullish = (
+            to_float(scores_15m.get("net")) >= 12
+            or ema_slope > 0.04
+            or (hist_slope > 0.02 and to_float(profiles.get("15m", {}).get("macd", {}).get("hist")) >= 0)
+        )
+
+        if rise_pct < watch_rise * 0.80:
+            return None
+
+        if profiles.get("4H", {}).get("trend") == "down":
+            return None
+        if profiles.get("1H", {}).get("trend") == "down" and profiles.get("15m", {}).get("trend") == "down":
+            return None
+
+        if aligned_15m:
+            if rise_pct >= surge_rise * 1.05 and pressure == "up":
+                return (
+                    "做多",
+                    "swing_entry_long",
+                    f"15m已转强且涨幅约{rise_pct:.2f}%，转多。",
+                )
+            if soft_bullish and rise_pct >= long_rise * 1.02 and pressure == "up":
+                return (
+                    "做多",
+                    "swing_entry_long",
+                    f"15m转强且涨幅约{rise_pct:.2f}%，转多。",
+                )
+            if pressure == "up" and rise_pct >= watch_rise * 1.12:
+                return (
+                    "观望",
+                    "swing_entry_watch",
+                    f"15m转强中，涨幅约{rise_pct:.2f}%，先观望。",
+                )
+            return None
+
+        if rise_pct >= surge_rise * 1.20 and pressure == "up":
+            return (
+                "做多",
+                "swing_entry_long",
+                f"15m未同向但涨幅约{rise_pct:.2f}%达强门槛，转多。",
+            )
+        if rise_pct >= long_rise * 1.28 and pressure == "up" and soft_bullish:
+            return (
+                "做多",
+                "swing_entry_long",
+                f"15m未同向但涨幅约{rise_pct:.2f}%且压力转强，转多。",
+            )
+        if rise_pct >= watch_rise * 1.12:
+            return (
+                "观望",
+                "swing_entry_watch",
+                f"涨幅约{rise_pct:.2f}%未达做多门槛，先观望。",
+            )
+        return None
+
+    def _swing_drop_supports_short(
+        self,
+        snapshot: Dict[str, Any],
+        profiles: Dict[str, Dict[str, Any]],
+        context: Dict[str, Any],
+        *,
+        for_intrabar: bool = False,
+    ) -> bool:
+        """15m 未同向看空时，需达到合理跌幅才允许做空（过滤高位小振荡）。"""
+        metrics = self._swing_live_drop_metrics(snapshot)
+        drop_pct = metrics["drop_pct"]
+        watch_drop, short_drop, crash_drop = self._swing_long_to_short_lines(snapshot)
+        pressure = context.get("recent_price_pressure", "neutral")
+        scores_15m = indicator_direction_scores(profiles.get("15m", {}))
+        ema_slope = to_float(profiles.get("15m", {}).get("ema_slope_pct"))
+        soft_bearish = (
+            to_float(scores_15m.get("net")) <= -12
+            or ema_slope < -0.04
+            or self._swing_15m_bearish_aligned(profiles)
+        )
+
+        if self._swing_15m_bearish_aligned(profiles):
+            required = short_drop * (0.82 if for_intrabar else 0.92)
+            return drop_pct >= required and pressure == "down"
+
+        if drop_pct >= crash_drop * 1.18 and pressure == "down":
+            return True
+        if drop_pct >= short_drop * 1.28 and pressure == "down" and soft_bearish:
+            return True
+        return False
+
+    def _swing_exit_from_long_meta(
+        self,
+        snapshot: Dict[str, Any],
+        context: Dict[str, Any],
+        profiles: Dict[str, Dict[str, Any]],
+    ) -> Optional[Tuple[str, str, str]]:
+        """持多后退出：15m 同向看空可较快转空；否则按跌幅比例区分观望/做空。"""
+        metrics = self._swing_live_drop_metrics(snapshot)
+        drop_pct = metrics["drop_pct"]
+        watch_drop, short_drop, crash_drop = self._swing_long_to_short_lines(snapshot)
+        pressure = context.get("recent_price_pressure", "neutral")
+        aligned_15m = self._swing_15m_bearish_aligned(profiles)
+        scores_15m = indicator_direction_scores(profiles.get("15m", {}))
+        ema_slope = to_float(profiles.get("15m", {}).get("ema_slope_pct"))
+        hist_slope = to_float(profiles.get("15m", {}).get("macd", {}).get("hist_slope"))
+        soft_bearish = (
+            to_float(scores_15m.get("net")) <= -12
+            or ema_slope < -0.04
+            or (hist_slope < -0.02 and to_float(profiles.get("15m", {}).get("macd", {}).get("hist")) <= 0)
+        )
+
+        if drop_pct < watch_drop * 0.80:
+            return None
+
+        if aligned_15m:
+            if drop_pct >= crash_drop * 1.05 and pressure == "down":
+                return (
+                    "做空",
+                    "swing_exit_short",
+                    f"15m已转弱且跌幅约{drop_pct:.2f}%，多单退出做空。",
+                )
+            if soft_bearish and drop_pct >= short_drop * 1.02 and pressure == "down":
+                return (
+                    "做空",
+                    "swing_exit_short",
+                    f"15m转弱且跌幅约{drop_pct:.2f}%，多单退出做空。",
+                )
+            if pressure == "down" and drop_pct >= watch_drop * 1.12:
+                return (
+                    "观望",
+                    "swing_exit_watch",
+                    f"15m转弱中，跌幅约{drop_pct:.2f}%，先退出观望。",
+                )
+            return None
+
+        if drop_pct >= crash_drop * 1.20 and pressure == "down":
+            return (
+                "做空",
+                "swing_exit_short",
+                f"15m未同向但跌幅约{drop_pct:.2f}%达强门槛，转空。",
+            )
+        if drop_pct >= short_drop * 1.28 and pressure == "down" and soft_bearish:
+            return (
+                "做空",
+                "swing_exit_short",
+                f"15m未同向但跌幅约{drop_pct:.2f}%且压力转弱，转空。",
+            )
+        if drop_pct >= watch_drop * 1.12:
+            return (
+                "观望",
+                "swing_exit_watch",
+                f"高位回落约{drop_pct:.2f}%未达做空门槛，先观望。",
+            )
+        return None
+
     def _swing_move_thresholds(self, snapshot: Dict[str, Any]) -> Tuple[float, float]:
         """中线动量阈值：30/60 分钟涨跌幅，结合 1H ATR 与风险偏好。"""
         profiles = snapshot.get("trend_profiles", {})
@@ -3162,75 +4059,208 @@ class OkxAiShortTermAssistant:
         return threshold_30m, threshold_60m
 
     def _swing_direction_meta(self, snapshot: Dict[str, Any], context: Dict[str, Any]) -> Tuple[str, str, str]:
-        profiles = snapshot.get("trend_profiles", {})
+        profiles = self._direction_profiles(snapshot)
         candles = snapshot.get("candles", {})
         trend_1h = profiles.get("1H", {}).get("trend")
         trend_4h = profiles.get("4H", {}).get("trend")
         trend_15m = profiles.get("15m", {}).get("trend")
-        if trend_1h == trend_4h == "up":
-            return "做多", "aligned", "1H/4H趋势同向偏多，中线关注结构回踩后的延伸机会。"
-        if trend_1h == trend_4h == "down":
-            return "做空", "aligned", "1H/4H趋势同向偏空，中线关注反抽不过后的延伸机会。"
+        pressure = context.get("recent_price_pressure", "neutral")
+        prior = str(
+            context.get("prior_direction")
+            or self._prior_direction(str(snapshot.get("inst_id", "") or ""))
+            or "观望"
+        )
+
+        price_led = self._price_led_direction_meta(snapshot, context)
+        if price_led:
+            direction, tier, summary = price_led
+            if direction == "做空" and prior == "做多":
+                if self._swing_drop_supports_short(snapshot, profiles, context):
+                    return price_led
+                metrics = self._swing_live_drop_metrics(snapshot)
+                watch_drop, _, _ = self._swing_long_to_short_lines(snapshot)
+                if metrics["drop_pct"] >= watch_drop * 0.92:
+                    return (
+                        "观望",
+                        "swing_exit_watch",
+                        f"高位小回落约{metrics['drop_pct']:.2f}%，15m未确认，先观望。",
+                    )
+            elif direction == "做多" and prior in ("做空", "观望"):
+                if self._swing_rise_supports_long(snapshot, profiles, context):
+                    return price_led
+                metrics = self._swing_live_move_metrics(snapshot)
+                watch_rise, _, _ = self._swing_short_to_long_lines(snapshot)
+                if metrics["rise_pct"] >= watch_rise * 0.92:
+                    return (
+                        "观望",
+                        "swing_entry_watch",
+                        f"低位小反弹约{metrics['rise_pct']:.2f}%，15m未确认，先观望。",
+                    )
+            else:
+                return price_led
 
         threshold_30m, threshold_60m = self._swing_move_thresholds(snapshot)
-        move_30m = self._recent_move_pct(candles.get("15m", []), 2)
-        move_60m = self._recent_move_pct(candles.get("15m", []), 4)
+        if trend_1h == trend_4h == "up":
+            if pressure == "down":
+                live = to_float(snapshot.get("price"))
+                move_30m = self._recent_move_pct(
+                    candles.get("1m", []), 30, live_price=live if live > 0 else 0.0,
+                )
+                short_floor, _ = self._price_move_floors(snapshot)
+                drop_pct = abs(min(move_30m, 0.0))
+                _, short_drop, crash_drop = self._swing_long_to_short_lines(snapshot)
+                can_short = (
+                    move_30m <= -short_floor * 0.55
+                    and pressure == "down"
+                    and (
+                        (self._swing_15m_bearish_aligned(profiles) and drop_pct >= short_drop * 1.05)
+                        or drop_pct >= crash_drop * 1.20
+                    )
+                )
+                if can_short:
+                    return (
+                        "做空",
+                        "price_pullback",
+                        f"1H/4H仍偏多但短窗回落约{abs(move_30m):.2f}%，按下跌处理。",
+                    )
+                return "观望", "pullback", "1H/4H结构仍偏多但短窗回落，等待企稳。"
+            if not self._swing_15m_bullish_aligned(profiles):
+                metrics = self._swing_live_move_metrics(snapshot)
+                _, long_rise, surge_rise = self._swing_short_to_long_lines(snapshot)
+                live = to_float(snapshot.get("price"))
+                move_30m = self._recent_move_pct(
+                    candles.get("1m", []), 30, live_price=live if live > 0 else 0.0,
+                )
+                rise_pct = max(metrics["rise_pct"], move_30m, 0.0)
+                if rise_pct >= surge_rise * 1.15 and pressure == "up":
+                    return (
+                        "做多",
+                        "swing_entry_long",
+                        f"1H/4H偏多且涨幅约{rise_pct:.2f}%，15m未同向仍跟多。",
+                    )
+                if rise_pct >= long_rise * 1.20 and pressure == "up":
+                    return "观望", "long_wait", "大周期偏多但15m/涨幅未充分确认，暂观望。"
+            if self._swing_15m_bullish_aligned(profiles) and pressure != "down":
+                return "做多", "aligned", "1H/4H趋势同向偏多，15m已确认，中线关注结构回踩后的延伸机会。"
+            return "观望", "long_wait", "1H/4H偏多但15m未确认，暂观望。"
+        if trend_1h == trend_4h == "down":
+            if pressure == "up":
+                live = to_float(snapshot.get("price"))
+                move_30m = self._recent_move_pct(
+                    candles.get("1m", []), 30, live_price=live if live > 0 else 0.0,
+                )
+                _, long_floor = self._price_move_floors(snapshot)
+                rise_pct = max(move_30m, 0.0)
+                _, long_rise, surge_rise = self._swing_short_to_long_lines(snapshot)
+                can_long = (
+                    move_30m >= long_floor * 0.55
+                    and pressure == "up"
+                    and (
+                        (self._swing_15m_bullish_aligned(profiles) and rise_pct >= long_rise * 1.05)
+                        or rise_pct >= surge_rise * 1.20
+                    )
+                )
+                if can_long:
+                    return (
+                        "做多",
+                        "price_rebound",
+                        f"1H/4H仍偏空但短窗反弹约{move_30m:.2f}%，按反弹处理。",
+                    )
+                return "观望", "rebound", "1H/4H结构仍偏空但短窗反弹，等待回落。"
+            if self._swing_15m_bearish_aligned(profiles) and pressure != "up":
+                return "做空", "aligned", "1H/4H趋势同向偏空，15m已确认，中线关注反抽不过后的延伸机会。"
+            return "观望", "short_wait", "1H/4H偏空但15m未确认，暂观望。"
+
+        threshold_30m, threshold_60m = self._swing_move_thresholds(snapshot)
+        live = to_float(snapshot.get("price"))
+        move_30m = self._recent_move_pct(candles.get("1m", []), 30, live_price=live if live > 0 else 0.0)
+        move_60m = self._recent_move_pct(candles.get("1m", []), 60, live_price=live if live > 0 else 0.0)
         pressure = context.get("recent_price_pressure", "neutral")
         trade_up = int(context.get("trade_up", 0) or 0)
         trade_down = int(context.get("trade_down", 0) or 0)
         bias = context.get("bias", "neutral")
         regime = context.get("regime", "")
 
+        watch_rise, long_rise, surge_rise = self._swing_short_to_long_lines(snapshot)
+        metrics = self._swing_live_move_metrics(snapshot)
+        rise_pct = metrics["rise_pct"]
+
         long_structural = (
             trend_1h in ("up", "mixed")
-            and trend_15m == "up"
             and trend_4h != "down"
-            and (trade_up >= 1 or pressure == "up" or bias == "long")
+            and pressure != "down"
+            and (
+                (
+                    trend_15m == "up"
+                    and (trade_up >= 1 or pressure == "up" or bias == "long")
+                )
+                or (
+                    trend_15m != "down"
+                    and rise_pct >= long_rise * 1.18
+                    and pressure == "up"
+                )
+            )
         )
         short_structural = (
             trend_1h in ("down", "mixed")
-            and trend_15m == "down"
+            and trend_15m in ("down", "mixed")
             and trend_4h != "up"
             and (trade_down >= 1 or pressure == "down" or bias == "short")
         )
         long_move = max(move_30m, move_60m)
         short_move = abs(min(move_30m, move_60m))
 
-        if long_structural:
-            if long_move >= threshold_30m:
-                return (
-                    "做多",
-                    "developing",
-                    f"1H/15m转多且30-60分钟涨幅约{long_move:.2f}%，4H仍在同步中。",
-                )
-            return "做多", "developing", "1H领先、15m确认转多，4H仍在同步中，关注延伸而非追极致。"
+        watch_drop, short_drop, crash_drop = self._swing_long_to_short_lines(snapshot)
+        drop_pct = metrics.get("drop_pct", short_move)
 
         if short_structural:
-            if short_move >= threshold_30m:
+            if short_move >= threshold_30m * 0.88 or drop_pct >= crash_drop * 1.05:
                 return (
                     "做空",
                     "developing",
                     f"1H/15m转空且30-60分钟跌幅约{short_move:.2f}%，4H仍在同步中。",
                 )
-            return "做空", "developing", "1H领先、15m确认转空，4H仍在同步中，关注延伸而非追极致。"
+            if pressure == "down" and short_move >= threshold_30m * 0.62:
+                return "做空", "developing", "1H领先、15m确认转空，4H仍在同步中，关注延伸而非追极致。"
+            return "观望", "short_wait", "结构偏空但跌幅未达确认门槛，继续观察。"
+
+        if long_structural:
+            if long_move >= threshold_30m * 1.05 or rise_pct >= long_rise * 1.12:
+                return (
+                    "做多",
+                    "developing",
+                    f"1H/15m转多且30-60分钟涨幅约{max(long_move, rise_pct):.2f}%，4H仍在同步中。",
+                )
+            if rise_pct >= watch_rise * 1.12 and self._swing_15m_bullish_aligned(profiles):
+                return "做多", "developing", "1H领先、15m确认转多，4H仍在同步中，关注延伸而非追极致。"
+            if rise_pct >= surge_rise * 1.12 and pressure == "up":
+                return (
+                    "做多",
+                    "developing",
+                    f"涨幅约{rise_pct:.2f}%达门槛，15m滞后但价格领先。",
+                )
+            return "观望", "long_wait", "结构偏多但涨幅未达确认门槛，继续观察。"
 
         long_momentum = (
-            long_move >= threshold_30m
+            (
+                long_move >= threshold_30m * 1.05
+                or rise_pct >= long_rise * 1.22
+            )
             and trend_1h != "down"
-            and trend_15m in ("up", "mixed")
+            and (trend_15m in ("up", "mixed") or rise_pct >= surge_rise * 1.12)
             and pressure != "down"
-            and (bias == "long" or regime in ("trend_up", "mixed"))
+            and (bias == "long" or regime in ("trend_up", "mixed") or rise_pct >= surge_rise * 1.08)
         )
         short_momentum = (
-            short_move >= threshold_30m
+            (short_move >= threshold_30m * 0.88 or drop_pct >= short_drop * 1.12)
             and trend_1h != "up"
             and trend_15m in ("down", "mixed")
             and pressure != "up"
             and (bias == "short" or regime in ("trend_down", "mixed"))
         )
-        if long_momentum and long_move >= threshold_60m * 0.85:
+        if long_momentum and long_move >= threshold_60m * 0.92:
             return "做多", "momentum", f"30-60分钟强势上行约{long_move:.2f}%，按中线动量跟踪。"
-        if short_momentum and short_move >= threshold_60m * 0.85:
+        if short_momentum and short_move >= threshold_60m * 0.92:
             return "做空", "momentum", f"30-60分钟强势下行约{short_move:.2f}%，按中线动量跟踪。"
         return self._merge_sentiment_direction_lead(
             snapshot,
@@ -3244,7 +4274,7 @@ class OkxAiShortTermAssistant:
         return self._swing_direction_meta(snapshot, context)[0]
 
     def _long_direction_meta(self, snapshot: Dict[str, Any], context: Dict[str, Any]) -> Tuple[str, str, str]:
-        profiles = snapshot.get("trend_profiles", {})
+        profiles = self._direction_profiles(snapshot)
         trend_4h = profiles.get("4H", {}).get("trend")
         trend_1d = profiles.get("1D", {}).get("trend")
         trend_1w = profiles.get("1W", {}).get("trend")
@@ -3411,6 +4441,12 @@ class OkxAiShortTermAssistant:
         if price_direction in ("做多", "做空") and price_tier not in ("neutral",):
             return price_direction, price_tier, price_summary
 
+        pressure = context.get("recent_price_pressure", "neutral")
+        if price_direction == "观望" and pressure == "down":
+            price_led = self._price_led_direction_meta(snapshot, context)
+            if price_led and price_led[0] == "做空":
+                return price_led
+
         sentiment = context.get("sentiment_meta")
         if not isinstance(sentiment, dict):
             sentiment = self._sentiment_direction_meta(snapshot, context)
@@ -3427,9 +4463,9 @@ class OkxAiShortTermAssistant:
         trend_15m = profiles.get(score_bars["primary"], {}).get("trend")
         trend_5m = profiles.get(score_bars["entry"], {}).get("trend")
         sent_dir = str(sentiment.get("direction"))
-        if sent_dir == "做多" and trend_15m == "down" and trend_5m == "down":
+        if sent_dir == "做多" and ((trend_15m == "down" and trend_5m == "down") or pressure == "down"):
             return price_direction, price_tier, price_summary
-        if sent_dir == "做空" and trend_15m == "up" and trend_5m == "up":
+        if sent_dir == "做空" and ((trend_15m == "up" and trend_5m == "up") or pressure == "up"):
             return price_direction, price_tier, price_summary
 
         if price_direction == "观望" or price_tier == "neutral":
@@ -3447,29 +4483,68 @@ class OkxAiShortTermAssistant:
         return threshold_10m, threshold_20m
 
     def _short_direction_meta(self, snapshot: Dict[str, Any], context: Dict[str, Any]) -> Tuple[str, str, str]:
-        profiles = snapshot.get("trend_profiles", {})
+        profiles = self._direction_profiles(snapshot)
         candles = snapshot.get("candles", {})
         trend_5m = profiles.get("5m", {}).get("trend")
         trend_15m = profiles.get("15m", {}).get("trend")
         trend_1h = profiles.get("1H", {}).get("trend")
+        trend_4h = profiles.get("4H", {}).get("trend")
         bias = context.get("bias", "neutral")
         pressure = context.get("recent_price_pressure", "neutral")
         trade_up = int(context.get("trade_up", 0) or 0)
         trade_down = int(context.get("trade_down", 0) or 0)
         threshold_10m, threshold_20m = self._short_move_thresholds(snapshot)
-        move_10m = self._recent_move_pct(candles.get("1m", []), 10)
-        move_20m = self._recent_move_pct(candles.get("1m", []), 20)
+        price = to_float(snapshot.get("price"))
+        live = price if price > 0 else 0.0
+        move_10m = self._recent_move_pct(candles.get("1m", []), 10, live_price=live)
+        move_20m = self._recent_move_pct(candles.get("1m", []), 20, live_price=live)
+        price_led = self._price_led_direction_meta(snapshot, context)
+        if price_led:
+            return price_led
 
-        if bias == "long" and (trade_up >= 1 or trend_15m == "up"):
+        indicator = context.get("indicator_consensus") if isinstance(context.get("indicator_consensus"), dict) else {}
+        alignment = context.get("indicator_alignment") if isinstance(context.get("indicator_alignment"), dict) else {}
+        indicator_long = self._htf_indicator_supports(indicator, "做多", alignment=alignment, min_net=22.0)
+        indicator_short = self._htf_indicator_supports(indicator, "做空", alignment=alignment, min_net=22.0)
+
+        if pressure == "down":
+            if (
+                move_20m <= -threshold_10m * 0.55
+                and trend_1h != "up"
+                and trend_15m != "up"
+            ):
+                return "做空", "price_leading", f"短窗下跌约{abs(move_20m):.2f}%，优先跟踪回落。"
+            if indicator_short and trend_1h in ("down", "mixed") and trend_4h in ("down", "mixed"):
+                return "做空", "indicator_htf", "1H/4H指标同向偏空且短窗转弱，提前跟随中线结构。"
+            if short_structural := (
+                trend_5m in ("down", "mixed")
+                and trend_15m in ("down", "mixed")
+                and (trade_down >= 1 or move_20m <= -threshold_10m * 0.45)
+            ):
+                return "做空", "structure", "5m/15m结构转弱且短窗压力向下，关注延续。"
+
+        if pressure == "up":
+            if indicator_long and trend_1h in ("up", "mixed") and trend_4h in ("up", "mixed"):
+                return "做多", "indicator_htf", "1H/4H指标同向偏多且短窗未转弱，提前跟随中线结构。"
+
+        if (
+            indicator_long
+            and trend_1h in ("up", "mixed")
+            and trend_4h in ("up", "mixed")
+            and pressure == "up"
+        ):
+            return "做多", "indicator_htf", "1H/4H指标同向偏多且短窗配合，提前跟随中线结构。"
+
+        if bias == "long" and pressure != "down" and (trade_up >= 1 or trend_15m == "up"):
             return "做多", "bias", "市场偏多且5m/15m未背离，短线跟随结构。"
-        if bias == "short" and (trade_down >= 1 or trend_15m == "down"):
+        if bias == "short" and pressure != "up" and (trade_down >= 1 or trend_15m == "down"):
             return "做空", "bias", "市场偏空且5m/15m未背离，短线跟随结构。"
 
-        long_structural = trend_5m == "up" and trend_15m == "up" and (
+        long_structural = trend_5m == "up" and trend_15m == "up" and pressure != "down" and (
             trade_up >= 2 or (trade_up >= 1 and pressure == "up")
         )
-        short_structural = trend_5m == "down" and trend_15m == "down" and (
-            trade_down >= 2 or (trade_down >= 1 and pressure == "down")
+        short_structural = trend_5m in ("down", "mixed") and trend_15m in ("down", "mixed") and (
+            trade_down >= 2 or (trade_down >= 1 and pressure == "down") or pressure == "down"
         )
         if long_structural:
             return "做多", "structure", "5m/15m结构同向转多，关注延续或回踩再入。"
@@ -3487,8 +4562,8 @@ class OkxAiShortTermAssistant:
             pressure == "down"
             and trend_5m in ("down", "mixed")
             and trend_1h != "up"
-            and move_20m <= -threshold_10m * 0.85
-            and (move_10m <= -threshold_10m * 0.55 or trend_15m in ("down", "mixed"))
+            and move_20m <= -threshold_10m * 0.70
+            and (move_10m <= -threshold_10m * 0.40 or trend_15m in ("down", "mixed"))
         )
         if long_developing_momentum:
             return "做多", "developing_momentum", "短窗压力向上，5m已转强且20m延伸，1H未强烈反向。"
@@ -3520,8 +4595,8 @@ class OkxAiShortTermAssistant:
             and pressure != "down"
         )
         short_momentum = (
-            move_20m <= -threshold_20m
-            and trend_15m == "down"
+            move_20m <= -threshold_20m * 0.85
+            and trend_15m in ("down", "mixed")
             and trend_5m in ("down", "mixed")
             and trend_1h != "up"
             and pressure != "up"
@@ -4133,7 +5208,7 @@ class OkxAiShortTermAssistant:
         if mode not in ("short", "scalp"):
             return self._empty_structure_forecast()
 
-        profiles = snapshot.get("trend_profiles", {})
+        profiles = self._direction_profiles(snapshot)
         context = snapshot.get("market_context", {})
         timeframe = self._forecast_timeframe_spec()
         lead_bar = timeframe["lead"]
@@ -4391,7 +5466,7 @@ class OkxAiShortTermAssistant:
         score: Dict[str, Any],
     ) -> Dict[str, Any]:
         mode = self._strategy_mode()
-        profiles = snapshot.get("trend_profiles", {})
+        profiles = self._direction_profiles(snapshot)
         context = snapshot.get("market_context", {})
         timeframe = self._forecast_timeframe_spec()
         lead_bar = timeframe["lead"]
@@ -4490,14 +5565,7 @@ class OkxAiShortTermAssistant:
         return {"entry": "-", "stop_loss": "-", "take_profit": "-"}
 
     def _raw_direction_for_mode(self, snapshot: Dict[str, Any], context: Dict[str, Any]) -> str:
-        mode = self._strategy_mode()
-        if mode == "scalp":
-            return self._scalp_raw_direction(snapshot, context)
-        if mode == "swing":
-            return self._swing_raw_direction(snapshot, context)
-        if mode == "long":
-            return self._long_raw_direction(snapshot, context)
-        return self._short_raw_direction(snapshot, context)
+        return self._raw_direction_meta_for_mode(snapshot, context)[0]
 
     def _should_downgrade_direction(
         self,
@@ -4567,10 +5635,10 @@ class OkxAiShortTermAssistant:
                 "entry": ("1m", "3m"),
                 "trade": ("5m", "15m"),
                 "higher": ("1H", "4H"),
-                "regime": "15m",
-                "momentum": "5m",
+                "regime": "1H",
+                "momentum": "15m",
                 "volume": "5m",
-                "group_weights": {"entry": 0.6, "trade": 1.5, "higher": 0.8},
+                "group_weights": {"entry": 0.5, "trade": 1.35, "higher": 1.25},
             },
             "swing": {
                 "entry": ("15m",),
@@ -4579,7 +5647,7 @@ class OkxAiShortTermAssistant:
                 "regime": "1H",
                 "momentum": "15m",
                 "volume": "1H",
-                "group_weights": {"entry": 0.7, "trade": 1.5, "higher": 1.0},
+                "group_weights": {"entry": 0.65, "trade": 1.8, "higher": 1.1},
             },
             "long": {
                 "entry": ("4H",),
@@ -4690,16 +5758,16 @@ class OkxAiShortTermAssistant:
             return "reversal_candidate_down"
         return "transition"
 
-    def _recent_move_pct(self, candles: List[Dict[str, Any]], bars: int) -> float:
-        rows = confirmed_candles(candles)
+    def _recent_move_pct(self, candles: List[Dict[str, Any]], bars: int, *, live_price: float = 0.0) -> float:
+        rows = tactical_candles(candles, live_price) if live_price > 0 else confirmed_candles(candles)
         if len(rows) <= bars:
             return 0.0
         latest = to_float(rows[0].get("close"))
         old = to_float(rows[bars].get("close"))
         return pct_change(latest, old)
 
-    def _recent_drawdown_pct(self, candles: List[Dict[str, Any]], bars: int) -> float:
-        rows = confirmed_candles(candles)
+    def _recent_drawdown_pct(self, candles: List[Dict[str, Any]], bars: int, *, live_price: float = 0.0) -> float:
+        rows = tactical_candles(candles, live_price) if live_price > 0 else confirmed_candles(candles)
         if len(rows) < 2:
             return 0.0
         sample = rows[: max(2, min(len(rows), bars + 1))]
@@ -4707,8 +5775,8 @@ class OkxAiShortTermAssistant:
         recent_high = max(to_float(item.get("high")) for item in sample)
         return pct_change(latest, recent_high)
 
-    def _recent_rebound_pct(self, candles: List[Dict[str, Any]], bars: int) -> float:
-        rows = confirmed_candles(candles)
+    def _recent_rebound_pct(self, candles: List[Dict[str, Any]], bars: int, *, live_price: float = 0.0) -> float:
+        rows = tactical_candles(candles, live_price) if live_price > 0 else confirmed_candles(candles)
         if len(rows) < 2:
             return 0.0
         sample = rows[: max(2, min(len(rows), bars + 1))]
@@ -4732,7 +5800,7 @@ class OkxAiShortTermAssistant:
                 down_hits += 1
             elif signed_move > 0:
                 up_hits += 1
-        if down_hits >= 2 or move_5m <= -max(0.12, atr_pct * 0.35):
+        if down_hits >= 2 or move_5m <= -max(0.08, atr_pct * 0.28):
             return "down"
         if up_hits >= 2 or move_5m >= max(0.12, atr_pct * 0.35):
             return "up"
@@ -6851,6 +7919,7 @@ class OkxAiShortTermAssistant:
             "long_short_ratio": snapshot["long_short_ratio"],
             "order_book": snapshot.get("order_book", {}),
             "trend_profiles": snapshot.get("trend_profiles", {}),
+            "trend_profiles_live": snapshot.get("trend_profiles_live", {}),
             "volatility": snapshot.get("volatility", {}),
             "dynamic_thresholds": snapshot.get("dynamic_thresholds", {}),
             "instrument_profile": snapshot.get("instrument_profile", {}),
@@ -7932,12 +9001,14 @@ class OkxAiShortTermAssistant:
         oi_change_pct_strategy: Optional[float] = None,
         funding_change_strategy: Optional[float] = None,
         derivative_window_minutes: int = 15,
+        profiles_live: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         # 市场上下文是新版判断的核心：先判断市场处于什么状态，再谈方向和入场。
         # 这样可以避免“放量就做多/做空”“多周期多数上涨就追多”的简单规则。
+        direction_profiles = profiles_live if isinstance(profiles_live, dict) and profiles_live else profiles
         context_bars = self._strategy_context_bars()
         trend_votes = {
-            group: [profiles.get(bar, {}).get("trend") for bar in context_bars.get(group, ())]
+            group: [direction_profiles.get(bar, {}).get("trend") for bar in context_bars.get(group, ())]
             for group in ("entry", "trade", "higher")
         }
         vote_metrics = self._weighted_trend_votes(
@@ -7955,7 +9026,7 @@ class OkxAiShortTermAssistant:
         entry_up = trend_votes["entry"].count("up")
         entry_down = trend_votes["entry"].count("down")
         regime_bar = str(context_bars.get("regime", "15m"))
-        regime_profile = profiles.get(regime_bar, {})
+        regime_profile = direction_profiles.get(regime_bar, {})
         adx_15m = to_float(regime_profile.get("adx", {}).get("adx"))
         boll_width = to_float(regime_profile.get("boll", {}).get("bandwidth_pct"))
         macd_15m = regime_profile.get("macd", {})
@@ -7965,8 +9036,9 @@ class OkxAiShortTermAssistant:
         mode = self._strategy_mode()
         pressure_spec = self._strategy_pressure_spec()
         pressure_rows = candles.get(pressure_spec["bar"], [])
+        live = price if price > 0 else 0.0
         pressure_moves = [
-            self._recent_move_pct(pressure_rows, bars)
+            self._recent_move_pct(pressure_rows, bars, live_price=live)
             for bars in pressure_spec["bars"]
         ]
         move_5m, move_10m, move_15m, move_20m = pressure_moves
@@ -7978,6 +9050,14 @@ class OkxAiShortTermAssistant:
         trade_metrics = vote_groups["trade"]
         entry_metrics = vote_groups["entry"]
         higher_metrics = vote_groups["higher"]
+        indicator_consensus = self._htf_indicator_consensus(direction_profiles)
+        indicator_alignment = self._htf_indicator_alignment_flags(direction_profiles)
+        indicator_long = self._htf_indicator_supports(
+            indicator_consensus, "做多", alignment=indicator_alignment, min_net=20.0,
+        )
+        indicator_short = self._htf_indicator_supports(
+            indicator_consensus, "做空", alignment=indicator_alignment, min_net=20.0,
+        )
         long_confirmed = (
             higher_metrics["up_ratio"] >= 0.5
             and vote_metrics["weighted_up"] > vote_metrics["weighted_down"]
@@ -7987,6 +9067,11 @@ class OkxAiShortTermAssistant:
                     trade_metrics["up_ratio"] >= 0.5
                     and recent_price_pressure == "up"
                     and entry_metrics["up_ratio"] >= 0.5
+                )
+                or (
+                    indicator_long
+                    and trade_metrics["up_ratio"] >= 0.5
+                    and recent_price_pressure != "down"
                 )
             )
         )
@@ -8000,8 +9085,20 @@ class OkxAiShortTermAssistant:
                     and recent_price_pressure == "down"
                     and entry_metrics["down_ratio"] >= 0.5
                 )
+                or (
+                    indicator_short
+                    and trade_metrics["down_ratio"] >= 0.5
+                    and recent_price_pressure != "up"
+                )
             )
         )
+
+        if (
+            recent_price_pressure == "down"
+            and trade_metrics["down_ratio"] >= 0.35
+            and vote_metrics["weighted_down"] >= vote_metrics["weighted_up"] * 0.80
+        ):
+            short_confirmed = True
 
         if squeeze and adx_15m < 18:
             bias = "neutral"
@@ -8107,6 +9204,8 @@ class OkxAiShortTermAssistant:
             "strategy_mode": mode,
             "strategy_bars": context_bars,
             "regime_bar": regime_bar,
+            "indicator_consensus": indicator_consensus,
+            "indicator_alignment": indicator_alignment,
             "recent_move_pct": {
                 "5m": move_5m,
                 "10m": move_10m,
