@@ -2349,6 +2349,7 @@ TRIGGER_REASON_LABELS = {
     "silence_brief": "静默简报",
     "monitor_start": "监控启动简报",
     "monitor_stop": "监控停止简报",
+    "manual_brief": "手动简报",
 }
 
 RISK_PREFERENCE_LABELS = {
@@ -6556,12 +6557,21 @@ class OkxAiShortTermAssistant:
 
         for attempt in range(1, retry_times + 1):
             try:
-                return client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2,
-                    timeout=self._ai_request_timeout(),
-                )
+                request_kwargs = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.2,
+                    "timeout": self._ai_request_timeout(),
+                }
+                try:
+                    return client.chat.completions.create(
+                        **request_kwargs,
+                        response_format={"type": "json_object"},
+                    )
+                except Exception as json_exc:
+                    if is_retryable_ai_error(json_exc):
+                        raise
+                    return client.chat.completions.create(**request_kwargs)
             except Exception as exc:
                 last_error = exc
                 if not is_retryable_ai_error(exc):
@@ -6802,6 +6812,7 @@ class OkxAiShortTermAssistant:
         labels = {
             "monitor_start": "监控已启动",
             "monitor_stop": "监控已停止",
+            "manual_brief": "手动简报",
         }
         label = labels.get(event, event)
         parsed = analysis.get("parsed") if isinstance(analysis.get("parsed"), dict) else {}
@@ -6847,6 +6858,51 @@ class OkxAiShortTermAssistant:
             trigger,
             selected,
         )
+
+    def generate_manual_brief_for_inst(self, inst_id: str) -> Dict[str, Any]:
+        """Generate one [简报] via live snapshot + AI; display only (no WeChat push)."""
+        if inst_id not in self.instruments:
+            return {"ok": False, "error": f"未配置币种 {inst_id}", "inst_id": inst_id}
+        if not self.ai_enabled:
+            return {"ok": False, "error": "AI 未启用或 API Key 未配置", "inst_id": inst_id}
+        snapshot = self.collect_snapshot(inst_id)
+        signals: List[Dict[str, Any]] = []
+        score = self.score_snapshot(snapshot, signals)
+        trigger = {
+            "level": "L2",
+            "should_call_ai": True,
+            "ai_invoked": False,
+            "reasons": ["manual_brief"],
+            "fingerprint": f"manual_brief:{inst_id}:{int(self._now_ts())}",
+        }
+        analysis = self.analyze_with_ai(snapshot, signals, score, trigger)
+        trigger["ai_invoked"] = True
+        if not analysis or not analysis.get("valid_json"):
+            detail = self._ai_analysis_error_detail(analysis)
+            return {
+                "ok": False,
+                "error": detail,
+                "inst_id": inst_id,
+            }
+        brief_decision = self._build_lifecycle_brief_decision(snapshot, analysis, score, trigger, "manual_brief")
+        title, body = self._build_wechat_push_content(
+            snapshot,
+            signals,
+            brief_decision,
+            analysis,
+            "brief",
+            local_score=score,
+            trigger=trigger,
+        )
+        text = f"{title}\n\n{body}".strip()
+        return {
+            "ok": True,
+            "inst_id": inst_id,
+            "title": title,
+            "body": body,
+            "text": text,
+            "usage": analysis.get("usage"),
+        }
 
     def push_lifecycle_brief(self, event: str) -> None:
         if not self._lifecycle_brief_enabled():
@@ -8312,7 +8368,9 @@ class OkxAiShortTermAssistant:
         self.last_push_at[push_key] = now
         self.last_wechat_push_at[inst_id] = now
         if push_kind == "brief":
-            self._silence_brief_epoch_sent[inst_id] = self._silence_brief_epoch(inst_id)
+            lifecycle = str(decision.get("lifecycle_event") or "")
+            if lifecycle not in ("monitor_start", "monitor_stop"):
+                self._silence_brief_epoch_sent[inst_id] = self._silence_brief_epoch(inst_id)
         if push_kind == "trade" and decision.get("direction") in ("做多", "做空"):
             self.last_trade_push_at[inst_id] = (decision["direction"], now)
 
@@ -10689,6 +10747,25 @@ class OkxAiShortTermAssistant:
 
         return not errors, errors
 
+    def _ai_analysis_error_detail(self, analysis: Optional[Dict[str, Any]]) -> str:
+        if not analysis:
+            return "AI 未返回结果"
+        error = str(analysis.get("error") or "").strip()
+        if error:
+            return error
+        if str(analysis.get("provider") or "").strip() == "local":
+            content = str(analysis.get("content") or "").strip()
+            if content:
+                return content
+        validation_errors = analysis.get("validation_errors")
+        if isinstance(validation_errors, list) and validation_errors:
+            return "AI JSON 校验失败: " + "; ".join(str(item) for item in validation_errors[:5])
+        content = str(analysis.get("content") or "").strip()
+        if content and extract_json_object(content) is None:
+            snippet = content[:240].replace("\n", " ")
+            return f"AI 返回无效 JSON（片段: {snippet}...）"
+        return "AI 返回无效 JSON"
+
     def _ai_payload(
         self,
         snapshot: Dict[str, Any],
@@ -11032,6 +11109,13 @@ class OkxAiShortTermAssistant:
                 "【监控停止 monitor_stop】\n"
                 "监控即将停止，请基于当前数据给出盘面小结、未推送 trade/spike 的原因、"
                 "停止前需关注事项。push_recommendation 应为 none 或 watch。\n\n"
+            )
+        elif "manual_brief" in trigger_reasons:
+            lifecycle_brief_block = (
+                "【手动简报 manual_brief】\n"
+                "用户从 Web 主动请求当前盘面简报，仅展示在对话窗口，不会自动推送微信。"
+                "请给出多周期结构概览、为何暂不宜 trade/spike 推送、关键价位/事件与观察建议。"
+                "analysis_note 必填；push_recommendation 应为 none 或 watch。\n\n"
             )
         return (
             f"你是欧易OKX USDT永续合约多策略分析助手，当前分析合约 {inst_id or instruments_text}。"
@@ -11481,6 +11565,8 @@ class OkxAiShortTermAssistant:
                 context_line = "- 监控已启动，发送启动盘面简报"
             elif lifecycle == "monitor_stop":
                 context_line = "- 监控已停止，发送停止前盘面简报"
+            elif lifecycle == "manual_brief":
+                context_line = "- Web 手动获取简报（不推送微信）"
             else:
                 context_line = (
                     f"- 距上次微信推送约 {brief_minutes} 分钟（期间未发结构单/急变/观察）"
@@ -11845,6 +11931,23 @@ def push_monitor_lifecycle_briefs(event: str, config: Optional[Dict[str, Any]] =
     assistant.push_enabled = bool(config.get("push_enabled"))
     assistant.ai_enabled = bool(config.get("ai_enabled"))
     assistant.push_lifecycle_brief(event)
+
+
+def generate_manual_brief(config: Optional[Dict[str, Any]] = None, inst_id: str = "") -> Dict[str, Any]:
+    """Generate one manual [简报] for display (no WeChat push)."""
+    config = dict(config or {})
+    target = str(inst_id or "").strip()
+    inst_ids = order_configured_instruments(config.get("inst_ids") or [])
+    if not inst_ids:
+        return {"ok": False, "error": "请先在配置页选择监控币种"}
+    if target and target not in inst_ids:
+        return {"ok": False, "error": f"未配置币种 {target}"}
+    preview_config = {**config, "ai_enabled": True}
+    assistant = _assistant_from_user_config(preview_config)
+    assistant.ai_enabled = True
+    assistant.push_enabled = False
+    chosen = target or inst_ids[0]
+    return assistant.generate_manual_brief_for_inst(chosen)
 
 
 def build_wechat_push_format_preview(config: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:

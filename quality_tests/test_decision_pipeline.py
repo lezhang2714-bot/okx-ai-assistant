@@ -967,6 +967,37 @@ class DecisionPipelineTests(unittest.TestCase):
             )
             mock_push.assert_not_called()
 
+    def test_lifecycle_brief_does_not_block_silence_brief_epoch(self):
+        assistant = make_assistant(wechat_silence_brief_minutes=60)
+        assistant.push_enabled = True
+        inst = "ETH-USDT-SWAP"
+        past = assistant._now_ts() - 61 * 60
+        assistant.last_wechat_push_at[inst] = past
+        assistant._mark_wechat_push_sent(
+            inst,
+            "brief:eth:lifecycle:monitor_start:观望",
+            "brief",
+            {"lifecycle_event": "monitor_start", "direction": "观望"},
+        )
+        self.assertNotIn(inst, assistant._silence_brief_epoch_sent)
+        assistant.last_wechat_push_at[inst] = past
+        self.assertTrue(assistant._silence_brief_should_call_ai(inst))
+
+    def test_silence_brief_marks_epoch_sent(self):
+        assistant = make_assistant(wechat_silence_brief_minutes=60)
+        inst = "ETH-USDT-SWAP"
+        assistant.last_wechat_push_at[inst] = assistant._now_ts()
+        assistant._mark_wechat_push_sent(
+            inst,
+            "brief:eth:观望",
+            "brief",
+            {"direction": "观望"},
+        )
+        self.assertEqual(
+            assistant._silence_brief_epoch_sent.get(inst),
+            assistant._silence_brief_epoch(inst),
+        )
+
     def test_swing_spike_rejects_single_macd_without_large_move(self):
         assistant = make_assistant(strategy_mode="swing", spike_push_score=62)
         score = {

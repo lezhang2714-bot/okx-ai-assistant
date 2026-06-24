@@ -11,6 +11,7 @@ import io
 import json
 import mimetypes
 import os
+from contextlib import contextmanager
 import re
 import secrets
 import shutil
@@ -259,7 +260,7 @@ CONFIG_FIELDS = [
     ("AI与推送", "ai_enabled", "checkbox", "启用AI分析", "开启后除 L2/L3 事件触发外，还可按下方「定时 AI 间隔」固定复核；事件触发仍受策略冷却约束。", "left"),
     ("AI与推送", "push_enabled", "checkbox", "启用微信推送", "每轮最多 1 条；trade/spike/watch 须 AI 复核；演变/静默简报规则见各间隔配置；同币种最短间隔 10 分钟。", "right"),
     ("AI与推送", "ai_periodic_interval_minutes", "number", "定时 AI 间隔(分钟)", "启用 AI 后，每个监控币种按此间隔固定调用一次分析（无信号也会调）；0 表示关闭。默认 10。修改后需重启监控。", "left"),
-    ("AI与推送", "wechat_silence_brief_minutes", "number", "静默简报间隔(分钟)", "启用后：监控启动/停止各推一次[简报]；任意微信推送后超过此时间仍无新推送则发静默[简报]。0=关闭。需同时启用 AI 与微信推送。修改后需重启监控。", "right"),
+    ("AI与推送", "wechat_silence_brief_minutes", "number", "静默简报间隔(分钟)", "启用后：监控启动/停止各推一次[简报]；距上次任意微信推送满此分钟且期间无结构单/急变推送时，再发静默[简报]。0=关闭。需 AI+微信推送。修改后需重启监控。", "right"),
     ("AI与推送", "push_score", "number", "做多推送门槛(trade)", "direction 为做多且 confidence ≥ 此值时可推 trade。建议见下方「推送分数建议」。", "right"),
     ("AI与推送", "short_push_score", "number", "做空推送门槛(trade)", "direction 为做空且 confidence ≥ 此值时可推 trade；标准模式建议与做多对称(75/75)。", "right"),
 ]
@@ -275,6 +276,7 @@ ENV_FIELDS = [
     ("AI_BASE_URL", "AI Base URL", "OpenAI 兼容 Base URL；DeepSeek 填 https://api.deepseek.com。"),
     ("WECHAT_SEND_KEY", "微信推送 SendKey", "Server酱 SendKey，用于推送到个人微信。在 https://sct.ftqq.com 获取。"),
 ]
+SAVED_AI_ENV_KEYS = ("OPENAI_API_KEY", "AI_API_KEY", "AI_BASE_URL", "AI_MODEL")
 
 
 def default_config() -> Dict[str, Any]:
@@ -1431,6 +1433,24 @@ def build_child_env() -> Dict[str, str]:
     return child_env
 
 
+@contextmanager
+def use_saved_env():
+    """Apply config-page env vars to the current process (same as monitor subprocess)."""
+    child = build_child_env()
+    backup = {key: os.environ[key] for key in SAVED_AI_ENV_KEYS if key in os.environ}
+    try:
+        for key in SAVED_AI_ENV_KEYS:
+            if key in child:
+                os.environ[key] = child[key]
+        yield
+    finally:
+        for key in SAVED_AI_ENV_KEYS:
+            if key in backup:
+                os.environ[key] = backup[key]
+            elif key in os.environ:
+                del os.environ[key]
+
+
 def build_monitor_args(config: Dict[str, Any]) -> List[str]:
     config = normalize_config(config)
     args = [
@@ -1853,9 +1873,10 @@ def stop_monitor(*, fast: bool = False) -> str:
     if not status["running"]:
         return "监控未运行。"
     try:
-        get_signal_monitor().push_monitor_lifecycle_briefs(
-            "monitor_stop", normalize_config(load_config())
-        )
+        with use_saved_env():
+            get_signal_monitor().push_monitor_lifecycle_briefs(
+                "monitor_stop", normalize_config(load_config())
+            )
     except Exception as exc:
         console_warn(f"monitor_stop lifecycle brief failed: {exc}")
     MONITOR_STOP_REQUESTED = True
@@ -2418,6 +2439,20 @@ def test_ai_connection() -> Dict[str, Any]:
     if result.get("ok"):
         return {"ok": True, "message": f"AI测试成功：{result.get('reply', '')}"}
     return {"ok": False, "message": f"AI测试失败：{result.get('error', '未知错误')}"}
+
+
+def fetch_manual_brief(inst_id: str = "") -> Dict[str, Any]:
+    env = build_child_env()
+    if not str(env.get("OPENAI_API_KEY", "")).strip():
+        return {"ok": False, "error": "AI API Key 未配置。请先在配置页填写并保存。"}
+    config = normalize_config(load_config())
+    if not configured_instruments():
+        return {"ok": False, "error": "请先在配置页选择监控币种。"}
+    try:
+        with use_saved_env():
+            return get_signal_monitor().generate_manual_brief(config, inst_id)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 def redact_secrets_mapping(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -4590,7 +4625,7 @@ button,.button{{border:0;border-radius:12px;padding:11px 16px;background:#f1f3f8
 <form class="settings-form" method="post" action="/save-auth#settings" autocomplete="off"><input type="text" name="fake_username" autocomplete="username" tabindex="-1" aria-hidden="true" class="autofill-trap"><input type="password" name="fake_password" autocomplete="current-password" tabindex="-1" aria-hidden="true" class="autofill-trap"><section class="card page-panel" data-page="settings"><h2>登录账号</h2><div class="field"><label>用户名</label><div><input type="text" name="auth_username" autocomplete="off" value="{esc(auth.get("username","admin"))}"><p>Web 控制台登录用户名（单账户）。</p></div></div><div class="field"><label>当前密码</label><div><div class="password-wrap"><input type="password" name="auth_current_password" autocomplete="off" placeholder="请手动输入当前密码" readonly data-verify-password><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>须手动输入当前密码验证身份，不会自动填充。</p></div></div><div class="field"><label>新密码</label><div><div class="password-wrap"><input type="password" name="auth_password" autocomplete="off" placeholder="留空则不修改" readonly data-verify-password><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>留空表示保留当前密码；保存后将停止监控/回放并退出登录。</p></div></div></section><section class="card page-panel" data-page="settings"><h2>恢复出厂设置</h2><p class="section-sub">清除 <code>build/runtime_logs/</code> 下运行日志、回放数据、模拟账户与 Token 统计，并将交易配置、AI 密钥、微信 SendKey 与登录账号恢复为出厂默认。会先停止监控与回放；操作不可撤销。</p><div class="field"><label>确认密码</label><div><div class="password-wrap"><input type="password" name="factory_reset_password" autocomplete="off" placeholder="请手动输入当前密码" readonly data-verify-password><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>须验证当前登录密码后才会执行；完成后请使用默认账号 admin / admin123 重新登录。</p></div></div><div class="actions" style="padding:0;margin-top:12px;"><button class="button action-control btn-danger" type="button" id="factoryResetBtn">恢复出厂设置</button></div><p class="accuracy-note" id="factoryResetHint" style="margin-top:10px;"></p></section><div class="actions settings-actions" data-page-actions="settings"><div class="action-group"><button class="action-control btn-save" type="submit">保存账号密码</button><a class="button action-control btn-danger" href="/logout">退出登录</a></div></div></form>
 <div class="page-panel active" data-page="monitor"><section class="card toolbar-card monitor-toolbar-card"><div><h2>实时监控</h2><p class="section-sub">K 线默认显示；关闭开关后不再请求 OKX/日志绘图，<strong>监控进程照常运行</strong>。下方模拟账户按 final_direction 满仓跟单（会话 $10,000 重置）。</p></div><div class="toolbar-right"><span class="section-sub" id="monitorChartLabel" style="margin:0;white-space:nowrap;">K线显示已开启</span><label class="switch" title="仅控制 Web 是否绘制 K 线与快照，不影响后台监控"><input type="checkbox" id="monitorChartEnableToggle" checked><span></span></label><div class="coin-tabs">{monitor_tabs}</div><button class="button btn-run action-control" type="button" id="monitorToggleBtn">开始监控</button></div></section><p class="accuracy-note accuracy-off-hint monitor-chart-off-hint" id="monitorChartOffHint" hidden>K 线显示已关闭。监控进程与磁盘日志照常运行；打开右上角开关后将请求 OKX 并绘制图表。</p><section class="market-card monitor-card" id="monitorChartPanel"><div class="market-head"><div><div class="market-title" id="monitorTitle">{esc(monitor_initial or "未配置币种")} K线</div><div class="market-sub" id="monitorMeta">{esc("选择周期查看蜡烛图 · 启动监控后叠加分析指标" if monitor_initial else "请先在配置页选择监控币种")}</div><div class="bar-tabs" id="monitorBarTabs">{monitor_bar_tabs}</div></div><div class="market-price" id="monitorPrice"><strong>--</strong><span>加载中</span></div></div><div class="market-canvas-wrap"><canvas id="monitorChart"></canvas><div class="market-loading" id="monitorLoading">正在加载 K 线...</div><div class="snapshot-panel" id="snapshotPanel"><div class="snapshot-head"><strong id="snapshotPanelTitle">最新快照</strong><button type="button" class="snapshot-toggle" id="snapshotToggleBtn" title="收起或展开快照面板">收起</button></div><div class="snapshot-body" id="snapshotPanelBody"><div class="snapshot-grid"><span>状态</span><b>加载中...</b><span>提示</span><b>点击 K 线查看 OHLC</b></div></div></div></div><div class="market-time-range"><span id="monitorProcessInfo">PID -- · Token --</span><span id="monitorUptime">已监控：未启动</span><span id="monitorPaperAccount">模拟账户：--</span><span id="monitorPointCount">K线：0</span></div></section></div>
 	<div class="page-panel" data-page="logs"><section class="card toolbar-card logs-toolbar-card"><div><h2>实时日志</h2><p class="section-sub">监控进程仍会照常写入磁盘（JSON 分析 + 控制台）；本页<strong>默认不拉取显示</strong>以节省资源。配置页可设单文件/总容量上限。</p></div><div class="toolbar-right" style="align-items:center;gap:10px;flex-wrap:wrap;"><span class="section-sub" id="logsDisplayLabel" style="margin:0;white-space:nowrap;">显示已关闭</span><label class="switch" title="仅控制 Web 是否读取并展示日志，不影响磁盘写入"><input type="checkbox" id="logsDisplayToggle"><span></span></label><span class="section-sub" id="analysisLogSwitchHint" style="margin:0;">{esc(log_size_summary_text(config))} · 修改后需重启监控</span><button class="button btn-log" type="button" id="refreshLogBtn">刷新全部</button><button class="button btn-log" type="button" id="openLogDirBtn">打开日志目录</button></div></section><p class="accuracy-note accuracy-off-hint" id="logsOffHint">Web 显示已关闭。监控仍正常写日志到磁盘；打开右上角开关后可在此查看本次启动后的内容。</p><section class="card logs-card" id="logPanelBody" hidden><div class="logs-grid"><div class="log-panel"><h3>JSON 分析日志</h3><p class="log-panel-desc">Web 图表/压测依赖的完整分析记录，分卷保存：{esc(MONITOR_JSON_LOG_FILE)} 及 .jsonl.1/.2 …</p><div class="log-panel-body"><textarea class="log-window" id="logWindow" readonly>正在加载日志...</textarea></div><div class="log-panel-footer"><div class="toolbar-card"><div><p class="section-sub" id="saveLogHint">可另存为 .jsonl 文件，便于回放与统计。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveLogBtn">另存为文件</button></div></div></div></div><div class="log-panel"><h3>控制台日志</h3><p class="log-panel-desc">监控进程精简调试输出（信号摘要、推送结果、错误）；详细重试日志需设置 CONSOLE_VERBOSE=1，默认保存：{esc(MONITOR_PROCESS_LOG_FILE)}</p><div class="log-panel-body"><textarea class="log-window log-window-console" id="consoleLogWindow" readonly>正在加载控制台日志...</textarea></div><div class="log-panel-footer"><div class="toolbar-card"><div><p class="section-sub" id="saveConsoleLogHint">可另存为 .log 文件，便于快速排查信号与推送。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearConsoleLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveConsoleLogBtn">另存为文件</button></div></div></div></div></div></section></div>
-	<div class="page-panel" data-page="tests"><section class="card diagnostic-export-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">问题排查导出</h2><p class="section-sub" style="margin:0;">一键打包配置（密钥已打码）、监控/回放状态、日志、压测图表与回放数据，便于反馈 bug 时分析。超大日志仅含尾部。</p></div><div class="toolbar-right"><button class="button action-control btn-save" type="button" id="diagnosticExportBtn">导出诊断包</button></div></div><p class="accuracy-note" id="diagnosticExportHint">将下载 ZIP 文件；包含 JSON 分析日志、控制台日志、回放数据、实时/回放压测 JSON、Token 统计与当前 AI 对话（如有）。</p></section><section class="card ai-chat-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">AI 对话测试</h2><p class="section-sub" style="margin:0;">使用配置页中的 AI 密钥与模型；发送前会先保存当前配置。对话历史仅保留在本页浏览器内存中。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="aiChatClearBtn">清空对话</button><button class="button action-control btn-test" type="button" id="aiChatPingBtn">连通性测试</button></div></div><div class="ai-chat-window" id="aiChatWindow"><div class="ai-chat-empty">输入下方消息开始与 AI 对话。可先点「连通性测试」验证配置是否可用。</div></div><div class="ai-chat-compose"><textarea id="aiChatInput" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea><button class="button action-control btn-test" type="button" id="aiChatSendBtn">发送</button></div></section><section class="card toolbar-card"><div><h2>微信推送测试</h2><p class="section-sub">测试 Server酱 推送是否可用。点击后会先保存配置页中的密钥，再发送与真实监控相同结构的格式预览（模拟 AI 全字段示例）。</p></div><div class="toolbar-right"><button class="button action-control btn-test" type="button" id="testPushBtn">测试微信推送</button></div></section><div id="connectivityTestNotice" class="notice" hidden></div><section class="card accuracy-card"><div class="toolbar-card" style="margin:0 0 12px;box-shadow:none;padding:0;background:transparent;border:none;align-items:flex-start;"><div><h2 style="margin:0 0 6px;">实时预测压测</h2><p class="section-sub" style="margin:0;">顶部<strong>分析次数、AI调用次数、Token总消耗</strong>按当前币种、范围和保留时长统计。模拟账户按 final_direction 从 $10,000 满仓跟单（方向变才换仓）；绿线为权益曲线。下方为分层预测准确度；<strong>AI前瞻命中率</strong>按每条 <code>forward_view</code> 的 horizon 独立验证。回放会话在价线上方标记<strong>应推送</strong>。<strong>默认关闭</strong>以节省资源，需要时再打开。</p></div><div class="toolbar-right" style="align-items:center;gap:10px;flex-shrink:0;"><span class="section-sub" id="accuracyEnableLabel" style="margin:0;white-space:nowrap;">压测已关闭</span><label class="switch" title="启用后才会读取分析日志并自动刷新压测图表"><input type="checkbox" id="accuracyEnableToggle"><span></span></label></div></div><p class="accuracy-note accuracy-off-hint" id="accuracyOffHint">压测已关闭。打开右上角开关后将读取分析日志并自动刷新图表。</p><div id="accuracyPanelBody" hidden><div class="accuracy-controls"><select id="accuracyInst">{accuracy_inst_options}</select>{accuracy_horizon_select_html}<select id="accuracyScope"><option value="session">本次启动后</option><option value="replay">回放会话</option><option value="all">全部历史日志</option></select><select id="accuracyRetentionHours" title="结合配置页轮询间隔计算图表最多保留多少点"><option value="1">保留1小时</option><option value="2">保留2小时</option><option value="4">保留4小时</option><option value="8">保留8小时</option><option value="12" selected>保留12小时</option><option value="24">保留24小时</option><option value="48">保留48小时</option></select><button class="btn-test" type="button" id="accuracyRefreshBtn">刷新压测</button><button class="btn-save" type="button" id="accuracyExportBtn">导出图表</button><button class="btn-save" type="button" id="accuracyImportBtn">导入图表</button><button class="btn-test" type="button" id="accuracyLiveBtn" style="display:none">返回实时</button><input type="file" id="accuracyImportInput" accept=".json,application/json" hidden></div><div class="accuracy-summary" id="accuracySummary"><div class="accuracy-primary"><span>分析次数</span><b>--</b></div><div class="accuracy-primary"><span>AI调用次数</span><b>--</b></div><div class="accuracy-primary"><span>Token总消耗</span><b>--</b></div></div><div class="accuracy-canvas-wrap"><canvas id="accuracyChart"></canvas><div class="accuracy-point-panel" id="accuracyPointPanel" hidden></div></div><p class="accuracy-note" id="accuracyNote">综合准确度用上方验证窗口；AI前瞻命中率用每条 forward_view 的 horizon（通常 15m）。观望：后续波动未超阈值即合理。交易：验证窗内价格朝做多/做空方向走即方向命中。</p></div></section><section class="card"><h2>离线回放压测</h2><p class="section-sub">配置页勾选「录制回放数据集」并运行监控，每轮原始输入写入 {esc(REPLAY_DATASET_FILE)}；停止监控后点击下方「开始回放」。回放按配置启用 AI 与微信推送（未开推送则只写日志），结论写入 {esc(REPLAY_ANALYSIS_LOG_FILE)} 的 <code>push_analysis</code> 与 <code>analysis</code> 字段，便于同一数据集多次回放对比；再选上方「回放会话」查看压测曲线。</p><div class="replay-status" id="replayDatasetInfo">正在加载数据集状态...</div><div class="field"><label>回放间隔(秒)</label><div><input type="number" id="replayInterval" value="0" min="0" max="120" step="0.1"><p>0 表示尽快跑完；大于 0 可在回放过程中观察压测曲线刷新。</p></div></div><div class="field"><label>控制</label><div><div class="toolbar-right" style="justify-content:flex-start;gap:8px;"><button class="btn-test" type="button" id="replayStartBtn">开始回放</button><button class="btn-danger action-control" type="button" id="replayStopBtn">停止回放</button><button class="button btn-log" type="button" id="replayRefreshBtn">刷新状态</button></div><p id="replayStatusText">等待加载...</p></div></div></section></div>
+	<div class="page-panel" data-page="tests"><section class="card diagnostic-export-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">问题排查导出</h2><p class="section-sub" style="margin:0;">一键打包配置（密钥已打码）、监控/回放状态、日志、压测图表与回放数据，便于反馈 bug 时分析。超大日志仅含尾部。</p></div><div class="toolbar-right"><button class="button action-control btn-save" type="button" id="diagnosticExportBtn">导出诊断包</button></div></div><p class="accuracy-note" id="diagnosticExportHint">将下载 ZIP 文件；包含 JSON 分析日志、控制台日志、回放数据、实时/回放压测 JSON、Token 统计与当前 AI 对话（如有）。</p></section><section class="card ai-chat-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">AI 对话测试</h2><p class="section-sub" style="margin:0;">使用配置页中的 AI 密钥与模型；发送前会先保存当前配置。对话历史仅保留在本页浏览器内存中。「获取简报」按监控同款逻辑拉取 OKX 盘面并生成 [简报]（不推送微信）。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="aiChatClearBtn">清空对话</button><button class="button action-control btn-test" type="button" id="aiChatBriefBtn">获取简报</button><button class="button action-control btn-test" type="button" id="aiChatPingBtn">连通性测试</button></div></div><div class="ai-chat-window" id="aiChatWindow"><div class="ai-chat-empty">输入下方消息开始与 AI 对话。可先点「连通性测试」验证配置是否可用。</div></div><div class="ai-chat-compose"><textarea id="aiChatInput" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea><button class="button action-control btn-test" type="button" id="aiChatSendBtn">发送</button></div></section><section class="card toolbar-card"><div><h2>微信推送测试</h2><p class="section-sub">测试 Server酱 推送是否可用。点击后会先保存配置页中的密钥，再发送与真实监控相同结构的格式预览（模拟 AI 全字段示例）。</p></div><div class="toolbar-right"><button class="button action-control btn-test" type="button" id="testPushBtn">测试微信推送</button></div></section><div id="connectivityTestNotice" class="notice" hidden></div><section class="card accuracy-card"><div class="toolbar-card" style="margin:0 0 12px;box-shadow:none;padding:0;background:transparent;border:none;align-items:flex-start;"><div><h2 style="margin:0 0 6px;">实时预测压测</h2><p class="section-sub" style="margin:0;">顶部<strong>分析次数、AI调用次数、Token总消耗</strong>按当前币种、范围和保留时长统计。模拟账户按 final_direction 从 $10,000 满仓跟单（方向变才换仓）；绿线为权益曲线。下方为分层预测准确度；<strong>AI前瞻命中率</strong>按每条 <code>forward_view</code> 的 horizon 独立验证。回放会话在价线上方标记<strong>应推送</strong>。<strong>默认关闭</strong>以节省资源，需要时再打开。</p></div><div class="toolbar-right" style="align-items:center;gap:10px;flex-shrink:0;"><span class="section-sub" id="accuracyEnableLabel" style="margin:0;white-space:nowrap;">压测已关闭</span><label class="switch" title="启用后才会读取分析日志并自动刷新压测图表"><input type="checkbox" id="accuracyEnableToggle"><span></span></label></div></div><p class="accuracy-note accuracy-off-hint" id="accuracyOffHint">压测已关闭。打开右上角开关后将读取分析日志并自动刷新图表。</p><div id="accuracyPanelBody" hidden><div class="accuracy-controls"><select id="accuracyInst">{accuracy_inst_options}</select>{accuracy_horizon_select_html}<select id="accuracyScope"><option value="session">本次启动后</option><option value="replay">回放会话</option><option value="all">全部历史日志</option></select><select id="accuracyRetentionHours" title="结合配置页轮询间隔计算图表最多保留多少点"><option value="1">保留1小时</option><option value="2">保留2小时</option><option value="4">保留4小时</option><option value="8">保留8小时</option><option value="12" selected>保留12小时</option><option value="24">保留24小时</option><option value="48">保留48小时</option></select><button class="btn-test" type="button" id="accuracyRefreshBtn">刷新压测</button><button class="btn-save" type="button" id="accuracyExportBtn">导出图表</button><button class="btn-save" type="button" id="accuracyImportBtn">导入图表</button><button class="btn-test" type="button" id="accuracyLiveBtn" style="display:none">返回实时</button><input type="file" id="accuracyImportInput" accept=".json,application/json" hidden></div><div class="accuracy-summary" id="accuracySummary"><div class="accuracy-primary"><span>分析次数</span><b>--</b></div><div class="accuracy-primary"><span>AI调用次数</span><b>--</b></div><div class="accuracy-primary"><span>Token总消耗</span><b>--</b></div></div><div class="accuracy-canvas-wrap"><canvas id="accuracyChart"></canvas><div class="accuracy-point-panel" id="accuracyPointPanel" hidden></div></div><p class="accuracy-note" id="accuracyNote">综合准确度用上方验证窗口；AI前瞻命中率用每条 forward_view 的 horizon（通常 15m）。观望：后续波动未超阈值即合理。交易：验证窗内价格朝做多/做空方向走即方向命中。</p></div></section><section class="card"><h2>离线回放压测</h2><p class="section-sub">配置页勾选「录制回放数据集」并运行监控，每轮原始输入写入 {esc(REPLAY_DATASET_FILE)}；停止监控后点击下方「开始回放」。回放按配置启用 AI 与微信推送（未开推送则只写日志），结论写入 {esc(REPLAY_ANALYSIS_LOG_FILE)} 的 <code>push_analysis</code> 与 <code>analysis</code> 字段，便于同一数据集多次回放对比；再选上方「回放会话」查看压测曲线。</p><div class="replay-status" id="replayDatasetInfo">正在加载数据集状态...</div><div class="field"><label>回放间隔(秒)</label><div><input type="number" id="replayInterval" value="0" min="0" max="120" step="0.1"><p>0 表示尽快跑完；大于 0 可在回放过程中观察压测曲线刷新。</p></div></div><div class="field"><label>控制</label><div><div class="toolbar-right" style="justify-content:flex-start;gap:8px;"><button class="btn-test" type="button" id="replayStartBtn">开始回放</button><button class="btn-danger action-control" type="button" id="replayStopBtn">停止回放</button><button class="button btn-log" type="button" id="replayRefreshBtn">刷新状态</button></div><p id="replayStatusText">等待加载...</p></div></div></section></div>
 	{help_manual_html(config)}
 	{design_docs_html()}
 	</main></div></div>
@@ -5440,6 +5475,47 @@ async function runAiChatPing() {{
     if (pingBtn) {{ pingBtn.disabled = false; pingBtn.textContent = '连通性测试'; }}
   }}
 }}
+async function runAiChatBrief() {{
+  const briefBtn = document.getElementById('aiChatBriefBtn');
+  const sendBtn = document.getElementById('aiChatSendBtn');
+  const pingBtn = document.getElementById('aiChatPingBtn');
+  const inst = monitorInst || (configuredMonitorInsts && configuredMonitorInsts.length ? configuredMonitorInsts[0] : '');
+  if (!inst) {{
+    alert('请先在配置页选择监控币种');
+    return;
+  }}
+  if (briefBtn) {{ briefBtn.disabled = true; briefBtn.textContent = '生成中...'; }}
+  if (sendBtn) sendBtn.disabled = true;
+  if (pingBtn) pingBtn.disabled = true;
+  aiChatMessages.push({{ role: 'user', content: '[获取简报] ' + inst }});
+  renderAiChatMessages();
+  aiChatMessages.push({{ role: 'assistant', content: '正在拉取盘面并生成简报...', pending: true }});
+  renderAiChatMessages();
+  try {{
+    await autoSaveConfig();
+    const response = await fetch('/api/ai-brief', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ inst_id: inst }}),
+      cache: 'no-store'
+    }});
+    const payload = await response.json();
+    aiChatMessages.pop();
+    if (!response.ok || payload.ok === false) {{
+      aiChatMessages.push({{ role: 'assistant', content: payload.error || payload.message || '简报生成失败', error: true }});
+    }} else {{
+      aiChatMessages.push({{ role: 'assistant', content: payload.text || ((payload.title || '') + '\\n\\n' + (payload.body || '')), usage: payload.usage || null }});
+    }}
+  }} catch (error) {{
+    aiChatMessages.pop();
+    aiChatMessages.push({{ role: 'assistant', content: String(error), error: true }});
+  }} finally {{
+    if (briefBtn) {{ briefBtn.disabled = false; briefBtn.textContent = '获取简报'; }}
+    if (sendBtn) sendBtn.disabled = false;
+    if (pingBtn) pingBtn.disabled = false;
+    renderAiChatMessages();
+  }}
+}}
 const aiChatSendBtn = document.getElementById('aiChatSendBtn');
 if (aiChatSendBtn) aiChatSendBtn.addEventListener('click', function() {{ sendAiChatMessage(); }});
 const aiChatInput = document.getElementById('aiChatInput');
@@ -5456,6 +5532,8 @@ if (aiChatClearBtn) aiChatClearBtn.addEventListener('click', function() {{
 }});
 const aiChatPingBtn = document.getElementById('aiChatPingBtn');
 if (aiChatPingBtn) aiChatPingBtn.addEventListener('click', function() {{ runAiChatPing(); }});
+const aiChatBriefBtn = document.getElementById('aiChatBriefBtn');
+if (aiChatBriefBtn) aiChatBriefBtn.addEventListener('click', function() {{ runAiChatBrief(); }});
 renderAiChatMessages();
 function parseDownloadFilename(disposition, fallback) {{
   if (!disposition) return fallback;
@@ -6063,6 +6141,15 @@ class Handler(BaseHTTPRequestHandler):
                     str(payload.get("message", "")),
                     payload.get("history") if isinstance(payload.get("history"), list) else None,
                 )
+                self.send_json(result, status=200 if result.get("ok") else 400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        if path == "/api/ai-brief":
+            try:
+                payload = json.loads(raw or "{}")
+                inst_id = str(payload.get("inst_id", "") or "").strip()
+                result = fetch_manual_brief(inst_id)
                 self.send_json(result, status=200 if result.get("ok") else 400)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=400)
