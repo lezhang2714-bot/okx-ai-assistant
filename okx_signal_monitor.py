@@ -653,7 +653,10 @@ def format_ai_analysis_lines(
         if isinstance(reasons, list) and reasons:
             lines.append(f"  前瞻理由: {_clip_console_text('; '.join(str(item) for item in reasons[:3]), 180)}")
 
-        suggestion = forward.get("summary") or parsed.get("suggestion") or parsed_analysis_note(parsed)
+        forward_summary = forward.get("summary")
+        if forward_summary:
+            lines.append(f"  前瞻路径: {_clip_console_text(forward_summary, 160)}")
+        suggestion = parsed.get("suggestion") or resolve_ai_suggestion(parsed)
         if suggestion:
             lines.append(f"  操作计划: {_clip_console_text(suggestion, 180)}")
         return lines
@@ -765,6 +768,28 @@ STRATEGY_PROFILES = {
         "holding_time": "数天-数周",
     },
 }
+
+
+def strategy_ai_trend_bars(mode: str) -> List[str]:
+    """AI trend.timeframes 允许填写的周期键，与策略 primary/confirm/background 对齐。"""
+    profile = STRATEGY_PROFILES.get(str(mode or "short").lower(), STRATEGY_PROFILES["short"])
+    selected = (
+        set(profile.get("primary_bars") or [])
+        | set(profile.get("confirm_bars") or [])
+        | set(profile.get("background_bars") or [])
+    )
+    return [bar for bar in BAR_CHANNELS if bar in selected]
+
+
+def filter_ai_trend_timeframes(trend: Dict[str, Any], allowed_bars: List[str]) -> None:
+    if not allowed_bars:
+        return
+    allowed = set(allowed_bars)
+    timeframes = trend.get("timeframes")
+    if not isinstance(timeframes, dict):
+        trend["timeframes"] = {}
+        return
+    trend["timeframes"] = {key: value for key, value in timeframes.items() if key in allowed}
 
 # 价格领先方向层级：不因质量/结构滞后把快速做空降级为观望。
 FAST_PRICE_DIRECTION_TIERS = frozenset({
@@ -959,6 +984,98 @@ def normalize_forward_view(raw: Any, *, default_horizon: int = 15) -> Dict[str, 
     }
 
 
+STRUCTURED_SUGGESTION_KEYS = (
+    "操作态度",
+    "触发条件",
+    "等待条件",
+    "价位计划",
+    "失效条件",
+)
+
+
+def _suggestion_needs_enrichment(suggestion: str, forward_summary: str) -> bool:
+    cleaned = str(suggestion or "").strip()
+    if not cleaned:
+        return True
+    forward_clean = str(forward_summary or "").strip()
+    if forward_clean and cleaned == forward_clean:
+        return True
+    if "操作态度" not in cleaned:
+        return True
+    if "价位计划" not in cleaned and "等待条件" not in cleaned:
+        return True
+    structured_hits = sum(1 for key in STRUCTURED_SUGGESTION_KEYS if key in cleaned)
+    return structured_hits < 3
+
+
+def format_ai_suggestion(parsed: Dict[str, Any]) -> str:
+    """Build structured actionable suggestion from parsed AI fields."""
+    forward = parsed.get("forward_view") if isinstance(parsed.get("forward_view"), dict) else {}
+    direction = forward.get("direction") or parsed.get("direction", "观望")
+    entry_plan = forward.get("entry_plan") if isinstance(forward.get("entry_plan"), dict) else {}
+    entry = entry_plan.get("entry") or parsed.get("entry", "-")
+    stop_loss = entry_plan.get("stop_loss") or parsed.get("stop_loss", "-")
+    take_profit = entry_plan.get("take_profit") or parsed.get("take_profit", "-")
+    invalidation = forward.get("invalidation") or parsed.get("invalidation", "-")
+    push_rec = str(parsed.get("push_recommendation", "none") or "none")
+
+    lines: List[str] = []
+    if direction == "观望":
+        attitude = "观望等待，暂不开仓"
+        if push_rec == "watch":
+            attitude = "观望为主，值得盯盘等待结构确认"
+    elif direction == "做多":
+        if push_rec == "spike":
+            attitude = "急变短打做多"
+        elif push_rec == "trade":
+            attitude = "可执行做多"
+        else:
+            attitude = "偏做多，等待更好入场"
+    else:
+        if push_rec == "spike":
+            attitude = "急变短打做空"
+        elif push_rec == "trade":
+            attitude = "可执行做空"
+        else:
+            attitude = "偏做空，等待更好入场"
+    lines.append(f"操作态度：{attitude}")
+
+    if direction == "观望":
+        wait_parts: List[str] = []
+        if entry not in (None, "", "-"):
+            wait_parts.append(f"有效突破/回踩 {entry} 后再评估")
+        if invalidation not in (None, "", "-"):
+            wait_parts.append(f"参考失效边界 {invalidation}")
+        lines.append(
+            "等待条件："
+            + ("；".join(wait_parts) if wait_parts else "主周期结构与关键价位共振后再定方向")
+        )
+    else:
+        trigger_parts: List[str] = []
+        if entry not in (None, "", "-"):
+            trigger_parts.append(f"价格进入入场区 {entry}")
+        trigger_parts.append("主周期结构延续且量价配合")
+        lines.append(f"触发条件：{'；'.join(trigger_parts)}")
+
+    if direction == "观望" and entry in (None, "", "-"):
+        lines.append("价位计划：暂不给入场位，仅观察关键支撑/阻力")
+    else:
+        lines.append(f"价位计划：入场 {entry} | 止损 {stop_loss} | 止盈 {take_profit}")
+
+    if invalidation not in (None, "", "-"):
+        lines.append(f"失效条件：{invalidation}")
+    return "\n".join(lines)
+
+
+def resolve_ai_suggestion(parsed: Dict[str, Any]) -> str:
+    forward = parsed.get("forward_view") if isinstance(parsed.get("forward_view"), dict) else {}
+    forward_summary = str(forward.get("summary") or "").strip()
+    suggestion = str(parsed.get("suggestion") or "").strip()
+    if _suggestion_needs_enrichment(suggestion, forward_summary):
+        return format_ai_suggestion(parsed)
+    return suggestion
+
+
 def apply_forward_view_to_parsed(parsed: Dict[str, Any]) -> Dict[str, Any]:
     forward = normalize_forward_view(
         parsed.get("forward_view"),
@@ -972,8 +1089,7 @@ def apply_forward_view_to_parsed(parsed: Dict[str, Any]) -> Dict[str, Any]:
         value = entry_plan.get(key)
         if value not in (None, "", "-"):
             parsed[key] = value
-    if forward.get("summary"):
-        parsed["suggestion"] = forward["summary"]
+    parsed["suggestion"] = resolve_ai_suggestion(parsed)
     if forward.get("probability"):
         parsed["confidence"] = max(int(parsed.get("confidence", 0) or 0), int(forward["probability"]))
     return parsed
@@ -1048,6 +1164,9 @@ def normalize_ai_parsed(parsed: Optional[Dict[str, Any]], score: Optional[Dict[s
         if not isinstance(trend.get("timeframes"), dict):
             trend["timeframes"] = {}
         trend.setdefault("conflict", "")
+        mode = str(score.get("strategy_mode", "") or "").lower()
+        if mode in STRATEGY_PROFILES:
+            filter_ai_trend_timeframes(trend, strategy_ai_trend_bars(mode))
 
     reasons = normalized.get("reasons")
     if isinstance(reasons, str):
@@ -1124,6 +1243,13 @@ class SignalConfig:
     paper_fee_bps: float = 5.0
     forward_require_forecast_alignment: bool = True
     replay_ai_cache_enabled: bool = True
+    # 微信 trade/spike/watch 必须先完成 AI 复核；演变 forecast 不受此限制。
+    wechat_require_ai_review: bool = True
+
+    # 定时 AI 复核间隔（分钟）；0 表示关闭。与 L2/L3 事件触发独立，到点即调用（无信号也会调）。
+    ai_periodic_interval_minutes: int = 0
+    # 简报功能总开关（分钟）：>0 时监控启动/停止各推一次[简报]，且距上次微信推送超过此分钟仍无推送时发静默[简报]；0=关闭。
+    wechat_silence_brief_minutes: int = 0
 
     # 网络请求失败后的重试次数，解决偶发超时、临时DNS异常等问题。
     retry_times: int = DEFAULT_RETRY_TIMES
@@ -2138,6 +2264,52 @@ def clip_push_text(value: Any, limit: int = 200) -> str:
     return text[: limit - 1] + "…"
 
 
+TIMEFRAME_DIR_SYMBOLS = {
+    "up": "↑",
+    "down": "↓",
+    "mixed": "~",
+    "range": "=",
+    "none": "-",
+}
+
+
+def format_wechat_timeframes_one_line(trend: Optional[Dict[str, Any]], limit: int = 6) -> str:
+    if not isinstance(trend, dict):
+        return ""
+    timeframes = trend.get("timeframes") if isinstance(trend.get("timeframes"), dict) else {}
+    parts: List[str] = []
+    for bar, value in timeframes.items():
+        token = str(value or "").strip().lower()
+        symbol = TIMEFRAME_DIR_SYMBOLS.get(token, token[:3] if token else "?")
+        parts.append(f"{bar}{symbol}")
+        if len(parts) >= limit:
+            break
+    return " ".join(parts)
+
+
+def wechat_confidence_label(
+    final_decision: Dict[str, Any],
+    analysis: Optional[Dict[str, Any]],
+    local_score: Dict[str, Any],
+    push_kind: str,
+) -> str:
+    analysis = analysis or {}
+    parsed = analysis.get("parsed") if isinstance(analysis.get("parsed"), dict) else {}
+    forward = parsed.get("forward_view") if isinstance(parsed.get("forward_view"), dict) else {}
+    ai_conf = int(forward.get("probability") or parsed.get("confidence") or 0)
+    final_conf = int(final_decision.get("confidence") or ai_conf or 0)
+    scalp_score = int(
+        final_decision.get("scalp_score")
+        or ((local_score.get("strategy_views") or {}).get("scalp") or {}).get("score")
+        or 0
+    )
+    if push_kind == "spike" and scalp_score > 0 and scalp_score != ai_conf:
+        return f"AI{ai_conf}·触发{scalp_score}"
+    if ai_conf > 0 and ai_conf != final_conf:
+        return f"AI{ai_conf}·综合{final_conf}"
+    return f"{final_conf}分"
+
+
 def display_push_value(value: Any, fallback: Any = None) -> str:
     text = "" if value is None else str(value).strip()
     if text in ("", "-", "None"):
@@ -2172,6 +2344,11 @@ TRIGGER_REASON_LABELS = {
     "multi_watch": "多观察类信号",
     "scalp_spike": "超短线异动",
     "funding_extreme": "资金费率极端",
+    "local_push_review": "本地达推送线需AI复核",
+    "periodic_review": "定时复核",
+    "silence_brief": "静默简报",
+    "monitor_start": "监控启动简报",
+    "monitor_stop": "监控停止简报",
 }
 
 RISK_PREFERENCE_LABELS = {
@@ -2185,6 +2362,7 @@ PUSH_KIND_LABELS = {
     "watch": "观察提醒",
     "spike": "急变提醒",
     "forecast": "结构演变",
+    "brief": "静默简报",
 }
 
 FORECAST_SCENARIO_LABELS = {
@@ -2356,6 +2534,9 @@ class OkxAiShortTermAssistant:
         # 推送冷却状态。key 为 push_kind:inst_id:direction，避免信号组合变化绕过冷却。
         self.last_push_at: Dict[str, float] = {}
         self.last_wechat_push_at: Dict[str, float] = {}
+        self._silence_brief_ai_epoch_done: Dict[str, int] = {}
+        self._silence_brief_epoch_sent: Dict[str, int] = {}
+        self._silence_brief_analysis_cache: Dict[str, Tuple[int, Dict[str, Any]]] = {}
 
         # 最近一次 trade 推送方向，用于短窗内禁止反向 trade。
         self.last_trade_push_at: Dict[str, Tuple[str, float]] = {}
@@ -2398,6 +2579,7 @@ class OkxAiShortTermAssistant:
         self.ai_abnormal_alert_at = 0.0
         self._last_runtime_cache_prune_at = 0.0
         self.last_ai_call_at: Dict[str, float] = {}
+        self.last_ai_periodic_call_at: Dict[str, float] = {}
         self.last_ai_fingerprint: Dict[str, str] = {}
         self.last_ai_direction: Dict[str, str] = {}
         self._ai_supplemental_latched: Set[str] = set()
@@ -6479,6 +6661,265 @@ class OkxAiShortTermAssistant:
             return max(base, LONG_AI_CALL_MIN_INTERVAL_SECONDS)
         return base
 
+    def _ai_periodic_interval_seconds(self) -> int:
+        minutes = int(getattr(self.config, "ai_periodic_interval_minutes", 0) or 0)
+        if minutes <= 0:
+            return 0
+        return max(60, minutes * 60)
+
+    def _ai_periodic_call_due(self, inst_id: str) -> bool:
+        if not self.ai_enabled:
+            return False
+        interval = self._ai_periodic_interval_seconds()
+        if interval <= 0:
+            return False
+        last = self.last_ai_periodic_call_at.get(inst_id, 0.0)
+        if last <= 0:
+            return True
+        return self._now_ts() - last >= interval
+
+    def _silence_brief_interval_seconds(self) -> int:
+        minutes = int(getattr(self.config, "wechat_silence_brief_minutes", 0) or 0)
+        if minutes <= 0:
+            return 0
+        return max(300, minutes * 60)
+
+    def _silence_brief_epoch(self, inst_id: str) -> int:
+        last_push = self.last_wechat_push_at.get(inst_id, 0.0)
+        return int(last_push) if last_push > 0 else 0
+
+    def _silence_brief_silence_due(self, inst_id: str) -> bool:
+        interval = self._silence_brief_interval_seconds()
+        if interval <= 0 or not self.push_enabled or not self.ai_enabled:
+            return False
+        last_push = self.last_wechat_push_at.get(inst_id, 0.0)
+        if last_push <= 0:
+            return False
+        return self._now_ts() - last_push >= interval
+
+    def _silence_brief_already_sent(self, inst_id: str) -> bool:
+        epoch = self._silence_brief_epoch(inst_id)
+        return epoch > 0 and self._silence_brief_epoch_sent.get(inst_id) == epoch
+
+    def _silence_brief_should_call_ai(self, inst_id: str) -> bool:
+        if not self._silence_brief_silence_due(inst_id):
+            return False
+        if self._silence_brief_already_sent(inst_id):
+            return False
+        epoch = self._silence_brief_epoch(inst_id)
+        return self._silence_brief_ai_epoch_done.get(inst_id) != epoch
+
+    def _silence_brief_analysis_for_push(
+        self,
+        inst_id: str,
+        analysis: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if analysis and analysis.get("valid_json") and isinstance(analysis.get("parsed"), dict):
+            return analysis
+        cached = self._silence_brief_analysis_cache.get(inst_id)
+        if cached and cached[0] == self._silence_brief_epoch(inst_id):
+            return cached[1]
+        return None
+
+    def _silence_brief_push_ready(
+        self,
+        inst_id: str,
+        analysis: Optional[Dict[str, Any]],
+    ) -> bool:
+        if not self._silence_brief_silence_due(inst_id):
+            return False
+        if self._silence_brief_already_sent(inst_id):
+            return False
+        epoch = self._silence_brief_epoch(inst_id)
+        if self._silence_brief_ai_epoch_done.get(inst_id) != epoch:
+            return False
+        return self._silence_brief_analysis_for_push(inst_id, analysis) is not None
+
+    def _silence_brief_minutes_since_push(self, inst_id: str) -> int:
+        last_push = self.last_wechat_push_at.get(inst_id, 0.0)
+        if last_push <= 0:
+            return 0
+        return max(0, int((self._now_ts() - last_push) // 60))
+
+    def _build_silence_brief_decision(
+        self,
+        snapshot: Dict[str, Any],
+        analysis: Dict[str, Any],
+        score: Dict[str, Any],
+        trigger: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        parsed = analysis.get("parsed") if isinstance(analysis.get("parsed"), dict) else {}
+        forward = parsed.get("forward_view") if isinstance(parsed.get("forward_view"), dict) else {}
+        inst_id = str(snapshot.get("inst_id", "") or "")
+        minutes_since = self._silence_brief_minutes_since_push(inst_id)
+        silence_note = str(parsed.get("analysis_note", "") or "").strip()
+        if not silence_note:
+            silence_note = (
+                f"距上次微信推送约 {minutes_since} 分钟，"
+                "当前未达结构单/急变推送门槛，详见下方前瞻与建议。"
+            )
+        return {
+            "inst_id": inst_id,
+            "direction": forward.get("direction") or parsed.get("direction", "观望"),
+            "confidence": forward.get("probability") or parsed.get("confidence", 0),
+            "push_recommendation": "brief",
+            "entry": "-",
+            "stop_loss": "-",
+            "take_profit": "-",
+            "risk_level": parsed.get("risk_level", "中"),
+            "summary": silence_note,
+            "reasons": parsed.get("reasons") if isinstance(parsed.get("reasons"), list) else [],
+            "rule_audit": parsed_data_quality(parsed),
+            "decision_source": "ai",
+            "ai_called": True,
+            "trigger_level": trigger.get("level", "L0"),
+            "forward_view": forward,
+            "market_regime": score.get("market_regime"),
+            "strategy_label": score.get("strategy_label"),
+            "risk_preference": score.get("risk_preference"),
+            "score_comment": parsed_analysis_note(parsed),
+            "silence_brief_minutes_since_push": minutes_since,
+        }
+
+    def _lifecycle_brief_enabled(self) -> bool:
+        return (
+            int(getattr(self.config, "wechat_silence_brief_minutes", 0) or 0) > 0
+            and self.push_enabled
+            and self.ai_enabled
+            and not self.dry_run_ai
+            and not self.replay_mode
+        )
+
+    def _build_lifecycle_brief_decision(
+        self,
+        snapshot: Dict[str, Any],
+        analysis: Dict[str, Any],
+        score: Dict[str, Any],
+        trigger: Dict[str, Any],
+        event: str,
+    ) -> Dict[str, Any]:
+        decision = self._build_silence_brief_decision(snapshot, analysis, score, trigger)
+        labels = {
+            "monitor_start": "监控已启动",
+            "monitor_stop": "监控已停止",
+        }
+        label = labels.get(event, event)
+        parsed = analysis.get("parsed") if isinstance(analysis.get("parsed"), dict) else {}
+        note = str(parsed.get("analysis_note") or decision.get("summary") or "").strip()
+        decision["lifecycle_event"] = event
+        decision["lifecycle_label"] = label
+        decision["summary"] = f"{label}：{note}" if note else label
+        return decision
+
+    def _push_lifecycle_brief_for_inst(self, inst_id: str, event: str) -> None:
+        snapshot = self.collect_snapshot(inst_id)
+        signals: List[Dict[str, Any]] = []
+        score = self.score_snapshot(snapshot, signals)
+        trigger = {
+            "level": "L2",
+            "should_call_ai": True,
+            "ai_invoked": False,
+            "reasons": [event],
+            "fingerprint": f"{event}:{inst_id}:{int(self._now_ts())}",
+        }
+        analysis = self.analyze_with_ai(snapshot, signals, score, trigger)
+        trigger["ai_invoked"] = True
+        if not analysis or not analysis.get("valid_json"):
+            console_warn(
+                f"[{self._now_text()}] {inst_id} lifecycle brief ({event}) skipped: AI invalid"
+            )
+            return
+        brief_decision = self._build_lifecycle_brief_decision(snapshot, analysis, score, trigger, event)
+        direction = str(brief_decision.get("direction", "观望") or "观望")
+        push_key = f"brief:{inst_id}:lifecycle:{event}:{direction}"
+        selected = {
+            "kind": "brief",
+            "status": "would_push",
+            "push_key": push_key,
+            "decision": brief_decision,
+        }
+        self._execute_wechat_push(
+            snapshot,
+            signals,
+            brief_decision,
+            analysis,
+            score,
+            trigger,
+            selected,
+        )
+
+    def push_lifecycle_brief(self, event: str) -> None:
+        if not self._lifecycle_brief_enabled():
+            minutes = int(getattr(self.config, "wechat_silence_brief_minutes", 0) or 0)
+            if minutes > 0:
+                console_info(
+                    f"[{self._now_text()}] lifecycle brief ({event}) skipped: "
+                    f"push={'on' if self.push_enabled else 'off'} "
+                    f"ai={'on' if self.ai_enabled else 'off'}"
+                )
+            return
+        if event not in ("monitor_start", "monitor_stop"):
+            return
+        console_info(
+            f"[{self._now_text()}] lifecycle brief ({event}) for {', '.join(self.instruments)}"
+        )
+        for inst_id in self.instruments:
+            try:
+                self._push_lifecycle_brief_for_inst(inst_id, event)
+            except Exception as exc:
+                console_warn(f"[{self._now_text()}] {inst_id} lifecycle brief ({event}) failed: {exc}")
+
+    def _silence_brief_push_eval(
+        self,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        final_decision: Dict[str, Any],
+        score: Dict[str, Any],
+        analysis: Optional[Dict[str, Any]],
+        trigger: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        inst_id = snapshot["inst_id"]
+        base = {
+            "track": "silence_brief",
+            "direction": final_decision.get("direction", "观望"),
+            "confidence": final_decision.get("confidence", 0),
+        }
+        if int(getattr(self.config, "wechat_silence_brief_minutes", 0) or 0) <= 0:
+            return {**base, "kind": "", "status": "skipped", "reason": "brief_disabled"}
+        if not self.push_enabled or not self.ai_enabled:
+            return {**base, "kind": "", "status": "skipped", "reason": "brief_requires_push_and_ai"}
+        if not self._silence_brief_push_ready(inst_id, analysis):
+            return {**base, "kind": "", "status": "skipped", "reason": "brief_not_ready"}
+
+        brief_analysis = self._silence_brief_analysis_for_push(inst_id, analysis)
+        if not brief_analysis:
+            return {**base, "kind": "brief", "status": "gate_blocked", "reason": "brief_missing_analysis"}
+
+        brief_decision = self._build_silence_brief_decision(snapshot, brief_analysis, score, trigger)
+        block = self._wechat_push_block_reason(
+            "brief",
+            brief_decision,
+            {},
+            score,
+            signals,
+            trigger,
+            brief_analysis,
+        )
+        if block:
+            return {**base, "kind": "brief", "status": "gate_blocked", "reason": block}
+
+        push_key = self._push_key(snapshot, "brief", str(brief_decision.get("direction", "观望") or "观望"))
+        if self._in_push_cooldown(push_key, "brief"):
+            return {**base, "kind": "brief", "status": "blocked", "reason": "cooldown", "push_key": push_key}
+
+        return {
+            **base,
+            "kind": "brief",
+            "status": "would_push",
+            "push_key": push_key,
+            "decision": brief_decision,
+        }
+
     def _ai_call_dedup_allows(
         self,
         inst_id: str,
@@ -6521,8 +6962,10 @@ class OkxAiShortTermAssistant:
         score: Dict[str, Any],
         snapshot: Dict[str, Any],
     ) -> Dict[str, Any]:
+        periodic_due = self._ai_periodic_call_due(inst_id)
+        silence_brief_due = self._silence_brief_should_call_ai(inst_id)
         supplemental_reasons = self._higher_timeframe_ai_supplemental_reasons(inst_id, score, snapshot)
-        if not signals and not supplemental_reasons:
+        if not signals and not supplemental_reasons and not periodic_due and not silence_brief_due:
             return {
                 "level": "L0",
                 "should_call_ai": False,
@@ -6534,8 +6977,14 @@ class OkxAiShortTermAssistant:
 
         signal_types = {item.get("type", "") for item in signals}
         reasons: List[str] = list(supplemental_reasons)
+        if periodic_due and not supplemental_reasons and not signals and not silence_brief_due:
+            reasons = ["periodic_review"]
+        elif periodic_due and "periodic_review" not in reasons:
+            reasons.append("periodic_review")
+        if silence_brief_due and "silence_brief" not in reasons:
+            reasons.append("silence_brief")
         scalp_view = score.get("strategy_views", {}).get("scalp", {})
-        level = "L2" if supplemental_reasons else "L1"
+        level = "L2" if (supplemental_reasons or periodic_due or silence_brief_due) else "L1"
         spike_filter_reason = ""
         spike_confirm_streak = 0
 
@@ -6629,6 +7078,58 @@ class OkxAiShortTermAssistant:
             elif qualifies:
                 skip_reason = "fingerprint_cooldown"
 
+        if (
+            self.config.wechat_require_ai_review
+            and self.ai_enabled
+            and not should_call_ai
+            and self._local_push_needs_ai_review(
+                score,
+                signals,
+                {"level": level, "reasons": reasons},
+                snapshot,
+            )
+        ):
+            trigger_direction = str(score.get("final_direction", score.get("direction", "")) or "")
+            if trigger_direction not in ("做多", "做空"):
+                trigger_direction = str(score.get("raw_direction", "") or "")
+            if self._ai_call_dedup_allows(
+                inst_id,
+                fingerprint,
+                "L2",
+                direction_reversal="direction_reversal" in reasons,
+                direction=trigger_direction,
+            ):
+                should_call_ai = True
+                skip_reason = ""
+                if "local_push_review" not in reasons:
+                    reasons.append("local_push_review")
+                if level in ("L0", "L1"):
+                    level = "L2"
+            elif not skip_reason:
+                skip_reason = "fingerprint_cooldown"
+
+        if silence_brief_due and self.ai_enabled and not should_call_ai:
+            silence_fp = f"silence_brief:{self._silence_brief_epoch(inst_id)}"
+            if self._ai_call_dedup_allows(inst_id, silence_fp, "L2"):
+                should_call_ai = True
+                skip_reason = ""
+                fingerprint = silence_fp
+                if "silence_brief" not in reasons:
+                    reasons.append("silence_brief")
+                if level in ("L0", "L1"):
+                    level = "L2"
+            elif not skip_reason:
+                skip_reason = "fingerprint_cooldown"
+
+        if periodic_due and self.ai_enabled:
+            should_call_ai = True
+            skip_reason = ""
+            if level in ("L0", "L1"):
+                level = "L2"
+            periodic_interval = self._ai_periodic_interval_seconds()
+            if not signals and not supplemental_reasons:
+                fingerprint = f"periodic:{int(self._now_ts() // max(1, periodic_interval))}"
+
         result = {
             "level": level,
             "should_call_ai": should_call_ai,
@@ -6645,6 +7146,8 @@ class OkxAiShortTermAssistant:
             result["candidate_level"] = candidate_level
         result["effective_spike_score"] = self._strategy_spike_score_threshold()
         result["effective_ai_call_min_interval"] = self._ai_call_min_interval(level)
+        result["effective_ai_periodic_interval_seconds"] = self._ai_periodic_interval_seconds()
+        result["effective_wechat_silence_brief_seconds"] = self._silence_brief_interval_seconds()
         if skip_reason:
             result["skip_reason"] = skip_reason
         return result
@@ -7122,6 +7625,8 @@ class OkxAiShortTermAssistant:
             return max(0, int(self.runtime_config.watch_push_cooldown_seconds))
         if push_kind == "forecast":
             return max(0, int(self.runtime_config.forecast_push_cooldown_seconds))
+        if push_kind == "brief":
+            return max(0, int(self.config.wechat_silence_brief_minutes) * 60)
         return max(0, int(self.runtime_config.push_cooldown_seconds))
 
     def _effective_push_confidence(
@@ -7457,6 +7962,61 @@ class OkxAiShortTermAssistant:
             "risk_preference": score.get("risk_preference"),
         }
 
+    def _preview_local_final_decision(
+        self,
+        score: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        trigger: Dict[str, Any],
+        snapshot: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        decision = self._build_local_final_decision(score, signals, trigger, snapshot)
+        return self._apply_decision_post_audit(decision, score, signals, trigger, snapshot)
+
+    def _local_confirmed_push_kind(
+        self,
+        score: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        trigger: Dict[str, Any],
+        snapshot: Dict[str, Any],
+    ) -> str:
+        if not signals:
+            return ""
+        decision = self._preview_local_final_decision(score, signals, trigger, snapshot)
+        return self.push_gate(decision, signals, score) or ""
+
+    def _local_push_needs_ai_review(
+        self,
+        score: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        trigger: Dict[str, Any],
+        snapshot: Dict[str, Any],
+    ) -> bool:
+        if not self.config.wechat_require_ai_review or not self.ai_enabled:
+            return False
+        return self._local_confirmed_push_kind(score, signals, trigger, snapshot) in ("trade", "watch", "spike")
+
+    def _wechat_ai_review_block_reason(
+        self,
+        push_kind: str,
+        decision: Dict[str, Any],
+        trigger: Dict[str, Any],
+        analysis: Optional[Dict[str, Any]],
+    ) -> str:
+        if not self.config.wechat_require_ai_review or push_kind == "forecast":
+            return ""
+        if not self.ai_enabled:
+            return "wechat_requires_ai_enabled"
+        if not trigger.get("ai_invoked"):
+            return f"{push_kind}_wechat_requires_ai_review"
+        source = str(decision.get("decision_source", "") or "")
+        if source == "local_fallback":
+            return f"{push_kind}_wechat_ai_review_failed"
+        if source != "ai":
+            return f"{push_kind}_wechat_requires_ai_decision"
+        if not analysis or not analysis.get("valid_json"):
+            return f"{push_kind}_wechat_ai_invalid"
+        return ""
+
     def _build_ai_final_decision(
         self,
         analysis: Dict[str, Any],
@@ -7487,7 +8047,7 @@ class OkxAiShortTermAssistant:
         entry = entry_plan.get("entry") or parsed.get("entry", "-")
         stop_loss = entry_plan.get("stop_loss") or parsed.get("stop_loss", "-")
         take_profit = entry_plan.get("take_profit") or parsed.get("take_profit", "-")
-        summary = forward.get("summary") or parsed.get("suggestion", "")
+        summary = parsed.get("suggestion") or resolve_ai_suggestion(parsed)
         reasons = parsed.get("reasons") if isinstance(parsed.get("reasons"), list) else []
         return {
             "direction": direction,
@@ -7751,6 +8311,8 @@ class OkxAiShortTermAssistant:
         now = self._now_ts()
         self.last_push_at[push_key] = now
         self.last_wechat_push_at[inst_id] = now
+        if push_kind == "brief":
+            self._silence_brief_epoch_sent[inst_id] = self._silence_brief_epoch(inst_id)
         if push_kind == "trade" and decision.get("direction") in ("做多", "做空"):
             self.last_trade_push_at[inst_id] = (decision["direction"], now)
 
@@ -7769,6 +8331,9 @@ class OkxAiShortTermAssistant:
         ai_invoked = bool(trigger.get("ai_invoked"))
 
         if kind == "watch":
+            review_block = self._wechat_ai_review_block_reason(kind, decision, trigger, analysis)
+            if review_block:
+                return review_block
             if str(decision.get("decision_source", "")) != "ai" or not ai_invoked:
                 return "watch_wechat_requires_ai"
             if str(decision.get("push_recommendation", "")) != "watch":
@@ -7786,6 +8351,9 @@ class OkxAiShortTermAssistant:
             return ""
 
         if kind == "spike":
+            review_block = self._wechat_ai_review_block_reason(kind, decision, trigger, analysis)
+            if review_block:
+                return review_block
             confidence = self._effective_push_confidence(decision, score, "spike")
             threshold = self._strategy_spike_score_threshold()
             if confidence < threshold:
@@ -7796,19 +8364,14 @@ class OkxAiShortTermAssistant:
                     qualified, reason = self._strategy_spike_qualification(score, signals)
                     if not qualified:
                         return reason
-            post_audit = decision.get("post_audit") if isinstance(decision.get("post_audit"), dict) else {}
-            l3_local = post_audit.get("action") == "l3_local_spike"
-            if ai_invoked and str(decision.get("push_recommendation", "")) in ("spike", "trade"):
-                return ""
-            if l3_local and self.config.l3_local_spike_push:
-                if confidence >= self.config.spike_push_score + WECHAT_SPIKE_LOCAL_MIN_MARGIN:
-                    return ""
-                return f"local_spike_below_wechat({confidence})"
-            if ai_invoked:
-                return ""
-            return "spike_requires_ai_or_strong_local"
+            if str(decision.get("push_recommendation", "")) not in ("spike", "trade"):
+                return "spike_not_ai_recommended"
+            return ""
 
         if kind == "trade":
+            review_block = self._wechat_ai_review_block_reason(kind, decision, trigger, analysis)
+            if review_block:
+                return review_block
             direction = str(decision.get("direction", "观望") or "观望")
             if direction not in ("做多", "做空"):
                 return "trade_requires_direction"
@@ -7835,6 +8398,23 @@ class OkxAiShortTermAssistant:
             if probability >= threshold + WECHAT_FORECAST_HIGH_PROB_MARGIN:
                 return ""
             return "forecast_requires_l2_or_high_probability"
+
+        if kind == "brief":
+            if int(getattr(self.config, "wechat_silence_brief_minutes", 0) or 0) <= 0:
+                return "brief_disabled"
+            if not self.push_enabled or not self.ai_enabled:
+                return "brief_requires_push_and_ai"
+            if decision.get("lifecycle_event") in ("monitor_start", "monitor_stop"):
+                if not analysis or not analysis.get("valid_json"):
+                    return "brief_wechat_ai_invalid"
+                return ""
+            inst_id = str(decision.get("inst_id") or "")
+            brief_analysis = self._silence_brief_analysis_for_push(inst_id, analysis) if inst_id else None
+            if not inst_id or not self._silence_brief_push_ready(inst_id, brief_analysis):
+                return "brief_not_ready"
+            if not brief_analysis:
+                return "brief_wechat_ai_invalid"
+            return ""
 
         return "unsupported_push_kind"
 
@@ -8019,16 +8599,28 @@ class OkxAiShortTermAssistant:
             _, selected = self._refine_wechat_push_tracks(
                 tracks, snapshot, signals, final_decision, score, trigger, analysis
             )
+            if not selected:
+                brief_track = self._silence_brief_push_eval(
+                    snapshot, signals, final_decision, score, analysis, trigger
+                )
+                if brief_track.get("status") == "would_push":
+                    selected = brief_track
 
         if not selected:
             return
+
+        push_analysis = analysis
+        if str(selected.get("kind", "") or "") == "brief":
+            cached = self._silence_brief_analysis_for_push(snapshot["inst_id"], analysis)
+            if cached:
+                push_analysis = cached
 
         dry_run_label = "replay-log-only" if self.replay_mode and not self.push_enabled else ""
         self._execute_wechat_push(
             snapshot,
             signals,
             final_decision,
-            analysis,
+            push_analysis,
             score,
             trigger,
             selected,
@@ -8419,6 +9011,14 @@ class OkxAiShortTermAssistant:
             analysis = self.analyze_with_ai(snapshot, signals, score, trigger)
             trigger["ai_invoked"] = True
             self.last_ai_call_at[inst_id] = self._now_ts()
+            if "periodic_review" in (trigger.get("reasons") or []):
+                self.last_ai_periodic_call_at[inst_id] = self._now_ts()
+            if "silence_brief" in (trigger.get("reasons") or []):
+                epoch = self._silence_brief_epoch(inst_id)
+                if epoch > 0:
+                    self._silence_brief_ai_epoch_done[inst_id] = epoch
+                    if analysis and analysis.get("valid_json"):
+                        self._silence_brief_analysis_cache[inst_id] = (epoch, analysis)
             self.last_ai_fingerprint[inst_id] = trigger["fingerprint"]
             ai_direction = str(score.get("final_direction", score.get("direction", "")) or "")
             if ai_direction not in ("做多", "做空"):
@@ -8560,6 +9160,10 @@ class OkxAiShortTermAssistant:
             f"[{now_text()}] monitor start: {', '.join(self.instruments)} "
             f"interval={self.interval}s {log_note}"
         )
+        try:
+            self.push_lifecycle_brief("monitor_start")
+        except Exception as exc:
+            console_warn(f"[{now_text()}] monitor_start lifecycle brief failed: {exc}")
         started = time.time()
         while True:
             self.run_once()
@@ -10287,6 +10891,68 @@ class OkxAiShortTermAssistant:
 
         return evidence
 
+    def _ai_prompt_output_style_hint(self, style: str) -> str:
+        hints = {
+            "steady": "偏稳健确认：多周期一致、结构清晰才给 trade；震荡或冲突优先观望/watch。",
+            "momentum": "偏动量捕捉：重视短窗压力与量价突破，但仍需与主周期不严重冲突。",
+            "trend": "偏趋势跟随：以主周期结构为主，逆主趋势仅 watch/none，不轻易 trade。",
+        }
+        key = str(style or "steady").lower()
+        return hints.get(key, hints["steady"])
+
+    def _ai_prompt_strategy_bars_text(self, config: Dict[str, Any], profile: Dict[str, Any]) -> str:
+        primary = "、".join(config.get("primary_bars") or profile.get("primary_bars") or []) or "-"
+        confirm = "、".join(config.get("confirm_bars") or profile.get("confirm_bars") or []) or "-"
+        background = "、".join(config.get("background_bars") or profile.get("background_bars") or []) or "-"
+        return (
+            f"主周期 {primary} 定方向；确认周期 {confirm} 做入场/失效；"
+            f"背景周期 {background or '见 background_profiles'} 定大势。"
+            "禁止仅凭确认周期推翻主周期结论。"
+        )
+
+    def _ai_prompt_push_semantics(self, mode: str) -> str:
+        if mode in ("swing", "long"):
+            return (
+                "trade=主周期结构级可执行前瞻单；watch=值得盯盘但方向观望。"
+                "本策略不主打 spike；仅 level=L3 且确有 5m/10m 急变时才考虑 spike，"
+                "勿把短打包装成 trade。"
+            )
+        return (
+            "trade=结构级可执行前瞻单；spike=5m/10m 急变短打前瞻；watch=值得盯盘但方向观望。"
+            "L3/scalp_spike 优先 spike，勿把急变包装成 trade。"
+        )
+
+    def _ai_prompt_json_example(self, price: float, horizon: int, trend_bars: Optional[List[str]] = None) -> str:
+        anchor = price if price > 0 else 68100.0
+        entry = round(anchor, 2)
+        stop = round(anchor * 0.998, 2)
+        take = round(anchor * 1.006, 2)
+        horizon = max(5, int(horizon or 15))
+        bars = trend_bars or ["15m"]
+        tf_pairs = ",".join(f'"{bar}":"mixed"' for bar in bars[:4]) or '"15m":"mixed"'
+        suggestion = (
+            "操作态度：偏做多，等待更好入场\\n"
+            f"触发条件：价格回踩入场区 {entry}\\n"
+            f"价位计划：入场 {entry} | 止损 {stop} | 止盈 {take}\\n"
+            f"失效条件：跌破 {stop}"
+        )
+        return (
+            f'{{"trend":{{"summary":"当前多周期结构回顾...","timeframes":{{{tf_pairs}}},"conflict":"..."}},'
+            '"risk":"...","suggestion":"'
+            + suggestion
+            + '","direction":"做多",'
+            f'"entry":"{entry}","stop_loss":"{stop}","take_profit":"{take}",'
+            '"risk_level":"中","confidence":68,'
+            '"push_recommendation":"watch","data_quality":{"overall":"部分可用","warnings":[]},'
+            '"reasons":["..."],'
+            f'"forward_view":{{"horizon_minutes":{horizon},"direction":"做多","probability":68,'
+            f'"summary":"未来{horizon}分钟内更可能先回踩再延续上行，关键支撑在 {stop} 附近",'
+            f'"invalidation":"跌破{stop}",'
+            f'"entry_plan":{{"entry":"{entry}","stop_loss":"{stop}","take_profit":"{take}"}},'
+            '"scenarios":[{"label":"延续","direction":"做多","probability":68}]},'
+            '"analysis_note":"..."}'
+        )
+
     def _ai_prompt(
         self,
         snapshot: Dict[str, Any],
@@ -10306,99 +10972,131 @@ class OkxAiShortTermAssistant:
         bars_text = "、".join(included_bars) or "无"
         profile_only_text = "、".join(profile_only_bars) or "无"
         trigger_ctx = payload.get("trigger_context") if isinstance(payload.get("trigger_context"), dict) else {}
-        trigger_reasons_text = "、".join(str(x) for x in (trigger_ctx.get("reasons") or trigger.get("reasons") or [])) or "无"
+        trigger_reasons = list(trigger_ctx.get("reasons") or trigger.get("reasons") or [])
+        trigger_reasons_text = "、".join(str(x) for x in trigger_reasons) or "无"
         signal_count = len(trigger_ctx.get("signals") or signals)
         instruments_text = "、".join(self.instruments) if self.instruments else "BTC-USDT-SWAP"
+        inst_id = str(snapshot.get("inst_id", instruments_text.split("、")[0] if instruments_text else "") or "")
         horizon = self._effective_forecast_horizon()
+        mode = str(config.get("strategy_mode", self._strategy_mode()) or "short")
+        output_style = str(config.get("ai_output_style", self._ai_output_style()) or "steady")
+        strategy_bars_text = self._ai_prompt_strategy_bars_text(config, profile)
+        trend_bars = strategy_ai_trend_bars(mode)
+        trend_bars_text = "、".join(trend_bars) or bars_text
+        push_semantics = self._ai_prompt_push_semantics(mode)
+        style_hint = self._ai_prompt_output_style_hint(output_style)
+        current_price = to_float(snapshot.get("price"), 0.0)
+        json_example = self._ai_prompt_json_example(current_price, horizon, trend_bars)
         market_ctx = payload.get("market_data", {}).get("market_context", {})
         if not isinstance(market_ctx, dict):
             market_ctx = compact_ai_market_context(snapshot)
         pressure = market_ctx.get("recent_price_pressure", "neutral")
         regime = market_ctx.get("regime", "-")
+        periodic_block = ""
+        if "periodic_review" in trigger_reasons:
+            periodic_block = (
+                "【定时复核 periodic_review】\n"
+                "本轮为到点例行复核，可能没有新检测器信号（signal_count 可为 0）。"
+                f"仍需独立更新 forward_view，horizon_minutes 默认 {horizon}（与策略前瞻窗一致，勿擅自缩成 15）。"
+                "无急变时 push_recommendation 倾向 none/watch，但不能仅因「无信号」就跳过结构判断。\n\n"
+            )
+        local_review_block = ""
+        if "local_push_review" in trigger_reasons:
+            local_review_block = (
+                "【本地达推送线·AI复核 local_push_review】\n"
+                "本地规则已满足 trade/watch/spike 推送门槛，但微信推送必须经你独立复核。"
+                "请基于 market_data 重新判断：若结构/风险/数据质量不支持，"
+                "将 push_recommendation 降为 none/watch 或 direction=观望，并说明理由。\n\n"
+            )
+        silence_brief_block = ""
+        if "silence_brief" in trigger_reasons:
+            silence_minutes = int(getattr(self.config, "wechat_silence_brief_minutes", 0) or 0)
+            silence_brief_block = (
+                "【静默简报 silence_brief】\n"
+                f"自上次任意微信推送已过去约 {silence_minutes} 分钟以上，期间未发结构单/急变/观察。"
+                "请说明：1) 当前多周期结构与 regime；2) 为何 push_recommendation 不宜 trade/spike；"
+                "3) 接下来应关注的关键价位/事件（写入 forward_view 与 suggestion）。"
+                "analysis_note 必填，用 2-4 句解释「为何这段时间没有交易类推送」；"
+                "push_recommendation 应为 none 或 watch，勿给 trade/spike。\n\n"
+            )
+        lifecycle_brief_block = ""
+        if "monitor_start" in trigger_reasons:
+            lifecycle_brief_block = (
+                "【监控启动 monitor_start】\n"
+                "用户刚启动监控，请给出当前盘面概览、为何暂不宜 trade/spike 推送、"
+                "以及值得关注的价位/事件。analysis_note 说明启动时点状态；"
+                "push_recommendation 应为 none 或 watch。\n\n"
+            )
+        elif "monitor_stop" in trigger_reasons:
+            lifecycle_brief_block = (
+                "【监控停止 monitor_stop】\n"
+                "监控即将停止，请基于当前数据给出盘面小结、未推送 trade/spike 的原因、"
+                "停止前需关注事项。push_recommendation 应为 none 或 watch。\n\n"
+            )
         return (
-            f"你是欧易OKX USDT永续合约多策略分析助手，当前监控 {instruments_text}。"
-            "你的输出会写入本地日志，并可能经微信推送给人工复核；"
-            "字段 push_recommendation 会参与是否推送。\n\n"
+            f"你是欧易OKX USDT永续合约多策略分析助手，当前分析合约 {inst_id or instruments_text}。"
+            "输出写入本地日志并可能微信推送；push_recommendation 参与是否推送。\n\n"
             "【分工（必须遵守）】\n"
-            "1. market_data 是唯一事实来源：K线、衍生品、盘口、波动率、动态阈值、数据质量均从中读取。\n"
-            "2. trigger_context 仅说明「为何本轮调用你、哪些检测器触发」；"
-            "signal_evidence 提供 current vs threshold 核对材料，无本地判决字段；"
-            "不得把 trigger_context 或 breakout 字段当作最终操作方向。\n"
-            "3. 输入中不包含本地评分、本地方向、structure_forecast 等预计算结论；"
-            "你必须独立形成判断，不要假设任何隐藏答案。\n"
-            "4. 你的主责是 forward_view：预测未来若干分钟内的最可能演变，并给出后续操作方向、"
-            "entry/stop_loss/take_profit、失效条件。\n"
-            "5. trend.summary / risk / suggestion 用于简要回顾现状与风险；"
-            "direction/entry/SL/TP/confidence 必须与 forward_view 一致。\n\n"
+            "1. market_data 是唯一事实来源；trigger_context 仅说明为何调用与检测器证据，不是预计算方向。\n"
+            "2. 输入不含本地评分、本地方向、structure_forecast；须独立判断。\n"
+            "3. 主责 forward_view：预测 horizon_minutes 内最可能路径、方向、价位与失效条件。\n"
+            "4. trend/risk 回顾现状；suggestion 给可执行计划；direction/entry/SL/TP/confidence 须与 forward_view 一致。\n\n"
+            f"{periodic_block}{local_review_block}{silence_brief_block}{lifecycle_brief_block}"
             "【本次触发】\n"
             f"- 级别: {trigger_ctx.get('level', trigger.get('level', 'L0'))}\n"
             f"- 原因: {trigger_reasons_text}\n"
             f"- 触发信号数: {signal_count}\n"
             f"- 市场结构 regime: {regime}\n"
-            f"- 主策略: {config.get('strategy_label', profile.get('label', '短线'))} "
-            f"({config.get('strategy_mode', 'short')})\n"
-            f"- 前瞻默认窗口: {horizon} 分钟（写入 forward_view.horizon_minutes）\n"
+            f"- 主策略: {config.get('strategy_label', profile.get('label', '短线'))} ({mode})\n"
+            f"- 前瞻默认窗口: {horizon} 分钟（forward_view.horizon_minutes 默认用此值，仅在结构极短时允许略小并说明）\n"
+            f"- 输出风格: {output_style}（{style_hint}）\n"
+            f"- 周期权重: {strategy_bars_text}\n"
+            f"- trend.timeframes 仅允许: {trend_bars_text}（勿输出策略外周期；summary/conflict 也以这些周期为主）\n"
             f"- 推送阈值 confidence: 做多 trade≥{thresholds.get('trade_long', self.push_score)}, "
             f"做空 trade≥{thresholds.get('trade_short', self.short_push_score)}, "
             f"watch≥{thresholds.get('watch', self.config.watch_push_score)}, "
             f"spike≥{thresholds.get('spike', self.config.spike_push_score)}\n"
             f"- 原始K线周期: {bars_text}\n"
-            f"- 仅 profile 摘要周期: {profile_only_text}（无 OHLC，见 background_profiles）\n"
+            f"- 仅 profile 摘要周期: {profile_only_text}（见 background_profiles）\n"
             f"- 短窗价格压力 recent_price_pressure: {pressure}\n\n"
             "【推送语义】\n"
-            "trade=结构级可执行前瞻单；spike=5m/10m 急变短打前瞻；watch=值得盯盘但方向观望。"
-            "L3/scalp_spike 优先 spike，勿把急变包装成 trade。\n"
-            "若 forward_view 与 recent_price_pressure 或结构突破方向严重冲突，"
+            f"{push_semantics}\n"
+            "若 forward_view 与 recent_price_pressure 或主周期结构严重冲突，"
             "降低 probability 并优先 watch/none；系统 post-audit 会拦截反向 trade。\n\n"
             "硬性限制：\n"
-            "1. 只提供分析和风险提示，不允许表示系统会自动下单。\n"
-            "2. 不允许承诺收益，不允许使用稳赚、必涨、必跌等确定性表述。\n"
-            "3. 数据不足、预热未完成、周期严重冲突或风险过高时 forward_view.direction=观望。\n"
-            "4. long_short_ratio.available=false 时不得编造多空比。\n"
-            "5. oi/funding warmup 未完成时，降低 15 分钟变化类指标权重。\n\n"
-            f"策略视角：{config.get('strategy_label')}，持仓周期约 {config.get('holding_time', '')}；"
-            f"风险偏好 {config.get('risk_preference', 'standard')}。"
-            "超短线重 1m/3m/5m+15m 过滤；短线重 5m/15m+1H；"
-            "中线重 15m/1H/4H；长线重 4H/1D/1W。"
-            "L3/spike 场景偏短线快进快出，不要包装成中线趋势。\n\n"
+            "1. 只提供分析与风险提示，不表示系统自动下单；禁止稳赚/必涨/必跌表述。\n"
+            "2. 数据不足、预热未完成、主周期严重冲突或风险过高时 forward_view.direction=观望。\n"
+            "3. long_short_ratio.available=false 时不得编造多空比；oi/funding 未 warmup 时降低短窗变化类权重。\n\n"
+            f"持仓周期约 {config.get('holding_time', profile.get('holding_time', ''))}；"
+            f"风险偏好 {config.get('risk_preference', 'standard')}。\n\n"
             "分析步骤：\n"
-            "1. 读 payload_meta：candle_order=newest_first（index 0 为最新 K 线）；"
-            "有 raw candles 的周期优先读 bar_profiles，仅 profile_only 的周期读 background_profiles。\n"
-            "2. 读 trigger_context.signal_evidence，自行比较 current vs threshold 是否成立。\n"
-            "3. trend.summary：用 1-3 句话回顾「当前已发生」的多周期结构、动量、量价（回顾，不是预测）。\n"
-            "4. 结合 derivatives（OI、费率、多空比及历史）判断资金行为与拥挤风险。\n"
-            "5. forward_view：预测 horizon_minutes 内最可能路径；"
-            "给出 direction/probability/summary/invalidation；"
-            "可选 scenarios 列出 1-2 个备选路径；"
-            "entry_plan 给出可执行的 entry/stop_loss/take_profit（做多 SL 低于入场、TP 高于入场；做空相反）。\n"
-            "6. 订单簿仅作入场确认，不得单独用盘口决定方向。\n"
-            "7. 评估 data_quality（预热、缺失、冲突），再定 risk_level 与 confidence。"
-            "confidence 应与 forward_view.probability 大体一致；"
-            "仅压线过门槛且无结构确认时，应降为 watch 或 none。\n"
-            "8. push_recommendation：默认 none。"
-            f"trade=forward_view.direction 为做多/做空且 confidence≥对应 trade 阈值且价位可执行；"
-            f"watch=forward_view.direction=观望且 confidence≥{thresholds.get('watch', self.config.watch_push_score)} 且值得提醒；"
-            f"spike=L3/急速异动且 forward_view.direction 为做多/做空且 confidence≥{thresholds.get('spike', self.config.spike_push_score)}。"
-            "data_quality.overall=数据不足/不可信 时通常 none，最多 watch。\n\n"
+            "1. payload_meta.candle_order=newest_first；有 raw candles 读 bar_profiles，profile_only 读 background_profiles。\n"
+            "2. 读 signal_evidence 自行核对 current vs threshold。\n"
+            "3. trend.summary：1-3 句回顾已发生结构（不是预测）；"
+            f"trend.timeframes 只填 {trend_bars_text}，勿输出其他周期键。\n"
+            "4. derivatives 判断资金行为与拥挤风险。\n"
+            f"5. forward_view：预测未来 {horizon} 分钟内路径；"
+            "给出 direction/probability/summary/invalidation 与 entry_plan（做多 SL 低于入场、TP 高于入场；做空相反）。"
+            "summary 只描述路径与关键价位，不写下单步骤。\n"
+            "6. suggestion 必须与 forward_view.summary 分工，禁止复制粘贴同一段话。"
+            "固定四行（用 \\n 分隔）：操作态度 / 触发条件（观望时写等待条件）/ 价位计划 / 失效条件；"
+            "价位须与 entry/stop_loss/take_profit 一致。\n"
+            "7. 订单簿仅作入场确认，不得单独决定方向。\n"
+            "8. data_quality 后再定 risk_level/confidence（与 probability 大体一致）；压线且无结构确认时降为 watch/none。\n"
+            "9. push_recommendation 默认 none；"
+            f"trade=forward 为做多/做空且 confidence≥对应 trade 阈值；"
+            f"watch=forward=观望且 confidence≥{thresholds.get('watch', self.config.watch_push_score)} 且值得提醒。\n\n"
+            "【文案格式】\n"
+            "- forward_view.summary：2-3 句路径预测（分阶段、关键支撑/阻力、短周期陷阱如假突破）；只讲「会怎样」。\n"
+            "- suggestion：可执行计划，四行结构见上；只讲「怎么做/等什么」。\n"
+            "- 禁止把 240 分钟路径与 15m 假突破混成一句模糊建议；短周期细节放 trend.summary 或 forward_view.summary。\n"
+            "- direction=观望 时：操作态度写观望；等待条件说明等什么；价位计划可写「暂不给入场位」。\n\n"
             "必须只输出一个合法 JSON 对象，不要 Markdown，不要 JSON 外文字。"
-            "必填字段：trend, risk, suggestion, direction, entry, stop_loss, take_profit, "
-            "risk_level, confidence, push_recommendation, data_quality, reasons, forward_view；"
-            "analysis_note 可选。"
-            "trend.timeframes 对无 raw candles 的周期填 profile_only 或 -，不要编造 OHLC。\n"
-            "data_quality 含 overall（充足/部分可用/数据不足）与 warnings 数组。\n"
-            "forward_view 必填：horizon_minutes, direction, probability, summary, invalidation；"
-            "entry_plan 含 entry/stop_loss/take_profit；scenarios 可选数组。\n"
-            "输出 JSON 模板（字段必须齐全，数值类型正确）：\n"
-            '{"trend":{"summary":"当前5m/15m...","timeframes":{"5m":"up"},"conflict":"..."},'
-            '"risk":"...","suggestion":"...","direction":"做多","entry":"68100","'
-            '"stop_loss":"67950","take_profit":"68400","risk_level":"中","confidence":68,'
-            '"push_recommendation":"trade","data_quality":{"overall":"部分可用","warnings":[]},'
-            '"reasons":["..."],'
-            '"forward_view":{"horizon_minutes":15,"direction":"做多","probability":68,'
-            '"summary":"未来15m内更可能延续...","invalidation":"跌破67950",'
-            '"entry_plan":{"entry":"68100","stop_loss":"67950","take_profit":"68400"},'
-            '"scenarios":[{"label":"延续","direction":"做多","probability":68}]},'
-            '"analysis_note":"..."}\n\n'
+            "必填：trend, risk, suggestion, direction, entry, stop_loss, take_profit, "
+            "risk_level, confidence, push_recommendation, data_quality, reasons, forward_view。"
+            "forward_view 必填 horizon_minutes, direction, probability, summary, invalidation, entry_plan。\n"
+            "输出 JSON 模板（字段齐全；horizon_minutes 须与默认前瞻窗一致）：\n"
+            f"{json_example}\n\n"
             f"输入数据：{json.dumps(payload, ensure_ascii=False)}"
         )
 
@@ -10481,7 +11179,12 @@ class OkxAiShortTermAssistant:
             "stop_loss": display_push_value(final_decision.get("stop_loss"), "-"),
             "take_profit": display_push_value(final_decision.get("take_profit"), "-"),
             "risk_level": display_push_value(final_decision.get("risk_level"), "中"),
-            "suggestion": clip_push_text(final_decision.get("summary"), 240),
+            "suggestion": clip_push_text(
+                parsed.get("suggestion")
+                or resolve_ai_suggestion(parsed)
+                or final_decision.get("summary"),
+                320,
+            ),
             "risk": clip_push_text(parsed.get("risk"), 260),
             "score_comment": clip_push_text(
                 final_decision.get("score_comment", parsed_analysis_note(parsed)),
@@ -10556,7 +11259,61 @@ class OkxAiShortTermAssistant:
             return True
         return analysis.get("provider") not in (None, "", "local-rule")
 
-    def _format_full_ai_push_lines(self, analysis: Dict[str, Any]) -> List[str]:
+    def _format_wechat_compact_ai_lines(
+        self,
+        analysis: Dict[str, Any],
+        view: Dict[str, Any],
+    ) -> List[str]:
+        lines: List[str] = []
+        parsed = analysis.get("parsed") if isinstance(analysis.get("parsed"), dict) else {}
+        trend = parsed.get("trend") if isinstance(parsed.get("trend"), dict) else {}
+
+        if trend.get("summary"):
+            lines.append(f"- 结构：{clip_push_text(trend.get('summary'), 150)}")
+        tf_line = format_wechat_timeframes_one_line(trend)
+        if tf_line:
+            lines.append(f"- 周期：{tf_line}")
+        if trend.get("conflict"):
+            lines.append(f"- 冲突：{clip_push_text(trend.get('conflict'), 100)}")
+
+        risk = clip_push_text(parsed.get("risk"), 150)
+        if risk not in ("", "-"):
+            lines.append(f"- 风险：{risk}")
+
+        if view.get("forward_summary") not in (None, "", "-"):
+            horizon = view.get("forward_horizon_minutes")
+            prob = view.get("forward_probability")
+            tag_parts = []
+            if horizon not in (None, "", "-"):
+                tag_parts.append(f"{horizon}m")
+            if prob not in (None, "", "-"):
+                tag_parts.append(f"P{prob}")
+            tag = "·".join(str(part) for part in tag_parts)
+            prefix = f"前瞻({tag})" if tag else "前瞻"
+            lines.append(f"- {prefix}：{view['forward_summary']}")
+
+        if view.get("forward_invalidation") not in (None, "", "-"):
+            lines.append(f"- 失效：{view['forward_invalidation']}")
+
+        if view.get("suggestion") not in (None, "", "-"):
+            lines.append("- 建议：")
+            for part in str(view["suggestion"]).splitlines():
+                text = part.strip()
+                if text:
+                    lines.append(f"  · {text}")
+
+        note = clip_push_text(parsed_analysis_note(parsed), 120)
+        if note not in ("", "-"):
+            lines.append(f"- 要点：{note}")
+
+        reasons = view.get("reasons") or []
+        if reasons:
+            lines.append("- 依据：")
+            for index, reason in enumerate(reasons[:3], start=1):
+                lines.append(f"  {index}. {reason}")
+        return lines
+
+    def _format_full_ai_push_lines(self, analysis: Dict[str, Any], *, include_raw: bool = True) -> List[str]:
         lines: List[str] = []
         if not analysis:
             lines.append("- 本轮未返回 AI 内容")
@@ -10605,10 +11362,23 @@ class OkxAiShortTermAssistant:
                 if value not in (None, "", "-"):
                     lines.append(f"- {label}：{value}")
 
-            for key, label in (("risk", "风险分析"), ("suggestion", "交易建议")):
+            for key, label in (("risk", "风险分析"),):
                 value = str(parsed.get(key) or "").strip()
                 if value:
                     lines.append(f"- {label}：{value}")
+
+            forward = parsed.get("forward_view") if isinstance(parsed.get("forward_view"), dict) else {}
+            forward_summary = str(forward.get("summary") or "").strip()
+            if forward_summary:
+                lines.append(f"- 前瞻路径：{forward_summary}")
+
+            suggestion = str(parsed.get("suggestion") or resolve_ai_suggestion(parsed) or "").strip()
+            if suggestion:
+                lines.append("- 交易建议：")
+                for part in suggestion.splitlines():
+                    text = part.strip()
+                    if text:
+                        lines.append(f"  · {text}")
 
             note = parsed_analysis_note(parsed)
             if note:
@@ -10633,7 +11403,7 @@ class OkxAiShortTermAssistant:
                         lines.append(f"  {index}. {text}")
 
         raw = str(analysis.get("content") or "").strip()
-        if raw:
+        if include_raw and raw:
             lines.extend(["", "**AI 原始输出**", "```", raw, "```"])
 
         return lines
@@ -10666,7 +11436,6 @@ class OkxAiShortTermAssistant:
         signal_text = "、".join(signal_labels) or "规则评分达标"
         local_raw = local_score.get("raw_total_score", local_score.get("total_score", "-"))
         local_trade = local_score.get("final_trade_score", local_score.get("total_score", "-"))
-        final_confidence = view.get("confidence", final_decision.get("confidence", "-"))
         strategy_label = final_decision.get("strategy_label", local_score.get("strategy_label", "-"))
         risk_preference = self._label_risk_preference(
             final_decision.get("risk_preference", local_score.get("risk_preference", "standard"))
@@ -10678,11 +11447,12 @@ class OkxAiShortTermAssistant:
         market_regime = final_decision.get("market_regime", local_score.get("market_regime", "unknown"))
         market_bias = local_score.get("bias", "neutral")
 
+        confidence_label = wechat_confidence_label(final_decision, analysis, local_score, push_kind)
         title_parts = [
             symbol,
             view["direction"],
             f"险{view['risk_level']}",
-            f"{final_confidence}分",
+            confidence_label,
         ]
         if signal_labels:
             title_parts.append(signal_labels[0])
@@ -10695,154 +11465,151 @@ class OkxAiShortTermAssistant:
             title = f"[急变] {title}"
         elif push_kind == "forecast":
             title = f"[演变] {title}"
+        elif push_kind == "brief":
+            title = f"[简报] {title}"
 
         forecast = local_score.get("structure_forecast") if isinstance(local_score.get("structure_forecast"), dict) else {}
-        lines = [
-            f"## {inst_id} · {snapshot.get('time', now_text())}",
-            "",
-            "### 一、当前配置",
-            f"- 主策略：{strategy_label} | 确认严格度：{risk_preference}",
-            f"- 本次推送：{push_kind_label} | 门槛 做多 {self.push_score} · 做空 {self.short_push_score} · "
-            f"watch {self.config.watch_push_score} · spike {self.config.spike_push_score} · "
-            f"forecast {self.config.forecast_push_score}",
-            f"- AI 分析：{'已启用' if self.ai_enabled else '未启用'} | 轮询：{self.interval}秒",
-            "",
-            "### 二、触发原因",
-            f"- 触发等级：{trigger_level} | 触发条件：{trigger_reasons}",
-            f"- 检测信号：{signal_text}",
-            f"- 市场状态：{market_regime} / {market_bias}",
-        ]
-        signal_details = [
-            clip_push_text(item.get("desc"), 100)
-            for item in signals[:3]
-            if clip_push_text(item.get("desc"), 100)
-        ]
-        if signal_details:
-            lines.append("- 信号说明：" + "；".join(signal_details))
+        ai_invoked = self._ai_push_was_invoked(analysis, trigger)
 
-        local_direction = display_push_value(local_score.get("final_direction", local_score.get("direction")), "观望")
+        if push_kind == "brief":
+            brief_minutes = final_decision.get(
+                "silence_brief_minutes_since_push",
+                self._silence_brief_minutes_since_push(inst_id),
+            )
+            lifecycle = str(final_decision.get("lifecycle_event") or "")
+            if lifecycle == "monitor_start":
+                context_line = "- 监控已启动，发送启动盘面简报"
+            elif lifecycle == "monitor_stop":
+                context_line = "- 监控已停止，发送停止前盘面简报"
+            else:
+                context_line = (
+                    f"- 距上次微信推送约 {brief_minutes} 分钟（期间未发结构单/急变/观察）"
+                )
+            view = self._resolve_push_view(final_decision, analysis, local_score)
+            lines = [
+                f"## {inst_id} · {snapshot.get('time', now_text())} · {price}",
+                "",
+                f"策略 {strategy_label} · {risk_preference} · {push_kind_label}",
+                "",
+                "### 简报说明",
+                context_line,
+                f"- {clip_push_text(final_decision.get('summary'), 260)}",
+                "",
+                "### 市场概览",
+                *self._format_wechat_compact_ai_lines(analysis, view),
+                "",
+                "仅供观察，不构成投资建议。",
+            ]
+            return title[:120], self._join_wechat_desp(lines)
 
         if push_kind == "forecast" and forecast.get("active"):
             scenario_label = FORECAST_SCENARIO_LABELS.get(forecast.get("scenario", ""), forecast.get("scenario", "-"))
-            lines.extend(
-                [
-                    "",
-                    "### 二、结构演变预测（前瞻轨，非已确认结构）",
-                    f"- 预测方向：{forecast.get('direction', '观望')} | 概率分：{forecast.get('probability', 0)}",
-                    f"- 时间窗：约 {forecast.get('horizon_minutes', 15)} 分钟 | 阶段：{forecast.get('phase', '-')}",
-                    f"- 场景：{scenario_label}（{forecast.get('from_state', '-')} → {forecast.get('to_state', '-')}）",
-                    f"- 说明：{clip_push_text(forecast.get('summary'), 200)}",
-                    f"- 失效条件：{clip_push_text(forecast.get('invalidation'), 120)}",
-                ]
-            )
+            lines = [
+                f"## {inst_id} · {snapshot.get('time', now_text())} · {price}",
+                "",
+                f"策略 {strategy_label} · {risk_preference} · {push_kind_label}",
+                "",
+                "### 演变预测",
+                f"- 方向 {forecast.get('direction', '观望')} | P={forecast.get('probability', 0)} | "
+                f"约 {forecast.get('horizon_minutes', 15)} 分钟",
+                f"- 场景 {scenario_label}（{forecast.get('from_state', '-')} → {forecast.get('to_state', '-')}）",
+                f"- 说明 {clip_push_text(forecast.get('summary'), 200)}",
+                f"- 失效 {clip_push_text(forecast.get('invalidation'), 120)}",
+            ]
             evidence = forecast.get("evidence") if isinstance(forecast.get("evidence"), list) else []
             if evidence:
-                lines.append("- 依据：" + "；".join(str(item) for item in evidence[:5]))
+                lines.append("- 依据 " + "；".join(str(item) for item in evidence[:4]))
+            local_direction = display_push_value(local_score.get("final_direction", local_score.get("direction")), "观望")
             lines.extend(
                 [
                     "",
-                    "### 三、与确认轨关系",
-                    f"- 当前本地确认方向：{local_direction}",
-                    "- 演变推送仅供提前盯盘；若后续出现 spike/trade 同向推送，以确认轨为准。",
-                    "- 不构成自动交易指令。",
+                    f"本地确认方向 {local_direction}；演变仅供盯盘，同向 trade/spike 以确认轨为准。",
                     "",
                     "仅供观察，不构成投资建议。",
                 ]
             )
             return title[:120], self._join_wechat_desp(lines)
 
-        ai_invoked = self._ai_push_was_invoked(analysis, trigger)
-        lines.extend(["", "### 三、本地筛查与 AI 前瞻", f"- 来源：{decision_source_label}"])
-        if view.get("local_screening_summary") not in (None, "", "-"):
-            lines.append(f"- 本地回顾：{view['local_screening_summary']}")
-        if ai_invoked:
-            forward_bits = []
-            if view.get("forward_horizon_minutes") not in (None, "", "-"):
-                forward_bits.append(f"{view['forward_horizon_minutes']}m")
-            if view.get("forward_probability") not in (None, "", "-"):
-                forward_bits.append(f"P={view['forward_probability']}")
-            prefix = f"AI前瞻（{' · '.join(forward_bits)}）" if forward_bits else "AI前瞻"
-            if view.get("forward_summary") not in (None, "", "-"):
-                lines.append(f"- {prefix}：{view['forward_summary']}")
-            if view.get("forward_invalidation") not in (None, "", "-"):
-                lines.append(f"- 失效条件：{view['forward_invalidation']}")
-            lines.extend(["", "#### AI 完整分析", *self._format_full_ai_push_lines(analysis), "", "#### 本地结构偏向"])
-
-        lines.append(
-            f"- 本地结构偏向：{view['rule_direction']} | 观察/交易分 {local_raw}/{local_trade}"
-        )
-        if view["direction"] != view["rule_direction"]:
-            lines.append(f"- 本地原始方向 {view['rule_direction']}（与最终结论不一致，以下以最终结论为准）")
-
-        local_summary = clip_push_text(local_score.get("trade_action_level"), 120)
-        if local_summary != "-":
-            lines.append(f"- 本地动作：{local_summary}")
-
-        selected_view = local_score.get("selected_strategy_view", {})
-        if selected_view.get("summary"):
-            lines.append(f"- 主策略视角：{clip_push_text(selected_view.get('summary'), 140)}")
-
-        scalp_view = local_score.get("strategy_views", {}).get("scalp", {})
-        if scalp_view.get("action_level") in ("急速异动", "可短打"):
+        lines = [
+            f"## {inst_id} · {snapshot.get('time', now_text())} · {price}",
+            "",
+            f"策略 {strategy_label} · {risk_preference} · {push_kind_label}",
+            "",
+            "### 结论",
+            f"- {view['direction']} | 风险{view['risk_level']} | {confidence_label} | 来源{decision_source_label}",
+        ]
+        if view["direction"] == "观望" and view["entry"] == "-" and view["stop_loss"] == "-" and view["take_profit"] == "-":
+            lines.append("- 暂观望，不给入场/止损/止盈")
+        else:
             lines.append(
-                f"- 超短线：{scalp_view.get('direction')} / {scalp_view.get('action_level')} / "
-                f"{scalp_view.get('score')}分；{clip_push_text(scalp_view.get('summary'), 120)}"
+                f"- 入场 {view['entry']} | 止损 {view['stop_loss']} | 止盈 {view['take_profit']}"
             )
+
+        lines.extend(
+            [
+                "",
+                "### 触发",
+                f"- {trigger_level} · {trigger_reasons} · {signal_text}",
+                f"- 市场 {market_regime}/{market_bias}",
+            ]
+        )
+        signal_details = [
+            clip_push_text(item.get("desc"), 90)
+            for item in signals[:2]
+            if clip_push_text(item.get("desc"), 90)
+        ]
+        if signal_details:
+            lines.append("- " + "；".join(signal_details))
+
+        if ai_invoked:
+            lines.extend(["", "### AI分析", *self._format_wechat_compact_ai_lines(analysis, view)])
+        else:
+            if view.get("local_screening_summary") not in (None, "", "-"):
+                lines.extend(["", "### 本地分析", f"- {view['local_screening_summary']}"])
+            if view["trend_summary"] != "-":
+                lines.append(f"- 趋势 {view['trend_summary']}")
+            if view["trend_conflict"] not in ("-", "none", "无", "否"):
+                lines.append(f"- 冲突 {view['trend_conflict']}")
+            if view["risk"] not in (None, "", "-"):
+                lines.append(f"- 风险 {view['risk']}")
+            if view["reasons"]:
+                lines.append("- 依据：")
+                for index, reason in enumerate(view["reasons"], start=1):
+                    lines.append(f"  {index}. {reason}")
+            if view["suggestion"] not in (None, "", "-"):
+                lines.append(f"- 建议 {view['suggestion']}")
+
+        local_bits: List[str] = []
+        if view["rule_direction"] not in (None, "", "-", view["direction"]):
+            local_bits.append(f"本地偏向 {view['rule_direction']} ({local_raw}/{local_trade})")
+        scalp_view = local_score.get("strategy_views", {}).get("scalp", {})
+        if push_kind == "spike" and scalp_view.get("action_level") in ("急速异动", "可短打"):
+            local_bits.append(
+                f"急变 {scalp_view.get('direction')}/{scalp_view.get('score')}分 "
+                f"({clip_push_text(scalp_view.get('summary'), 60)})"
+            )
+        elif view["rule_direction"] not in (None, "", "-"):
+            local_bits.append(f"本地 {view['rule_direction']} {local_raw}/{local_trade}")
+        local_action = clip_push_text(local_score.get("trade_action_level"), 80)
+        if local_action not in ("", "-") and local_action != "不建议":
+            local_bits.append(f"本地动作 {local_action}")
+        if local_bits:
+            lines.extend(["", "本地参考：" + " | ".join(local_bits)])
+
         if forecast.get("active") and push_kind != "forecast":
             scenario_label = FORECAST_SCENARIO_LABELS.get(forecast.get("scenario", ""), forecast.get("scenario", "-"))
             lines.append(
-                f"- 结构演变：{forecast.get('direction')} P={forecast.get('probability', 0)} "
-                f"({scenario_label})；{clip_push_text(forecast.get('summary'), 100)}"
+                f"结构演变 {forecast.get('direction')} P={forecast.get('probability', 0)} "
+                f"({scenario_label})"
             )
+
         post_audit = final_decision.get("post_audit") if isinstance(final_decision.get("post_audit"), dict) else {}
         if post_audit.get("action") not in (None, "", "kept"):
             audit_reasons = post_audit.get("reasons") or []
-            audit_text = "、".join(str(item) for item in audit_reasons) or "-"
-            lines.append(
-                f"- 推送复核：{post_audit.get('action', '-')}（{audit_text}）"
-            )
+            audit_text = "、".join(str(item) for item in audit_reasons[:2]) or "-"
+            lines.append(f"推送复核 {post_audit.get('action', '-')}（{audit_text}）")
 
-        if not ai_invoked and view["reasons"]:
-            lines.append("- 本地依据：")
-            for index, reason in enumerate(view["reasons"], start=1):
-                lines.append(f"  {index}. {reason}")
-
-        lines.append("- 交易计划（最终结论）：")
-        if view["direction"] == "观望" and view["entry"] == "-" and view["stop_loss"] == "-" and view["take_profit"] == "-":
-            lines.append("  - 当前建议观望，暂不给出入场/止损/止盈")
-        else:
-            lines.append(f"  - 入场：{view['entry']}")
-            lines.append(f"  - 止损：{view['stop_loss']}")
-            lines.append(f"  - 止盈：{view['take_profit']}")
-
-        if view["suggestion"] != "-" and not ai_invoked:
-            lines.append(f"- 执行建议：{view['suggestion']}")
-
-        lines.extend([
-            "",
-            "### 四、最终结论",
-            f"- 方向：{view['direction']} | 风险：{view['risk_level']} | 置信度：{final_confidence}",
-            f"- 现价：{price} | 推送：{view.get('push_recommendation', push_kind)}",
-            f"- 决策来源：{decision_source_label} | 触发等级：{trigger_level}",
-        ])
-        if not ai_invoked and view["trend_summary"] != "-":
-            lines.append(f"- 趋势：{view['trend_summary']}")
-        if not ai_invoked and view["trend_conflict"] not in ("-", "none", "无", "否"):
-            lines.append(f"- 周期冲突：{view['trend_conflict']}")
-
-        audit_bits = []
-        if view["rule_audit_overall"] != "-":
-            audit_bits.append(view["rule_audit_overall"])
-        audit_bits.extend(view["rule_audit_warnings"])
-        if audit_bits and not ai_invoked:
-            lines.append(f"- 数据质量：{'；'.join(audit_bits)}")
-        elif view["score_comment"] != "-" and not ai_invoked:
-            lines.append(f"- 分析说明：{view['score_comment']}")
-
-        lines.extend([
-            "",
-            "仅供观察，不构成投资建议。",
-        ])
+        lines.extend(["", "仅供观察，不构成投资建议。"])
         return title[:120], self._join_wechat_desp(lines)
 
     def _format_push_message(
@@ -11031,6 +11798,13 @@ def _assistant_from_user_config(config: Dict[str, Any]) -> OkxAiShortTermAssista
             paper_fee_bps=max(0.0, float(config.get("paper_fee_bps", 5.0))),
             forward_require_forecast_alignment=bool(config.get("forward_require_forecast_alignment", True)),
             replay_ai_cache_enabled=bool(config.get("replay_ai_cache_enabled", True)),
+            wechat_require_ai_review=bool(config.get("wechat_require_ai_review", True)),
+            ai_periodic_interval_minutes=max(
+                0, min(1440, int(config.get("ai_periodic_interval_minutes", 0) or 0))
+            ),
+            wechat_silence_brief_minutes=max(
+                0, min(1440, int(config.get("wechat_silence_brief_minutes", 0) or 0))
+            ),
         ),
         runtime_config=RuntimeConfig(
             retry_times=int(config.get("retry_times", DEFAULT_RETRY_TIMES)),
@@ -11056,6 +11830,21 @@ def _assistant_from_user_config(config: Dict[str, Any]) -> OkxAiShortTermAssista
             analysis_log_enabled=bool(config.get("analysis_log_enabled", True)),
         ),
     )
+
+
+def push_monitor_lifecycle_briefs(event: str, config: Optional[Dict[str, Any]] = None) -> None:
+    """Send lifecycle [简报] for each configured instrument (monitor start/stop)."""
+    if event not in ("monitor_start", "monitor_stop"):
+        return
+    config = dict(config or {})
+    if int(config.get("wechat_silence_brief_minutes", 0) or 0) <= 0:
+        return
+    if not config.get("push_enabled") or not config.get("ai_enabled"):
+        return
+    assistant = _assistant_from_user_config(config)
+    assistant.push_enabled = bool(config.get("push_enabled"))
+    assistant.ai_enabled = bool(config.get("ai_enabled"))
+    assistant.push_lifecycle_brief(event)
 
 
 def build_wechat_push_format_preview(config: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
@@ -11084,7 +11873,12 @@ def build_wechat_push_format_preview(config: Optional[Dict[str, Any]] = None) ->
             "conflict": "1H 与 15m 方向尚未完全共振",
         },
         "risk": "【示例】资金费率略偏正、多空比均衡；波动率偏高，追价风险大于回踩确认。",
-        "suggestion": "【示例】可轻仓试多，优先等回踩入场区；未放量突破前不建议追涨。",
+        "suggestion": (
+            "操作态度：偏做多，等待回踩确认\n"
+            "触发条件：价格进入 65750-65780 且 15m 结构不转弱\n"
+            "价位计划：入场 65750 - 65780 | 止损 65710 | 止盈 65840 / 65900\n"
+            "失效条件：跌破 65710 或 5m/15m 同步转 mixed/down"
+        ),
         "direction": "做多",
         "entry": "65750 - 65780",
         "stop_loss": "65710",
@@ -11109,7 +11903,7 @@ def build_wechat_push_format_preview(config: Optional[Dict[str, Any]] = None) ->
             "horizon_minutes": 15,
             "direction": "做多",
             "probability": 78,
-            "summary": "【示例】未来15m 更可能延续 15m 偏多，优先回踩试多",
+            "summary": "【示例】未来15m 更可能先小幅回踩 65710 附近再测试 65840 阻力；15m 假突破后回落概率不低",
             "invalidation": "【示例】跌破 65710 或 5m 转 mixed/down",
             "entry_plan": {
                 "entry": "65750 - 65780",
@@ -11334,6 +12128,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strategy-mode", choices=tuple(STRATEGY_PROFILES.keys()), default=os.getenv("STRATEGY_MODE", "swing"))
     parser.add_argument("--risk-preference", choices=("conservative", "standard", "aggressive"), default=os.getenv("RISK_PREFERENCE", "aggressive"))
     parser.add_argument("--ai-output-style", choices=("steady", "momentum", "trend"), default=os.getenv("AI_OUTPUT_STYLE", "steady"))
+    parser.add_argument(
+        "--ai-periodic-interval-minutes",
+        type=int,
+        default=env_int("AI_PERIODIC_INTERVAL_MINUTES", 0),
+        help="Fixed AI review interval per instrument in minutes; 0 disables",
+    )
+    parser.add_argument(
+        "--wechat-silence-brief-minutes",
+        type=int,
+        default=env_int("WECHAT_SILENCE_BRIEF_MINUTES", 0),
+        help="Lifecycle + silence WeChat brief interval in minutes; 0 disables",
+    )
     parser.add_argument("--trade-signals", action="store_true", default=os.getenv("TRADE_SIGNALS_ENABLED", "1") == "1")
     parser.add_argument("--no-trade-signals", action="store_false", dest="trade_signals")
     parser.add_argument("--watch-signals", action="store_true", default=os.getenv("WATCH_SIGNALS_ENABLED", "0") == "1")
@@ -11517,6 +12323,13 @@ def main() -> int:
             paper_fee_bps=max(0.0, float(args.paper_fee_bps)),
             forward_require_forecast_alignment=bool(args.forward_require_forecast_alignment),
             replay_ai_cache_enabled=bool(args.replay_ai_cache),
+            wechat_require_ai_review=True,
+            ai_periodic_interval_minutes=max(
+                0, min(1440, int(getattr(args, "ai_periodic_interval_minutes", 0) or 0))
+            ),
+            wechat_silence_brief_minutes=max(
+                0, min(1440, int(getattr(args, "wechat_silence_brief_minutes", 0) or 0))
+            ),
         ),
         runtime_config=RuntimeConfig(
             retry_times=max(args.retry_times, 1),

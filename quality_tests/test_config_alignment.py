@@ -43,7 +43,18 @@ class ConfigAlignmentTests(unittest.TestCase):
         self.assertEqual(again["interval"], 60)
         self.assertEqual(again.get("custom_inst_ids"), [])
         self.assertEqual(again["inst_ids"], ["ETH-USDT-SWAP"])
+        self.assertEqual(again["ai_periodic_interval_minutes"], 10)
         self.assertFalse(config_value(again, "signal_watch_enabled"))
+
+    def test_restart_detects_ai_periodic_interval_change(self):
+        before = {"ai_periodic_interval_minutes": 10}
+        after = {"ai_periodic_interval_minutes": 15}
+        self.assertTrue(config_requires_monitor_restart(before, after))
+
+    def test_restart_detects_wechat_silence_brief_change(self):
+        before = {"wechat_silence_brief_minutes": 0}
+        after = {"wechat_silence_brief_minutes": 120}
+        self.assertTrue(config_requires_monitor_restart(before, after))
 
     def test_restart_detects_push_score_change(self):
         before = {"push_score": 75, "paper_follow_ai_only": True}

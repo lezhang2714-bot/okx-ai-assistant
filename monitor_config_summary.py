@@ -81,6 +81,8 @@ MONITOR_BEHAVIOR_DEFAULTS: Dict[str, Any] = {
     "paper_fee_bps": 5.0,
     "forward_require_forecast_alignment": True,
     "replay_ai_cache_enabled": True,
+    "wechat_require_ai_review": True,
+    "wechat_silence_brief_minutes": 0,
     "volume_multiplier": 2.0,
     "oi_change_pct_15m": 5.0,
     "funding_abs_threshold": 0.0008,
@@ -100,6 +102,7 @@ MONITOR_RESTART_KEYS: Set[str] = frozenset(
         "strategy_mode",
         "risk_preference",
         "ai_enabled",
+        "ai_periodic_interval_minutes",
         "dry_run_ai",
         "push_enabled",
         "push_score",
@@ -127,6 +130,8 @@ MONITOR_RESTART_KEYS: Set[str] = frozenset(
         "paper_follow_ai_only",
         "paper_fee_bps",
         "forward_require_forecast_alignment",
+        "wechat_require_ai_review",
+        "wechat_silence_brief_minutes",
         "record_replay_enabled",
     }
 )
@@ -164,6 +169,7 @@ FIXED_BEHAVIOR_KEYS: frozenset = frozenset(
         "paper_fee_bps",
         "forward_require_forecast_alignment",
         "replay_ai_cache_enabled",
+        "wechat_require_ai_review",
     }
 )
 
@@ -227,6 +233,7 @@ def build_log_config_snapshot(
         "local_trade_push_margin": LOCAL_TRADE_PUSH_MARGIN,
         "ai_enabled": bool(ai_enabled),
         "push_enabled": bool(push_enabled),
+        "ai_periodic_interval_minutes": int(getattr(cfg, "ai_periodic_interval_minutes", 0) or 0),
     }
 
 
@@ -289,7 +296,9 @@ def build_effective_config_lines(
             f"local_trade_margin=+{LOCAL_TRADE_PUSH_MARGIN} "
             f"swing_spike=+{SWING_SPIKE_SCORE_MARGIN}/{SWING_SPIKE_CONFIRM_ROUNDS}rounds "
             f"ai_interval swing={SWING_AI_CALL_MIN_INTERVAL_SECONDS}s long={LONG_AI_CALL_MIN_INTERVAL_SECONDS}s "
-            f"sustained_review={SWING_AI_SUSTAINED_REVIEW_INTERVAL_SECONDS}s"
+            f"sustained_review={SWING_AI_SUSTAINED_REVIEW_INTERVAL_SECONDS}s "
+            f"periodic={getattr(cfg, 'ai_periodic_interval_minutes', 0)}m "
+            f"silence_brief={getattr(cfg, 'wechat_silence_brief_minutes', 0)}m"
         ),
         (
             f"paper_ai_only={getattr(cfg, 'paper_follow_ai_only', True)} "

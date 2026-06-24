@@ -2,6 +2,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,6 +13,13 @@ from okx_signal_monitor import (  # noqa: E402
     OkxAiShortTermAssistant,
     RuntimeConfig,
     SignalConfig,
+    apply_forward_view_to_parsed,
+    build_wechat_push_format_preview,
+    format_ai_suggestion,
+    normalize_ai_parsed,
+    push_monitor_lifecycle_briefs,
+    resolve_ai_suggestion,
+    wechat_confidence_label,
 )
 
 
@@ -113,8 +121,83 @@ class DecisionPipelineTests(unittest.TestCase):
         self.assertEqual(assistant.push_gate(decision, signals, score), "trade")
         self.assertEqual(
             assistant._wechat_push_block_reason("trade", decision, {}, score, signals, trigger, None),
-            "",
+            "trade_wechat_requires_ai_review",
         )
+
+    def test_local_push_review_triggers_ai_call(self):
+        assistant = make_assistant(strategy_mode="swing", short_push_score=70)
+        snapshot = {
+            "inst_id": "ETH-USDT-SWAP",
+            "price": 1668.0,
+            "funding_rate": 0.0001,
+            "trend_profiles": {"15m": {"trend": "down"}, "1H": {"trend": "mixed"}},
+            "market_context": {"regime": "trend_down", "recent_price_pressure": "down"},
+        }
+        score = {
+            "direction": SHORT,
+            "final_direction": SHORT,
+            "raw_direction": SHORT,
+            "raw_total_score": 76,
+            "final_trade_score": 75,
+            "risk_level": "\u4e2d",
+            "entry_plan": {"quality": "wait_confirmation"},
+            "strategy_views": {"scalp": {}},
+        }
+        signals = [{"type": "order_book_imbalance", "desc": "book imbalance -0.72"}]
+        trigger = assistant.evaluate_ai_trigger("ETH-USDT-SWAP", signals, score, snapshot)
+        self.assertTrue(trigger["should_call_ai"])
+        self.assertIn("local_push_review", trigger["reasons"])
+
+    def test_ai_failure_blocks_wechat_trade_push(self):
+        assistant = make_assistant()
+        score = {
+            "direction": SHORT,
+            "final_direction": SHORT,
+            "raw_total_score": 86,
+            "final_trade_score": 81,
+            "risk_level": "\u4e2d",
+            "entry_plan": {"quality": "breakout_valid"},
+            "strategy_views": {"scalp": {}},
+        }
+        trigger = {"level": "L2", "ai_invoked": True, "reasons": ["local_push_review"]}
+        analysis = {"valid_json": False, "error": "timeout"}
+        decision = assistant.merge_final_decision(
+            analysis,
+            score,
+            [{"type": "order_book_imbalance", "desc": "book"}],
+            trigger,
+            {},
+        )
+        self.assertEqual(decision["decision_source"], "local_fallback")
+        self.assertEqual(
+            assistant._wechat_push_block_reason(
+                "trade", decision, {}, score, [{"type": "order_book_imbalance"}], trigger, analysis
+            ),
+            "trade_wechat_ai_review_failed",
+        )
+
+    def test_forecast_wechat_still_allowed_without_ai(self):
+        assistant = make_assistant()
+        forecast = {
+            "active": True,
+            "direction": SHORT,
+            "probability": 72,
+            "calibrated_probability": 72,
+            "effective_push_threshold": 58,
+        }
+        score = {"structure_forecast": forecast, "strategy_views": {"scalp": {}}}
+        trigger = {"level": "L1", "ai_invoked": False, "reasons": ["structure_forecast_active"]}
+        decision = {"direction": WATCH, "confidence": 50, "push_recommendation": "none"}
+        block = assistant._wechat_push_block_reason(
+            "forecast",
+            decision,
+            forecast,
+            score,
+            [{"type": "volume_spike"}],
+            trigger,
+            None,
+        )
+        self.assertEqual(block, "")
 
     def test_ai_failure_uses_strong_local_fallback(self):
         assistant = make_assistant()
@@ -529,6 +612,360 @@ class DecisionPipelineTests(unittest.TestCase):
         assistant.evaluate_ai_trigger("BTC-USDT-SWAP", signals, score, snapshot)
         retriggered = assistant.evaluate_ai_trigger("BTC-USDT-SWAP", signals, score, snapshot)
         self.assertEqual(retriggered["level"], "L3")
+
+    def test_periodic_ai_review_triggers_without_signals(self):
+        assistant = make_assistant(strategy_mode="swing", ai_periodic_interval_minutes=10)
+        score = {"direction": WATCH, "strategy_views": {"scalp": {}}}
+        snapshot = {
+            "funding_rate": 0.0001,
+            "trend_profiles": {},
+            "market_context": {"regime": "mixed"},
+        }
+        trigger = assistant.evaluate_ai_trigger("BTC-USDT-SWAP", [], score, snapshot)
+        self.assertTrue(trigger["should_call_ai"])
+        self.assertIn("periodic_review", trigger["reasons"])
+        self.assertEqual(trigger["level"], "L2")
+        self.assertTrue(str(trigger.get("fingerprint", "")).startswith("periodic:"))
+
+    def test_periodic_ai_respects_interval_after_last_call(self):
+        assistant = make_assistant(strategy_mode="swing", ai_periodic_interval_minutes=10)
+        score = {"direction": WATCH, "strategy_views": {"scalp": {}}}
+        snapshot = {
+            "funding_rate": 0.0001,
+            "trend_profiles": {},
+            "market_context": {"regime": "mixed"},
+        }
+        assistant.last_ai_periodic_call_at["BTC-USDT-SWAP"] = assistant._now_ts()
+        trigger = assistant.evaluate_ai_trigger("BTC-USDT-SWAP", [], score, snapshot)
+        self.assertFalse(trigger["should_call_ai"])
+        self.assertEqual(trigger["level"], "L0")
+
+    def test_periodic_ai_disabled_when_interval_zero(self):
+        assistant = make_assistant(strategy_mode="swing", ai_periodic_interval_minutes=0)
+        score = {"direction": WATCH, "strategy_views": {"scalp": {}}}
+        snapshot = {
+            "funding_rate": 0.0001,
+            "trend_profiles": {},
+            "market_context": {"regime": "mixed"},
+        }
+        trigger = assistant.evaluate_ai_trigger("BTC-USDT-SWAP", [], score, snapshot)
+        self.assertFalse(trigger["should_call_ai"])
+        self.assertEqual(trigger["level"], "L0")
+
+    def test_ai_prompt_uses_strategy_horizon_and_periodic_hint(self):
+        assistant = make_assistant(strategy_mode="swing", ai_periodic_interval_minutes=10)
+        snapshot = {
+            "inst_id": "ETH-USDT-SWAP",
+            "price": 1665.3,
+            "time": "2026-06-24 10:00:00",
+            "funding_rate": 0.0001,
+            "funding_change": 0.0,
+            "funding_warmup_ready": True,
+            "oi_warmup_ready": True,
+            "open_interest": 1000,
+            "oi_change_pct_15m": 0.0,
+            "volume": {"multiplier": 1.0},
+            "long_short_ratio": {"available": False},
+            "candles": {},
+            "trend_profiles": {},
+            "market_context": {"regime": "mixed", "recent_price_pressure": "neutral"},
+            "volatility": {},
+            "dynamic_thresholds": {},
+            "instrument_profile": {},
+            "snapshot_quality": {},
+            "data_sources": {},
+            "best_bid": 1665.0,
+            "best_ask": 1665.5,
+            "order_book": {},
+        }
+        score = {
+            "direction": WATCH,
+            "strategy_views": {"scalp": {}},
+            "trends": {},
+            "market_regime": "mixed",
+        }
+        trigger = {
+            "level": "L2",
+            "reasons": ["periodic_review"],
+            "fingerprint": "periodic:1",
+        }
+        prompt = assistant._ai_prompt(snapshot, [], score, trigger)
+        self.assertIn("periodic_review", prompt)
+        self.assertIn("horizon_minutes 默认 240", prompt)
+        self.assertIn('"horizon_minutes":240', prompt)
+        self.assertIn("主周期 1H、4H", prompt)
+        self.assertIn("trend.timeframes 仅允许: 15m、1H、4H", prompt)
+        self.assertIn('"1H":"mixed"', prompt)
+        self.assertIn("1665.3", prompt)
+
+    def test_normalize_ai_parsed_filters_extra_timeframes_for_swing(self):
+        parsed = normalize_ai_parsed(
+            {
+                "direction": WATCH,
+                "confidence": 55,
+                "risk_level": "中",
+                "push_recommendation": "none",
+                "entry": "-",
+                "stop_loss": "-",
+                "take_profit": "-",
+                "trend": {
+                    "summary": "test",
+                    "timeframes": {
+                        "1m": "down",
+                        "3m": "down",
+                        "5m": "up",
+                        "15m": "range",
+                        "1H": "mixed",
+                        "4H": "down",
+                    },
+                    "conflict": "x",
+                },
+                "risk": "",
+                "suggestion": "",
+                "reasons": [],
+                "forward_view": {
+                    "horizon_minutes": 240,
+                    "direction": WATCH,
+                    "probability": 50,
+                    "summary": "s",
+                    "invalidation": "i",
+                },
+                "data_quality": {"overall": "部分可用", "warnings": []},
+            },
+            {"strategy_mode": "swing"},
+        )
+        self.assertEqual(set(parsed["trend"]["timeframes"].keys()), {"15m", "1H", "4H"})
+
+    def test_apply_forward_view_keeps_suggestion_separate_from_summary(self):
+        parsed = apply_forward_view_to_parsed(
+            {
+                "direction": SHORT,
+                "confidence": 62,
+                "entry": "1668-1672",
+                "stop_loss": "1678",
+                "take_profit": "1650",
+                "push_recommendation": "watch",
+                "forward_view": {
+                    "horizon_minutes": 240,
+                    "direction": SHORT,
+                    "probability": 62,
+                    "summary": "未来240分钟内更可能延续震荡下行，短期反弹遇阻后重新测试1650-1655支撑区。",
+                    "invalidation": "有效站上1678并15m转强",
+                    "entry_plan": {
+                        "entry": "1668-1672",
+                        "stop_loss": "1678",
+                        "take_profit": "1650",
+                    },
+                },
+                "suggestion": (
+                    "未来240分钟内更可能延续震荡下行，短期反弹遇阻后重新测试1650-1655支撑区。"
+                ),
+            }
+        )
+        self.assertNotEqual(parsed["suggestion"], parsed["forward_view"]["summary"])
+        self.assertIn("操作态度", parsed["suggestion"])
+        self.assertIn("价位计划", parsed["suggestion"])
+        self.assertIn("1668-1672", parsed["suggestion"])
+
+    def test_resolve_ai_suggestion_keeps_structured_ai_text(self):
+        structured = (
+            "操作态度：观望等待\n"
+            "等待条件：15m 假突破后回落再评估\n"
+            "价位计划：暂不给入场位\n"
+            "失效条件：有效站上1678"
+        )
+        parsed = {
+            "direction": WATCH,
+            "push_recommendation": "watch",
+            "forward_view": {
+                "direction": WATCH,
+                "summary": "未来240分钟内震荡下行",
+                "invalidation": "有效站上1678",
+            },
+            "suggestion": structured,
+        }
+        self.assertEqual(resolve_ai_suggestion(parsed), structured)
+
+    def test_format_ai_suggestion_builds_action_plan_for_short_bias(self):
+        text = format_ai_suggestion(
+            {
+                "direction": SHORT,
+                "push_recommendation": "watch",
+                "entry": "1668-1672",
+                "stop_loss": "1678",
+                "take_profit": "1650",
+                "forward_view": {
+                    "direction": SHORT,
+                    "invalidation": "有效站上1678并15m转强",
+                    "entry_plan": {
+                        "entry": "1668-1672",
+                        "stop_loss": "1678",
+                        "take_profit": "1650",
+                    },
+                },
+            }
+        )
+        self.assertIn("操作态度：偏做空", text)
+        self.assertIn("触发条件", text)
+        self.assertIn("价位计划：入场 1668-1672", text)
+        self.assertIn("失效条件：有效站上1678并15m转强", text)
+
+    def test_vague_ai_suggestion_is_replaced_with_structured_plan(self):
+        parsed = apply_forward_view_to_parsed(
+            {
+                "direction": SHORT,
+                "confidence": 65,
+                "push_recommendation": "spike",
+                "entry": "1664.4",
+                "stop_loss": "1672.5",
+                "take_profit": "1655.0",
+                "forward_view": {
+                    "horizon_minutes": 240,
+                    "direction": SHORT,
+                    "probability": 65,
+                    "summary": "未来240分钟内更可能延续震荡下行，短期反弹遇阻后重新向下测试1650-1655支撑区。",
+                    "invalidation": "若价格有效突破1672.5并站稳，则空头失效",
+                    "entry_plan": {
+                        "entry": "1664.4",
+                        "stop_loss": "1672.5",
+                        "take_profit": "1655.0",
+                    },
+                },
+                "suggestion": "当前不宜追多，等待反弹乏力后逢高做空或观望。若价格跌破1660可考虑短线追空，但需严格止损。",
+            }
+        )
+        self.assertIn("操作态度：急变短打做空", parsed["suggestion"])
+        self.assertIn("价位计划", parsed["suggestion"])
+
+    def test_wechat_confidence_label_splits_ai_and_spike_scores(self):
+        label = wechat_confidence_label(
+            {"confidence": 95, "scalp_score": 95},
+            {"parsed": {"confidence": 65, "forward_view": {"probability": 65}}},
+            {"strategy_views": {"scalp": {"score": 95}}},
+            "spike",
+        )
+        self.assertEqual(label, "AI65·触发95")
+
+    def test_wechat_push_is_compact_without_raw_json(self):
+        title, desp = build_wechat_push_format_preview({"strategy_mode": "swing"})
+        self.assertIn("[结构单]", title)
+        self.assertIn("### 结论", desp)
+        self.assertIn("### 触发", desp)
+        self.assertIn("### AI分析", desp)
+        self.assertNotIn("AI 原始输出", desp)
+        self.assertNotIn("一、当前配置", desp)
+        self.assertNotIn("#### AI 完整分析", desp)
+
+    def test_evaluate_ai_trigger_does_not_crash_for_local_push_review(self):
+        assistant = make_assistant(short_push_score=70)
+        assistant.push_enabled = True
+        snapshot = {
+            "inst_id": "ETH-USDT-SWAP",
+            "price": 1668.0,
+            "funding_rate": 0.0001,
+            "trend_profiles": {"15m": {"trend": "down"}},
+            "market_context": {"regime": "trend_down", "recent_price_pressure": "down"},
+        }
+        score = {
+            "direction": SHORT,
+            "final_direction": SHORT,
+            "raw_direction": SHORT,
+            "raw_total_score": 76,
+            "final_trade_score": 75,
+            "risk_level": "\u4e2d",
+            "entry_plan": {"quality": "wait_confirmation"},
+            "strategy_views": {"scalp": {}},
+        }
+        signals = [{"type": "order_book_imbalance", "desc": "book imbalance -0.72"}]
+        trigger = assistant.evaluate_ai_trigger("ETH-USDT-SWAP", signals, score, snapshot)
+        self.assertIn("level", trigger)
+        self.assertIn("should_call_ai", trigger)
+
+    def test_silence_brief_triggers_ai_after_wechat_silence(self):
+        assistant = make_assistant(wechat_silence_brief_minutes=120)
+        assistant.push_enabled = True
+        inst = "ETH-USDT-SWAP"
+        assistant.last_wechat_push_at[inst] = assistant._now_ts() - 121 * 60
+        snapshot = {
+            "inst_id": inst,
+            "price": 1668.0,
+            "funding_rate": 0.0001,
+            "trend_profiles": {"15m": {"trend": "mixed"}, "1H": {"trend": "mixed"}},
+            "market_context": {"regime": "range", "recent_price_pressure": "neutral"},
+        }
+        trigger = assistant.evaluate_ai_trigger(inst, [], {"strategy_views": {"scalp": {}}}, snapshot)
+        self.assertTrue(trigger["should_call_ai"])
+        self.assertIn("silence_brief", trigger["reasons"])
+
+    def test_silence_brief_wechat_after_ai_epoch(self):
+        assistant = make_assistant(wechat_silence_brief_minutes=60)
+        assistant.push_enabled = True
+        inst = "ETH-USDT-SWAP"
+        assistant.last_wechat_push_at[inst] = assistant._now_ts() - 70 * 60
+        epoch = assistant._silence_brief_epoch(inst)
+        assistant._silence_brief_ai_epoch_done[inst] = epoch
+        analysis = {
+            "valid_json": True,
+            "parsed": {
+                "direction": WATCH,
+                "confidence": 55,
+                "risk_level": "\u4e2d",
+                "push_recommendation": "none",
+                "analysis_note": "4H\u504f\u7a7a\u30011H\u6574\u7406\uff0c\u672a\u8fbe\u7ed3\u6784\u5355\u95e8\u69db",
+                "forward_view": {
+                    "direction": WATCH,
+                    "probability": 55,
+                    "horizon_minutes": 240,
+                    "summary": "震荡等待方向选择",
+                    "invalidation": "突破1720或跌破1655",
+                },
+                "suggestion": "操作态度：观望等待\n等待条件：突破1720或跌破1655\n价位计划：暂不给入场位\n失效条件：-",
+                "data_quality": {"overall": "\u5145\u8db3", "warnings": []},
+            },
+        }
+        assistant._silence_brief_analysis_cache[inst] = (epoch, analysis)
+        track = assistant._silence_brief_push_eval(
+            {"inst_id": inst, "price": 1668.0, "time": "t"},
+            [],
+            {"direction": WATCH, "push_recommendation": "none"},
+            {"strategy_views": {"scalp": {}}},
+            analysis,
+            {"level": "L2", "reasons": ["silence_brief"]},
+        )
+        self.assertEqual(track.get("status"), "would_push")
+        self.assertEqual(track.get("kind"), "brief")
+
+    def test_lifecycle_brief_enabled_requires_silence_minutes(self):
+        disabled = make_assistant(wechat_silence_brief_minutes=0)
+        disabled.push_enabled = True
+        self.assertFalse(disabled._lifecycle_brief_enabled())
+        enabled = make_assistant(wechat_silence_brief_minutes=90)
+        enabled.push_enabled = True
+        self.assertTrue(enabled._lifecycle_brief_enabled())
+
+    def test_lifecycle_brief_block_reason_bypasses_silence_ready(self):
+        assistant = make_assistant(wechat_silence_brief_minutes=90)
+        assistant.push_enabled = True
+        analysis = {"valid_json": True, "parsed": {"direction": WATCH, "analysis_note": "启动观察"}}
+        decision = {"inst_id": "ETH-USDT-SWAP", "lifecycle_event": "monitor_start"}
+        block = assistant._wechat_push_block_reason(
+            "brief",
+            decision,
+            {},
+            {"strategy_views": {"scalp": {}}},
+            [],
+            {"level": "L2", "reasons": ["monitor_start"]},
+            analysis,
+        )
+        self.assertEqual(block, "")
+
+    def test_push_monitor_lifecycle_briefs_noop_when_disabled(self):
+        with patch.object(OkxAiShortTermAssistant, "push_lifecycle_brief") as mock_push:
+            push_monitor_lifecycle_briefs(
+                "monitor_start",
+                {"wechat_silence_brief_minutes": 0, "push_enabled": True, "ai_enabled": True},
+            )
+            mock_push.assert_not_called()
 
     def test_swing_spike_rejects_single_macd_without_large_move(self):
         assistant = make_assistant(strategy_mode="swing", spike_push_score=62)
