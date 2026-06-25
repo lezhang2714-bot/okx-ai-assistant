@@ -79,6 +79,81 @@ class DecisionPipelineTests(unittest.TestCase):
         self.assertEqual(decision["direction"], LONG)
         self.assertEqual(decision["forward_view"]["direction"], LONG)
 
+    def test_ai_watch_promotes_to_trade_when_direction_and_score_qualify(self):
+        assistant = make_assistant()
+        score = {
+            "direction": LONG,
+            "raw_total_score": 36,
+            "final_trade_score": 0,
+            "risk_level": "\u4e2d",
+            "strategy_views": {"scalp": {}},
+        }
+        trigger = {"level": "L2", "ai_invoked": True, "reasons": ["trade_signal"]}
+        analysis = {
+            "valid_json": True,
+            "parsed": {
+                "direction": LONG,
+                "confidence": 78,
+                "push_recommendation": "watch",
+                "entry": "1700",
+                "stop_loss": "1695",
+                "take_profit": "1720",
+                "risk_level": "\u4e2d",
+                "forward_view": {
+                    "horizon_minutes": 240,
+                    "direction": LONG,
+                    "probability": 78,
+                    "summary": "test",
+                    "invalidation": "break 1690",
+                },
+            },
+        }
+        decision = assistant.merge_final_decision(
+            analysis,
+            score,
+            [{"type": "volume_spike"}],
+            trigger,
+            {},
+        )
+        self.assertEqual(decision["direction"], LONG)
+        self.assertEqual(decision["confidence"], 78)
+        self.assertEqual(decision["push_recommendation"], "trade")
+        self.assertEqual(
+            assistant.push_gate(decision, [{"type": "volume_spike"}], score),
+            "trade",
+        )
+
+    def test_ai_watch_stays_none_when_score_below_trade_threshold(self):
+        assistant = make_assistant()
+        score = {
+            "direction": LONG,
+            "raw_total_score": 36,
+            "final_trade_score": 0,
+            "risk_level": "\u4e2d",
+            "strategy_views": {"scalp": {}},
+        }
+        trigger = {"level": "L2", "ai_invoked": True, "reasons": ["trade_signal"]}
+        analysis = {
+            "valid_json": True,
+            "parsed": {
+                "direction": LONG,
+                "confidence": 68,
+                "push_recommendation": "watch",
+                "risk_level": "\u4e2d",
+                "forward_view": {"direction": LONG, "probability": 68},
+            },
+        }
+        decision = assistant.merge_final_decision(
+            analysis,
+            score,
+            [{"type": "volume_spike"}],
+            trigger,
+            {},
+        )
+        self.assertEqual(decision["direction"], LONG)
+        self.assertEqual(decision["push_recommendation"], "none")
+        self.assertEqual(assistant.push_gate(decision, [{"type": "volume_spike"}], score), "")
+
     def test_local_screening_without_ai(self):
         assistant = make_assistant()
         score = {
@@ -852,9 +927,65 @@ class DecisionPipelineTests(unittest.TestCase):
         self.assertIn("### 结论", desp)
         self.assertIn("### 触发", desp)
         self.assertIn("### AI分析", desp)
+        self.assertIn("- 建议：", desp)
+        self.assertIn("操作态度：", desp)
+        self.assertIn("价位计划：", desp)
         self.assertNotIn("AI 原始输出", desp)
         self.assertNotIn("一、当前配置", desp)
         self.assertNotIn("#### AI 完整分析", desp)
+
+    def test_wechat_trade_push_keeps_long_suggestion_after_watch_ai(self):
+        assistant = make_assistant()
+        parsed = {
+            "direction": LONG,
+            "confidence": 78,
+            "push_recommendation": "watch",
+            "risk_level": "\u4e2d",
+            "entry": "1692.50",
+            "stop_loss": "1687.80",
+            "take_profit": "1710.00",
+            "trend": {"summary": "15m 转强", "timeframes": {"15m": "up"}, "conflict": ""},
+            "risk": "波动偏高，追价需谨慎",
+            "forward_view": {
+                "direction": LONG,
+                "probability": 78,
+                "summary": "未来15m 更可能延续上行",
+                "invalidation": "跌破1687.80",
+                "entry_plan": {
+                    "entry": "1692.50",
+                    "stop_loss": "1687.80",
+                    "take_profit": "1710.00",
+                },
+            },
+        }
+        final_decision = {
+            "direction": LONG,
+            "confidence": 78,
+            "push_recommendation": "trade",
+            "decision_source": "ai",
+            "entry": "1692.50",
+            "stop_loss": "1687.80",
+            "take_profit": "1710.00",
+            "risk_level": "\u4e2d",
+            "strategy_label": "\u77ed\u7ebf",
+            "forward_view": parsed["forward_view"],
+        }
+        analysis = {"valid_json": True, "parsed": parsed, "provider": "deepseek", "model": "test"}
+        snapshot = {"inst_id": "ETH-USDT-SWAP", "price": 1692.5, "time": "2026-06-15 08:50:00"}
+        title, desp = assistant._build_wechat_push_content(
+            snapshot,
+            [{"type": "volume_spike", "desc": "volume spike"}],
+            final_decision,
+            analysis,
+            push_kind="trade",
+            local_score={"raw_total_score": 70, "final_trade_score": 72, "strategy_views": {"scalp": {}}},
+            trigger={"level": "L2", "ai_invoked": True, "reasons": ["multi_signal"]},
+        )
+        self.assertIn("- 建议：", desp)
+        self.assertIn("\u53ef\u6267\u884c\u505a\u591a", desp)
+        self.assertIn("1692.50", desp)
+        self.assertIn("1687.80", desp)
+        self.assertIn("1710.00", desp)
 
     def test_evaluate_ai_trigger_does_not_crash_for_local_push_review(self):
         assistant = make_assistant(short_push_score=70)
@@ -885,7 +1016,7 @@ class DecisionPipelineTests(unittest.TestCase):
         assistant = make_assistant(wechat_silence_brief_minutes=120)
         assistant.push_enabled = True
         inst = "ETH-USDT-SWAP"
-        assistant.last_wechat_push_at[inst] = assistant._now_ts() - 121 * 60
+        assistant.last_silence_brief_at[inst] = assistant._now_ts() - 121 * 60
         snapshot = {
             "inst_id": inst,
             "price": 1668.0,
@@ -901,9 +1032,9 @@ class DecisionPipelineTests(unittest.TestCase):
         assistant = make_assistant(wechat_silence_brief_minutes=60)
         assistant.push_enabled = True
         inst = "ETH-USDT-SWAP"
-        assistant.last_wechat_push_at[inst] = assistant._now_ts() - 70 * 60
-        epoch = assistant._silence_brief_epoch(inst)
-        assistant._silence_brief_ai_epoch_done[inst] = epoch
+        assistant.last_silence_brief_at[inst] = assistant._now_ts() - 70 * 60
+        cycle = assistant._silence_brief_cycle(inst)
+        assistant._silence_brief_ai_epoch_done[inst] = cycle
         analysis = {
             "valid_json": True,
             "parsed": {
@@ -923,7 +1054,7 @@ class DecisionPipelineTests(unittest.TestCase):
                 "data_quality": {"overall": "\u5145\u8db3", "warnings": []},
             },
         }
-        assistant._silence_brief_analysis_cache[inst] = (epoch, analysis)
+        assistant._silence_brief_analysis_cache[inst] = (cycle, analysis)
         track = assistant._silence_brief_push_eval(
             {"inst_id": inst, "price": 1668.0, "time": "t"},
             [],
@@ -972,7 +1103,7 @@ class DecisionPipelineTests(unittest.TestCase):
         assistant.push_enabled = True
         inst = "ETH-USDT-SWAP"
         past = assistant._now_ts() - 61 * 60
-        assistant.last_wechat_push_at[inst] = past
+        assistant.last_silence_brief_at[inst] = past
         assistant._mark_wechat_push_sent(
             inst,
             "brief:eth:lifecycle:monitor_start:观望",
@@ -980,23 +1111,40 @@ class DecisionPipelineTests(unittest.TestCase):
             {"lifecycle_event": "monitor_start", "direction": "观望"},
         )
         self.assertNotIn(inst, assistant._silence_brief_epoch_sent)
-        assistant.last_wechat_push_at[inst] = past
+        assistant.last_silence_brief_at[inst] = past
         self.assertTrue(assistant._silence_brief_should_call_ai(inst))
 
     def test_silence_brief_marks_epoch_sent(self):
         assistant = make_assistant(wechat_silence_brief_minutes=60)
         inst = "ETH-USDT-SWAP"
-        assistant.last_wechat_push_at[inst] = assistant._now_ts()
+        assistant.last_silence_brief_at[inst] = assistant._now_ts() - 70 * 60
+        cycle = assistant._silence_brief_cycle(inst)
         assistant._mark_wechat_push_sent(
             inst,
             "brief:eth:观望",
             "brief",
             {"direction": "观望"},
         )
-        self.assertEqual(
-            assistant._silence_brief_epoch_sent.get(inst),
-            assistant._silence_brief_epoch(inst),
-        )
+        self.assertEqual(assistant._silence_brief_epoch_sent.get(inst), cycle)
+        self.assertGreater(assistant.last_silence_brief_at.get(inst, 0.0), 0.0)
+
+    def test_silence_brief_schedule_independent_of_business_push(self):
+        assistant = make_assistant(wechat_silence_brief_minutes=60)
+        assistant.push_enabled = True
+        inst = "ETH-USDT-SWAP"
+        assistant.last_silence_brief_at[inst] = assistant._now_ts() - 70 * 60
+        assistant.last_wechat_push_at[inst] = assistant._now_ts() - 5 * 60
+        self.assertTrue(assistant._silence_brief_should_call_ai(inst))
+
+    def test_silence_brief_repeats_after_previous_silence_brief(self):
+        assistant = make_assistant(wechat_silence_brief_minutes=60)
+        assistant.push_enabled = True
+        inst = "ETH-USDT-SWAP"
+        prior_brief = assistant._now_ts() - 130 * 60
+        due_cycle = int(prior_brief + assistant._silence_brief_interval_seconds())
+        assistant.last_silence_brief_at[inst] = assistant._now_ts() - 65 * 60
+        assistant._silence_brief_epoch_sent[inst] = due_cycle
+        self.assertTrue(assistant._silence_brief_should_call_ai(inst))
 
     def test_swing_spike_rejects_single_macd_without_large_move(self):
         assistant = make_assistant(strategy_mode="swing", spike_push_score=62)

@@ -1076,6 +1076,37 @@ def resolve_ai_suggestion(parsed: Dict[str, Any]) -> str:
     return suggestion
 
 
+def merge_parsed_for_wechat_suggestion(
+    parsed: Dict[str, Any],
+    final_decision: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Align parsed AI fields with final trade decision for WeChat suggestion text."""
+    merged = dict(parsed) if isinstance(parsed, dict) else {}
+    direction = str(final_decision.get("direction") or merged.get("direction") or "观望")
+    if direction in ("做多", "做空", "观望"):
+        merged["direction"] = direction
+    push_rec = str(final_decision.get("push_recommendation") or merged.get("push_recommendation") or "none")
+    if push_rec in ("none", "watch", "trade", "spike"):
+        merged["push_recommendation"] = push_rec
+    forward = dict(merged.get("forward_view") or {}) if isinstance(merged.get("forward_view"), dict) else {}
+    if direction in ("做多", "做空", "观望"):
+        forward["direction"] = direction
+    entry_plan = dict(forward.get("entry_plan") or {}) if isinstance(forward.get("entry_plan"), dict) else {}
+    for key in ("entry", "stop_loss", "take_profit"):
+        value = final_decision.get(key)
+        if value not in (None, "", "-"):
+            merged[key] = value
+            entry_plan[key] = value
+    if entry_plan:
+        forward["entry_plan"] = entry_plan
+    invalidation = forward.get("invalidation")
+    if invalidation not in (None, "", "-"):
+        merged["invalidation"] = invalidation
+    if forward:
+        merged["forward_view"] = forward
+    return merged
+
+
 def apply_forward_view_to_parsed(parsed: Dict[str, Any]) -> Dict[str, Any]:
     forward = normalize_forward_view(
         parsed.get("forward_view"),
@@ -1231,7 +1262,7 @@ class SignalConfig:
     ai_conflict_guard: bool = True
     l3_local_spike_push: bool = False
     l2_require_volume_or_structure: bool = True
-    signal_forecast_enabled: bool = True
+    signal_forecast_enabled: bool = False
     forecast_push_score: int = DEFAULT_FORECAST_PUSH_SCORE
     forecast_horizon_minutes: int = DEFAULT_FORECAST_HORIZON_MINUTES
     calibration_enabled: bool = True
@@ -2535,6 +2566,8 @@ class OkxAiShortTermAssistant:
         # 推送冷却状态。key 为 push_kind:inst_id:direction，避免信号组合变化绕过冷却。
         self.last_push_at: Dict[str, float] = {}
         self.last_wechat_push_at: Dict[str, float] = {}
+        # 静默简报独立计时，不与 trade/spike/watch 等业务推送共用 epoch。
+        self.last_silence_brief_at: Dict[str, float] = {}
         self._silence_brief_ai_epoch_done: Dict[str, int] = {}
         self._silence_brief_epoch_sent: Dict[str, int] = {}
         self._silence_brief_analysis_cache: Dict[str, Tuple[int, Dict[str, Any]]] = {}
@@ -6694,30 +6727,41 @@ class OkxAiShortTermAssistant:
             return 0
         return max(300, minutes * 60)
 
+    def _silence_brief_cycle(self, inst_id: str) -> int:
+        last_brief = self.last_silence_brief_at.get(inst_id, 0.0)
+        interval = self._silence_brief_interval_seconds()
+        if last_brief <= 0 or interval <= 0:
+            return 0
+        if self._now_ts() - last_brief < interval:
+            return 0
+        return int(last_brief + interval)
+
     def _silence_brief_epoch(self, inst_id: str) -> int:
-        last_push = self.last_wechat_push_at.get(inst_id, 0.0)
-        return int(last_push) if last_push > 0 else 0
+        # 兼容旧调用点；周期 id 仅基于上次静默简报时间。
+        return self._silence_brief_cycle(inst_id)
 
     def _silence_brief_silence_due(self, inst_id: str) -> bool:
         interval = self._silence_brief_interval_seconds()
         if interval <= 0 or not self.push_enabled or not self.ai_enabled:
             return False
-        last_push = self.last_wechat_push_at.get(inst_id, 0.0)
-        if last_push <= 0:
+        last_brief = self.last_silence_brief_at.get(inst_id, 0.0)
+        if last_brief <= 0:
             return False
-        return self._now_ts() - last_push >= interval
+        return self._now_ts() - last_brief >= interval
 
     def _silence_brief_already_sent(self, inst_id: str) -> bool:
-        epoch = self._silence_brief_epoch(inst_id)
-        return epoch > 0 and self._silence_brief_epoch_sent.get(inst_id) == epoch
+        cycle = self._silence_brief_cycle(inst_id)
+        if cycle <= 0:
+            return False
+        return self._silence_brief_epoch_sent.get(inst_id) == cycle
 
     def _silence_brief_should_call_ai(self, inst_id: str) -> bool:
         if not self._silence_brief_silence_due(inst_id):
             return False
         if self._silence_brief_already_sent(inst_id):
             return False
-        epoch = self._silence_brief_epoch(inst_id)
-        return self._silence_brief_ai_epoch_done.get(inst_id) != epoch
+        cycle = self._silence_brief_cycle(inst_id)
+        return cycle > 0 and self._silence_brief_ai_epoch_done.get(inst_id) != cycle
 
     def _silence_brief_analysis_for_push(
         self,
@@ -6727,7 +6771,7 @@ class OkxAiShortTermAssistant:
         if analysis and analysis.get("valid_json") and isinstance(analysis.get("parsed"), dict):
             return analysis
         cached = self._silence_brief_analysis_cache.get(inst_id)
-        if cached and cached[0] == self._silence_brief_epoch(inst_id):
+        if cached and cached[0] == self._silence_brief_cycle(inst_id):
             return cached[1]
         return None
 
@@ -6740,16 +6784,16 @@ class OkxAiShortTermAssistant:
             return False
         if self._silence_brief_already_sent(inst_id):
             return False
-        epoch = self._silence_brief_epoch(inst_id)
-        if self._silence_brief_ai_epoch_done.get(inst_id) != epoch:
+        cycle = self._silence_brief_cycle(inst_id)
+        if self._silence_brief_ai_epoch_done.get(inst_id) != cycle:
             return False
         return self._silence_brief_analysis_for_push(inst_id, analysis) is not None
 
     def _silence_brief_minutes_since_push(self, inst_id: str) -> int:
-        last_push = self.last_wechat_push_at.get(inst_id, 0.0)
-        if last_push <= 0:
+        last_brief = self.last_silence_brief_at.get(inst_id, 0.0)
+        if last_brief <= 0:
             return 0
-        return max(0, int((self._now_ts() - last_push) // 60))
+        return max(0, int((self._now_ts() - last_brief) // 60))
 
     def _build_silence_brief_decision(
         self,
@@ -6765,8 +6809,8 @@ class OkxAiShortTermAssistant:
         silence_note = str(parsed.get("analysis_note", "") or "").strip()
         if not silence_note:
             silence_note = (
-                f"距上次微信推送约 {minutes_since} 分钟，"
-                "当前未达结构单/急变推送门槛，详见下方前瞻与建议。"
+                f"距上次静默简报约 {minutes_since} 分钟，"
+                "按设定周期例行简报，详见下方前瞻与建议。"
             )
         return {
             "inst_id": inst_id,
@@ -7165,7 +7209,7 @@ class OkxAiShortTermAssistant:
                 skip_reason = "fingerprint_cooldown"
 
         if silence_brief_due and self.ai_enabled and not should_call_ai:
-            silence_fp = f"silence_brief:{self._silence_brief_epoch(inst_id)}"
+            silence_fp = f"silence_brief:{self._silence_brief_cycle(inst_id)}"
             if self._ai_call_dedup_allows(inst_id, silence_fp, "L2"):
                 should_call_ai = True
                 skip_reason = ""
@@ -7870,7 +7914,7 @@ class OkxAiShortTermAssistant:
             forward_prob = max(0, min(100, int(round(forward_prob_raw))))
             raw_conf = forward_prob if raw_conf is None else max(raw_conf, forward_prob)
 
-        direction = parsed.get("direction", "观望")
+        direction = self._resolve_ai_direction(parsed)
         if raw_conf is None:
             if direction in ("做多", "做空"):
                 raw_conf = max(0, min(100, int(score.get("final_trade_score", score.get("raw_total_score", 0)))))
@@ -7888,6 +7932,17 @@ class OkxAiShortTermAssistant:
             cap = max(cap, int(scalp_view.get("score", 0) or 0))
         return max(0, min(100, min(raw_conf, cap)))
 
+    def _resolve_ai_direction(self, parsed: Dict[str, Any]) -> str:
+        forward = parsed.get("forward_view") if isinstance(parsed.get("forward_view"), dict) else {}
+        direction = forward.get("direction") or parsed.get("direction", "观望")
+        return str(direction or "观望")
+
+    def _ai_trade_push_if_qualified(self, direction: str, confidence: int) -> str:
+        """AI 方向为准：做多/做空且分数达 trade 门槛则推 trade，忽略 AI 的 watch/none 建议。"""
+        if direction in ("做多", "做空") and confidence >= self.trade_push_score(direction):
+            return "trade"
+        return ""
+
     def _derive_push_recommendation(
         self,
         parsed: Dict[str, Any],
@@ -7895,30 +7950,29 @@ class OkxAiShortTermAssistant:
         signals: List[Dict[str, Any]],
         trigger: Dict[str, Any],
     ) -> str:
-        explicit = str(parsed.get("push_recommendation", "") or "").strip().lower()
-        if explicit in ("none", "watch", "trade", "spike"):
-            if explicit == "trade":
-                scalp_view = score.get("strategy_views", {}).get("scalp", {})
-                ai_dir = parsed.get("direction", "观望")
-                if (
-                    self._is_scalp_spike_active(scalp_view)
-                    and scalp_view.get("direction") in ("做多", "做空")
-                    and ai_dir in ("做多", "做空")
-                    and ai_dir != scalp_view.get("direction")
-                    and trigger.get("level") == "L3"
-                ):
-                    return "spike"
-            return explicit
-
-        direction = parsed.get("direction", "观望")
+        direction = self._resolve_ai_direction(parsed)
         confidence = self._derive_confidence_from_parsed(parsed, score)
+        explicit = str(parsed.get("push_recommendation", "") or "").strip().lower()
+
+        if explicit == "spike":
+            return "spike"
+
+        if explicit == "trade":
+            scalp_view = score.get("strategy_views", {}).get("scalp", {})
+            if (
+                self._is_scalp_spike_active(scalp_view)
+                and scalp_view.get("direction") in ("做多", "做空")
+                and direction in ("做多", "做空")
+                and direction != scalp_view.get("direction")
+                and trigger.get("level") == "L3"
+            ):
+                return "spike"
+            qualified = self._ai_trade_push_if_qualified(direction, confidence)
+            return qualified or "none"
+
         audit = parsed_data_quality(parsed)
         audit_overall = str(audit.get("overall", ""))
-
         if audit_overall in AI_DATA_QUALITY_UNTRUSTED:
-            signal_types = {item.get("type", "") for item in signals}
-            if signal_types.intersection(WATCH_TRIGGER_SIGNALS) and confidence >= self.config.watch_push_score:
-                return "watch"
             return "none"
 
         scalp_view = score.get("strategy_views", {}).get("scalp", {})
@@ -7929,11 +7983,17 @@ class OkxAiShortTermAssistant:
         ):
             return "spike"
 
-        if direction in ("做多", "做空") and confidence >= self.trade_push_score(direction):
-            return "trade"
+        qualified = self._ai_trade_push_if_qualified(direction, confidence)
+        if qualified:
+            return qualified
 
         signal_types = {item.get("type", "") for item in signals}
-        if direction == "观望" and confidence >= self.config.watch_push_score and signal_types.intersection(WATCH_TRIGGER_SIGNALS):
+        if (
+            direction == "观望"
+            and self.config.signal_watch_enabled
+            and confidence >= self.config.watch_push_score
+            and signal_types.intersection(WATCH_TRIGGER_SIGNALS)
+        ):
             return "watch"
 
         return "none"
@@ -8084,20 +8144,14 @@ class OkxAiShortTermAssistant:
         parsed = analysis.get("parsed") if isinstance(analysis.get("parsed"), dict) else {}
         audit = parsed_data_quality(parsed)
         forward = parsed.get("forward_view") if isinstance(parsed.get("forward_view"), dict) else {}
-        direction = forward.get("direction") or parsed.get("direction", "观望")
+        direction = self._resolve_ai_direction(parsed)
         confidence = self._derive_confidence_from_parsed(parsed, score)
         push_recommendation = self._derive_push_recommendation(parsed, score, signals, trigger)
         screening = self.build_local_screening(snapshot or {}, signals, score, trigger)
 
         if data_quality_untrusted(parsed):
             if push_recommendation == "trade":
-                signal_types = {item.get("type", "") for item in signals}
-                push_recommendation = "watch" if signal_types.intersection(WATCH_TRIGGER_SIGNALS) else "none"
-            if direction in ("做多", "做空") and push_recommendation == "none":
-                direction = "观望"
-
-        if parsed.get("risk_level") == "高" and confidence < max(50, self.trade_push_score(direction) - 10) and push_recommendation == "trade":
-            push_recommendation = "watch"
+                push_recommendation = "none"
 
         entry_plan = forward.get("entry_plan") if isinstance(forward.get("entry_plan"), dict) else {}
         entry = entry_plan.get("entry") or parsed.get("entry", "-")
@@ -8369,8 +8423,14 @@ class OkxAiShortTermAssistant:
         self.last_wechat_push_at[inst_id] = now
         if push_kind == "brief":
             lifecycle = str(decision.get("lifecycle_event") or "")
-            if lifecycle not in ("monitor_start", "monitor_stop"):
-                self._silence_brief_epoch_sent[inst_id] = self._silence_brief_epoch(inst_id)
+            if lifecycle in ("monitor_start", "monitor_stop"):
+                self.last_silence_brief_at[inst_id] = now
+            else:
+                cycle = self._silence_brief_cycle(inst_id)
+                if cycle <= 0:
+                    cycle = int(now)
+                self._silence_brief_epoch_sent[inst_id] = cycle
+                self.last_silence_brief_at[inst_id] = now
         if push_kind == "trade" and decision.get("direction") in ("做多", "做空"):
             self.last_trade_push_at[inst_id] = (decision["direction"], now)
 
@@ -9072,11 +9132,11 @@ class OkxAiShortTermAssistant:
             if "periodic_review" in (trigger.get("reasons") or []):
                 self.last_ai_periodic_call_at[inst_id] = self._now_ts()
             if "silence_brief" in (trigger.get("reasons") or []):
-                epoch = self._silence_brief_epoch(inst_id)
-                if epoch > 0:
-                    self._silence_brief_ai_epoch_done[inst_id] = epoch
+                cycle = self._silence_brief_cycle(inst_id)
+                if cycle > 0:
+                    self._silence_brief_ai_epoch_done[inst_id] = cycle
                     if analysis and analysis.get("valid_json"):
-                        self._silence_brief_analysis_cache[inst_id] = (epoch, analysis)
+                        self._silence_brief_analysis_cache[inst_id] = (cycle, analysis)
             self.last_ai_fingerprint[inst_id] = trigger["fingerprint"]
             ai_direction = str(score.get("final_direction", score.get("direction", "")) or "")
             if ai_direction not in ("做多", "做空"):
@@ -11090,10 +11150,10 @@ class OkxAiShortTermAssistant:
             silence_minutes = int(getattr(self.config, "wechat_silence_brief_minutes", 0) or 0)
             silence_brief_block = (
                 "【静默简报 silence_brief】\n"
-                f"自上次任意微信推送已过去约 {silence_minutes} 分钟以上，期间未发结构单/急变/观察。"
-                "请说明：1) 当前多周期结构与 regime；2) 为何 push_recommendation 不宜 trade/spike；"
+                f"距上次静默简报已满约 {silence_minutes} 分钟，按设定周期发送例行简报（与是否推送结构单/急变无关）。"
+                "请说明：1) 当前多周期结构与 regime；2) 当前盘面风险与机会；"
                 "3) 接下来应关注的关键价位/事件（写入 forward_view 与 suggestion）。"
-                "analysis_note 必填，用 2-4 句解释「为何这段时间没有交易类推送」；"
+                "analysis_note 必填，用 2-4 句概括当前盘面与观察要点；"
                 "push_recommendation 应为 none 或 watch，勿给 trade/spike。\n\n"
             )
         lifecycle_brief_block = ""
@@ -11264,10 +11324,9 @@ class OkxAiShortTermAssistant:
             "take_profit": display_push_value(final_decision.get("take_profit"), "-"),
             "risk_level": display_push_value(final_decision.get("risk_level"), "中"),
             "suggestion": clip_push_text(
-                parsed.get("suggestion")
-                or resolve_ai_suggestion(parsed)
+                resolve_ai_suggestion(merge_parsed_for_wechat_suggestion(parsed, final_decision))
                 or final_decision.get("summary"),
-                320,
+                400,
             ),
             "risk": clip_push_text(parsed.get("risk"), 260),
             "score_comment": clip_push_text(
@@ -11364,6 +11423,13 @@ class OkxAiShortTermAssistant:
         if risk not in ("", "-"):
             lines.append(f"- 风险：{risk}")
 
+        if view.get("suggestion") not in (None, "", "-"):
+            lines.append("- 建议：")
+            for part in str(view["suggestion"]).splitlines():
+                text = part.strip()
+                if text:
+                    lines.append(f"  {text}")
+
         if view.get("forward_summary") not in (None, "", "-"):
             horizon = view.get("forward_horizon_minutes")
             prob = view.get("forward_probability")
@@ -11378,13 +11444,6 @@ class OkxAiShortTermAssistant:
 
         if view.get("forward_invalidation") not in (None, "", "-"):
             lines.append(f"- 失效：{view['forward_invalidation']}")
-
-        if view.get("suggestion") not in (None, "", "-"):
-            lines.append("- 建议：")
-            for part in str(view["suggestion"]).splitlines():
-                text = part.strip()
-                if text:
-                    lines.append(f"  · {text}")
 
         note = clip_push_text(parsed_analysis_note(parsed), 120)
         if note not in ("", "-"):
@@ -11568,9 +11627,7 @@ class OkxAiShortTermAssistant:
             elif lifecycle == "manual_brief":
                 context_line = "- Web 手动获取简报（不推送微信）"
             else:
-                context_line = (
-                    f"- 距上次微信推送约 {brief_minutes} 分钟（期间未发结构单/急变/观察）"
-                )
+                context_line = f"- 距上次静默简报约 {brief_minutes} 分钟（周期例行简报）"
             view = self._resolve_push_view(final_decision, analysis, local_score)
             lines = [
                 f"## {inst_id} · {snapshot.get('time', now_text())} · {price}",
@@ -11648,7 +11705,17 @@ class OkxAiShortTermAssistant:
             lines.append("- " + "；".join(signal_details))
 
         if ai_invoked:
-            lines.extend(["", "### AI分析", *self._format_wechat_compact_ai_lines(analysis, view)])
+            ai_lines = self._format_wechat_compact_ai_lines(analysis, view)
+            if view.get("direction") in ("做多", "做空") and not any(
+                line.startswith("- 建议") for line in ai_lines
+            ):
+                suggestion = str(view.get("suggestion") or "").strip()
+                if suggestion:
+                    ai_lines.extend(
+                        ["- 建议："]
+                        + [f"  {part.strip()}" for part in suggestion.splitlines() if part.strip()]
+                    )
+            lines.extend(["", "### AI分析", *ai_lines])
         else:
             if view.get("local_screening_summary") not in (None, "", "-"):
                 lines.extend(["", "### 本地分析", f"- {view['local_screening_summary']}"])
@@ -11663,7 +11730,11 @@ class OkxAiShortTermAssistant:
                 for index, reason in enumerate(view["reasons"], start=1):
                     lines.append(f"  {index}. {reason}")
             if view["suggestion"] not in (None, "", "-"):
-                lines.append(f"- 建议 {view['suggestion']}")
+                lines.append("- 建议：")
+                for part in str(view["suggestion"]).splitlines():
+                    text = part.strip()
+                    if text:
+                        lines.append(f"  {text}")
 
         local_bits: List[str] = []
         if view["rule_direction"] not in (None, "", "-", view["direction"]):
@@ -11870,7 +11941,7 @@ def _assistant_from_user_config(config: Dict[str, Any]) -> OkxAiShortTermAssista
             ai_conflict_guard=bool(config.get("ai_conflict_guard", True)),
             l3_local_spike_push=bool(config.get("l3_local_spike_push", False)),
             l2_require_volume_or_structure=bool(config.get("l2_require_volume_or_structure", True)),
-            signal_forecast_enabled=bool(config.get("signal_forecast_enabled", True)),
+            signal_forecast_enabled=bool(config.get("signal_forecast_enabled", False)),
             forecast_push_score=int(config.get("forecast_push_score", 58)),
             forecast_horizon_minutes=int(config.get("forecast_horizon_minutes", 15)),
             calibration_enabled=bool(config.get("calibration_enabled", True)),
@@ -12295,8 +12366,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--forecast-alerts",
         action="store_true",
-        default=os.getenv("FORECAST_ALERTS_ENABLED", "1") == "1",
-        help="Enable parallel structure evolution forecast track",
+        default=os.getenv("FORECAST_ALERTS_ENABLED", "0") == "1",
+        help="Enable structure evolution forecast track and WeChat [演变] pushes",
     )
     parser.add_argument("--no-forecast-alerts", action="store_false", dest="forecast_alerts")
     parser.add_argument("--forecast-push-score", type=int, default=env_int("FORECAST_PUSH_SCORE", DEFAULT_FORECAST_PUSH_SCORE))

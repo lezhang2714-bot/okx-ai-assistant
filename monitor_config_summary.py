@@ -72,7 +72,7 @@ MONITOR_BEHAVIOR_DEFAULTS: Dict[str, Any] = {
     "signal_trade_enabled": True,
     "signal_watch_enabled": False,
     "signal_spike_enabled": True,
-    "signal_forecast_enabled": True,
+    "signal_forecast_enabled": False,
     "ai_conflict_guard": True,
     "l3_local_spike_push": False,
     "l2_require_volume_or_structure": True,

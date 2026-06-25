@@ -141,6 +141,7 @@ PAPER_ACCOUNT_FILE = LOG_DIR / "paper_account.json"
 PAPER_INITIAL_CAPITAL = 10000.0
 REPLAY_ANALYSIS_LOG_FILE = REPLAY_LOG_FILE
 REPLAY_PROCESS_LOG_FILE = LOG_DIR / "replay_console.log"
+HISTORICAL_REPLAY_DATASET_FILE = LOG_DIR / "replay_dataset_historical.jsonl"
 HOST = os.getenv("WEB_CONTROL_PANEL_HOST", "127.0.0.1")
 PORT = int(os.getenv("WEB_CONTROL_PANEL_PORT", "8765"))
 APP_VERSION = "1.3.0"
@@ -163,8 +164,12 @@ ACCURACY_LOG_TAIL_BYTES = int(os.getenv("WEB_ACCURACY_LOG_TAIL_BYTES", str(32 * 
 LOG_DISPLAY_MAX_LINES = max(500, int(os.getenv("WEB_LOG_DISPLAY_MAX_LINES", "2000")))
 CONSOLE_LOG_MAX_BYTES = int(os.getenv("WEB_CONSOLE_LOG_MAX_BYTES", str(100 * 1024 * 1024)))
 CONSOLE_LOG_TOTAL_MAX_BYTES = int(os.getenv("WEB_CONSOLE_LOG_TOTAL_MAX_BYTES", str(300 * 1024 * 1024)))
-API_RESPONSE_CACHE_TTL_SECONDS = float(os.getenv("WEB_API_CACHE_TTL_SECONDS", "3"))
+API_RESPONSE_CACHE_TTL_SECONDS = float(os.getenv("WEB_API_CACHE_TTL_SECONDS", "4"))
 WEB_CANDLE_CACHE_TTL_SECONDS = float(os.getenv("WEB_CANDLE_CACHE_TTL_SECONDS", "45"))
+REALTIME_LOG_CACHE_SECONDS = float(os.getenv("WEB_REALTIME_LOG_CACHE_SECONDS", "2.5"))
+MONITOR_STATUS_HEAVY_INTERVAL_SECONDS = float(
+    os.getenv("WEB_MONITOR_STATUS_HEAVY_INTERVAL_SECONDS", "30")
+)
 WEB_MAX_CONCURRENT_REQUESTS = max(8, int(os.getenv("WEB_MAX_CONCURRENT_REQUESTS", "48")))
 WEB_MONITOR_AUTO_RESTART = os.getenv("WEB_MONITOR_AUTO_RESTART", "1").strip().lower() in ("1", "true", "yes")
 DIAG_EXPORT_MAX_FILE_BYTES = int(os.getenv("WEB_DIAG_EXPORT_MAX_FILE_BYTES", str(32 * 1024 * 1024)))
@@ -231,8 +236,24 @@ REPLAY_STARTED_AT = ""
 REPLAY_LOG_START_AT = ""
 REPLAY_STOPPED_AT = ""
 REPLAY_STOP_REQUESTED = False
+_REPLAY_BUILD_LOCK = threading.Lock()
+_REPLAY_BUILD_THREAD: Optional[threading.Thread] = None
+_REPLAY_BUILD_STATE: Dict[str, Any] = {
+    "running": False,
+    "phase": "",
+    "current": 0,
+    "total": 0,
+    "message": "",
+    "error": "",
+    "result": None,
+    "cancel_requested": False,
+}
 _DATASET_STATS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _LOG_LINE_COUNT_CACHE: Dict[str, Tuple[float, int]] = {}
+_MONITOR_STOP_LOCK = threading.Lock()
+_MONITOR_STATUS_HEAVY_AT = 0.0
+_STATUS_TOKEN_CACHE: Tuple[float, int] = (0.0, 0)
+_REALTIME_POINTS_CACHE: Dict[str, Tuple[float, Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]] = {}
 
 FIXED_MONITOR_RUNTIME = 0
 FIXED_OKX_FLAG = "0"
@@ -260,7 +281,7 @@ CONFIG_FIELDS = [
     ("AI与推送", "ai_enabled", "checkbox", "启用AI分析", "开启后除 L2/L3 事件触发外，还可按下方「定时 AI 间隔」固定复核；事件触发仍受策略冷却约束。", "left"),
     ("AI与推送", "push_enabled", "checkbox", "启用微信推送", "每轮最多 1 条；trade/spike/watch 须 AI 复核；演变/静默简报规则见各间隔配置；同币种最短间隔 10 分钟。", "right"),
     ("AI与推送", "ai_periodic_interval_minutes", "number", "定时 AI 间隔(分钟)", "启用 AI 后，每个监控币种按此间隔固定调用一次分析（无信号也会调）；0 表示关闭。默认 10。修改后需重启监控。", "left"),
-    ("AI与推送", "wechat_silence_brief_minutes", "number", "静默简报间隔(分钟)", "启用后：监控启动/停止各推一次[简报]；距上次任意微信推送满此分钟且期间无结构单/急变推送时，再发静默[简报]。0=关闭。需 AI+微信推送。修改后需重启监控。", "right"),
+    ("AI与推送", "wechat_silence_brief_minutes", "number", "静默简报间隔(分钟)", "启用后：监控启动/停止各推一次[简报]；距上次静默简报满此分钟后再发例行[简报]（与结构单/急变是否推送无关）。0=关闭。需 AI+微信推送。修改后需重启监控。", "right"),
     ("AI与推送", "push_score", "number", "做多推送门槛(trade)", "direction 为做多且 confidence ≥ 此值时可推 trade。建议见下方「推送分数建议」。", "right"),
     ("AI与推送", "short_push_score", "number", "做空推送门槛(trade)", "direction 为做空且 confidence ≥ 此值时可推 trade；标准模式建议与做多对称(75/75)。", "right"),
 ]
@@ -1392,6 +1413,7 @@ def perform_factory_reset(password: str) -> Dict[str, Any]:
     _CANDLE_CACHE.clear()
     _DATASET_STATS_CACHE.clear()
     _LOG_LINE_COUNT_CACHE.clear()
+    _REALTIME_POINTS_CACHE.clear()
     return {
         "ok": True,
         "message": (
@@ -1732,14 +1754,123 @@ def analysis_log_bytes() -> int:
         return 0
 
 
+def resolve_replay_dataset_path(source: str = "recorded") -> Path:
+    normalized = str(source or "recorded").strip().lower()
+    if normalized == "historical":
+        return HISTORICAL_REPLAY_DATASET_FILE
+    return REPLAY_DATASET_FILE
+
+
+def replay_build_status_snapshot() -> Dict[str, Any]:
+    with _REPLAY_BUILD_LOCK:
+        state = dict(_REPLAY_BUILD_STATE)
+    return {
+        **state,
+        "historical_dataset": cached_replay_dataset_stats(HISTORICAL_REPLAY_DATASET_FILE),
+        "historical_dataset_path": str(HISTORICAL_REPLAY_DATASET_FILE),
+    }
+
+
+def start_historical_replay_build(payload: Dict[str, Any]) -> Dict[str, Any]:
+    global _REPLAY_BUILD_THREAD, _REPLAY_BUILD_STATE
+    with _REPLAY_BUILD_LOCK:
+        if _REPLAY_BUILD_STATE.get("running"):
+            return {"ok": False, "error": "已有历史回放生成任务在进行中"}
+    if monitor_status()["running"]:
+        return {"ok": False, "error": "请先停止正式监控，再生成历史回放数据"}
+    if replay_status()["running"]:
+        return {"ok": False, "error": "请先停止回放，再生成历史回放数据"}
+
+    inst_id = str(payload.get("inst_id") or "").strip().upper()
+    if not inst_id:
+        configured = order_configured_inst_ids(load_config().get("inst_ids"))
+        inst_id = configured[0] if configured else DEFAULT_MONITOR_INSTRUMENTS[0]
+    start_time = str(payload.get("start_time") or "").strip()
+    end_time = str(payload.get("end_time") or "").strip()
+    if not start_time or not end_time:
+        return {"ok": False, "error": "请填写开始时间与结束时间"}
+    try:
+        step_seconds = max(5, min(3600, int(payload.get("step_seconds") or 60)))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "帧步长无效"}
+
+    def worker() -> None:
+        global _REPLAY_BUILD_STATE
+        try:
+            from historical_replay_builder import build_historical_replay_dataset
+
+            def progress(phase: str, current: int, total: int, message: str) -> None:
+                with _REPLAY_BUILD_LOCK:
+                    _REPLAY_BUILD_STATE.update(
+                        {
+                            "phase": phase,
+                            "current": current,
+                            "total": total,
+                            "message": message,
+                        }
+                    )
+
+            result = build_historical_replay_dataset(
+                inst_id=inst_id,
+                start_time=start_time,
+                end_time=end_time,
+                step_seconds=step_seconds,
+                output_path=HISTORICAL_REPLAY_DATASET_FILE,
+                progress_callback=progress,
+                cancel_check=lambda: bool(_REPLAY_BUILD_STATE.get("cancel_requested")),
+            )
+            with _REPLAY_BUILD_LOCK:
+                _REPLAY_BUILD_STATE.update(
+                    {
+                        "running": False,
+                        "phase": "done",
+                        "message": "生成完成",
+                        "error": "",
+                        "result": result,
+                    }
+                )
+            _DATASET_STATS_CACHE.pop(str(HISTORICAL_REPLAY_DATASET_FILE), None)
+        except Exception as exc:
+            with _REPLAY_BUILD_LOCK:
+                _REPLAY_BUILD_STATE.update(
+                    {
+                        "running": False,
+                        "phase": "error",
+                        "message": str(exc),
+                        "error": str(exc),
+                        "result": None,
+                    }
+                )
+
+    with _REPLAY_BUILD_LOCK:
+        _REPLAY_BUILD_STATE = {
+            "running": True,
+            "phase": "init",
+            "current": 0,
+            "total": 0,
+            "message": "准备生成...",
+            "error": "",
+            "result": None,
+            "cancel_requested": False,
+        }
+    _REPLAY_BUILD_THREAD = threading.Thread(target=worker, daemon=True, name="historical-replay-build")
+    _REPLAY_BUILD_THREAD.start()
+    return {"ok": True, "message": "已开始生成历史回放数据", **replay_build_status_snapshot()}
+
+
 def replay_dataset_info(*, lite: bool = False) -> Dict[str, Any]:
     stats = cached_replay_dataset_stats(REPLAY_DATASET_FILE)
+    historical_stats = cached_replay_dataset_stats(HISTORICAL_REPLAY_DATASET_FILE)
     status = replay_status()
     config = load_config()
     running = bool(status["running"])
     line_count = count_nonempty_lines(REPLAY_ANALYSIS_LOG_FILE, fast=lite or running)
+    build_status = replay_build_status_snapshot()
     return {
         **stats,
+        "historical_dataset": historical_stats,
+        "historical_dataset_path": str(HISTORICAL_REPLAY_DATASET_FILE),
+        "build_status": build_status,
         "record_enabled": bool(config.get("record_replay_enabled")),
         "monitor_running": bool(monitor_status()["running"]),
         "replay_running": running,
@@ -1754,6 +1885,32 @@ def replay_dataset_info(*, lite: bool = False) -> Dict[str, Any]:
     }
 
 
+def _clear_monitor_runtime_caches() -> None:
+    _REALTIME_POINTS_CACHE.clear()
+
+
+def _cached_monitor_ai_tokens() -> int:
+    global _STATUS_TOKEN_CACHE
+    now = time.time()
+    if now - _STATUS_TOKEN_CACHE[0] < 5.0:
+        return _STATUS_TOKEN_CACHE[1]
+    tokens = int(load_ai_token_stats(AI_TOKEN_STATS_FILE).get("total_tokens", 0))
+    _STATUS_TOKEN_CACHE = (now, tokens)
+    return tokens
+
+
+def _send_monitor_stop_lifecycle_brief(config: Dict[str, Any]) -> None:
+    if int(config.get("wechat_silence_brief_minutes", 0) or 0) <= 0:
+        return
+    if not config.get("push_enabled") or not config.get("ai_enabled"):
+        return
+    try:
+        with use_saved_env():
+            get_signal_monitor().push_monitor_lifecycle_briefs("monitor_stop", config)
+    except Exception as exc:
+        print(f"[web] monitor_stop lifecycle brief failed: {exc}", flush=True)
+
+
 def monitor_status_text(running: bool, pid: Optional[int] = None, ai_total_tokens: int = 0) -> str:
     if running and pid:
         return f"运行中 PID={pid} · Token {ai_total_tokens:,}"
@@ -1763,10 +1920,9 @@ def monitor_status_text(running: bool, pid: Optional[int] = None, ai_total_token
 
 
 def monitor_status() -> Dict[str, Any]:
-    global MONITOR_PROCESS, MONITOR_STOPPED_AT
+    global MONITOR_PROCESS, MONITOR_STOPPED_AT, _MONITOR_STATUS_HEAVY_AT
     elapsed_seconds = 0
-    token_stats = load_ai_token_stats(AI_TOKEN_STATS_FILE)
-    ai_total_tokens = int(token_stats.get("total_tokens", 0))
+    ai_total_tokens = _cached_monitor_ai_tokens()
     if MONITOR_STARTED_AT:
         try:
             start_time = datetime.strptime(MONITOR_STARTED_AT, "%Y-%m-%d %H:%M:%S")
@@ -1788,7 +1944,10 @@ def monitor_status() -> Dict[str, Any]:
         }
     code = MONITOR_PROCESS.poll()
     if code is None:
-        rotate_console_log_if_needed(MONITOR_PROCESS_LOG_FILE)
+        now = time.time()
+        if now - _MONITOR_STATUS_HEAVY_AT >= MONITOR_STATUS_HEAVY_INTERVAL_SECONDS:
+            rotate_console_log_if_needed(MONITOR_PROCESS_LOG_FILE)
+            _MONITOR_STATUS_HEAVY_AT = now
         pid = MONITOR_PROCESS.pid
         return {
             "running": True,
@@ -1867,38 +2026,56 @@ def start_monitor() -> str:
     return f"监控已启动，PID={MONITOR_PROCESS.pid} · Token 0"
 
 
-def stop_monitor(*, fast: bool = False) -> str:
-    global MONITOR_PROCESS, MONITOR_STOPPED_AT, MONITOR_STOP_REQUESTED, MONITOR_LAST_EXIT_UNEXPECTED
+def monitor_start_payload() -> Dict[str, Any]:
+    message = start_monitor()
     status = monitor_status()
-    if not status["running"]:
-        return "监控未运行。"
-    try:
-        with use_saved_env():
-            get_signal_monitor().push_monitor_lifecycle_briefs(
-                "monitor_stop", normalize_config(load_config())
-            )
-    except Exception as exc:
-        console_warn(f"monitor_stop lifecycle brief failed: {exc}")
-    MONITOR_STOP_REQUESTED = True
-    MONITOR_LAST_EXIT_UNEXPECTED = False
-    wait_timeout = 1.5 if fast else 8
-    kill_wait = 1.0 if fast else 5
-    MONITOR_PROCESS.terminate()
-    try:
-        MONITOR_PROCESS.wait(timeout=wait_timeout)
-    except subprocess.TimeoutExpired:
-        MONITOR_PROCESS.kill()
-        MONITOR_PROCESS.wait(timeout=kill_wait)
-    MONITOR_STOPPED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
-    MONITOR_PROCESS = None
-    clear_child_pid(MONITOR_PID_FILE)
-    try:
-        with MONITOR_PROCESS_LOG_FILE.open("a", encoding="utf-8") as log_file:
-            log_file.write(f"\n===== signal monitor stopped at {MONITOR_STOPPED_AT} =====\n")
-    except OSError:
-        pass
-    MONITOR_STOP_REQUESTED = False
+    ok = bool(status.get("running")) or "已启动" in message
+    return {"ok": ok, "message": message, **status}
+
+
+def stop_monitor(*, fast: bool = False, lifecycle_brief: bool = True) -> str:
+    global MONITOR_PROCESS, MONITOR_STOPPED_AT, MONITOR_STOP_REQUESTED, MONITOR_LAST_EXIT_UNEXPECTED
+    brief_config: Optional[Dict[str, Any]] = None
+    with _MONITOR_STOP_LOCK:
+        status = monitor_status()
+        if not status["running"]:
+            return "监控未运行。"
+        if lifecycle_brief and not fast:
+            brief_config = normalize_config(load_config())
+        MONITOR_STOP_REQUESTED = True
+        MONITOR_LAST_EXIT_UNEXPECTED = False
+        wait_timeout = 1.5 if fast else 8
+        kill_wait = 1.0 if fast else 5
+        MONITOR_PROCESS.terminate()
+        try:
+            MONITOR_PROCESS.wait(timeout=wait_timeout)
+        except subprocess.TimeoutExpired:
+            MONITOR_PROCESS.kill()
+            MONITOR_PROCESS.wait(timeout=kill_wait)
+        MONITOR_STOPPED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
+        MONITOR_PROCESS = None
+        clear_child_pid(MONITOR_PID_FILE)
+        try:
+            with MONITOR_PROCESS_LOG_FILE.open("a", encoding="utf-8") as log_file:
+                log_file.write(f"\n===== signal monitor stopped at {MONITOR_STOPPED_AT} =====\n")
+        except OSError:
+            pass
+        MONITOR_STOP_REQUESTED = False
+        _clear_monitor_runtime_caches()
+    if brief_config is not None:
+        threading.Thread(
+            target=_send_monitor_stop_lifecycle_brief,
+            args=(brief_config,),
+            daemon=True,
+        ).start()
     return "监控已停止。"
+
+
+def monitor_stop_payload(*, fast: bool = False) -> Dict[str, Any]:
+    message = stop_monitor(fast=fast, lifecycle_brief=not fast)
+    status = monitor_status()
+    ok = "已停止" in message or "未运行" in message
+    return {"ok": ok, "message": message, **status}
 
 
 def post_json(url: str, payload: dict) -> str:
@@ -2805,6 +2982,13 @@ def monitor_console_log_text() -> str:
 
 
 def read_realtime_log_points(inst_id: str, max_points: int = 20000) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    cache_key = f"{inst_id}:{MONITOR_LOG_START_AT}:{realtime_log_tail_bytes()}"
+    now = time.time()
+    cached = _REALTIME_POINTS_CACHE.get(cache_key)
+    if cached and now - cached[0] < REALTIME_LOG_CACHE_SECONDS:
+        realtime_points, log_chart_points = cached[1]
+        return realtime_points[-max_points:], log_chart_points
+
     realtime_points: List[Dict[str, Any]] = []
     log_chart_points: List[Dict[str, Any]] = []
     tail_limit = realtime_log_tail_bytes()
@@ -2825,7 +3009,14 @@ def read_realtime_log_points(inst_id: str, max_points: int = 20000) -> Tuple[Lis
         if item_chart_points:
             log_chart_points = item_chart_points
         realtime_points.append(point_from_log_item(item, price))
-    return realtime_points[-max_points:], log_chart_points
+    result = (realtime_points[-max_points:], log_chart_points)
+    _REALTIME_POINTS_CACHE[cache_key] = (now, result)
+    if len(_REALTIME_POINTS_CACHE) > 16:
+        stale_before = now - REALTIME_LOG_CACHE_SECONDS * 4
+        for key, (saved_at, _) in list(_REALTIME_POINTS_CACHE.items()):
+            if saved_at < stale_before:
+                _REALTIME_POINTS_CACHE.pop(key, None)
+    return result
 
 
 def read_monitor_candles(inst_id: str, bar: str = "1m", max_points: int = 200) -> Dict[str, Any]:
@@ -4625,7 +4816,7 @@ button,.button{{border:0;border-radius:12px;padding:11px 16px;background:#f1f3f8
 <form class="settings-form" method="post" action="/save-auth#settings" autocomplete="off"><input type="text" name="fake_username" autocomplete="username" tabindex="-1" aria-hidden="true" class="autofill-trap"><input type="password" name="fake_password" autocomplete="current-password" tabindex="-1" aria-hidden="true" class="autofill-trap"><section class="card page-panel" data-page="settings"><h2>登录账号</h2><div class="field"><label>用户名</label><div><input type="text" name="auth_username" autocomplete="off" value="{esc(auth.get("username","admin"))}"><p>Web 控制台登录用户名（单账户）。</p></div></div><div class="field"><label>当前密码</label><div><div class="password-wrap"><input type="password" name="auth_current_password" autocomplete="off" placeholder="请手动输入当前密码" readonly data-verify-password><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>须手动输入当前密码验证身份，不会自动填充。</p></div></div><div class="field"><label>新密码</label><div><div class="password-wrap"><input type="password" name="auth_password" autocomplete="off" placeholder="留空则不修改" readonly data-verify-password><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>留空表示保留当前密码；保存后将停止监控/回放并退出登录。</p></div></div></section><section class="card page-panel" data-page="settings"><h2>恢复出厂设置</h2><p class="section-sub">清除 <code>build/runtime_logs/</code> 下运行日志、回放数据、模拟账户与 Token 统计，并将交易配置、AI 密钥、微信 SendKey 与登录账号恢复为出厂默认。会先停止监控与回放；操作不可撤销。</p><div class="field"><label>确认密码</label><div><div class="password-wrap"><input type="password" name="factory_reset_password" autocomplete="off" placeholder="请手动输入当前密码" readonly data-verify-password><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>须验证当前登录密码后才会执行；完成后请使用默认账号 admin / admin123 重新登录。</p></div></div><div class="actions" style="padding:0;margin-top:12px;"><button class="button action-control btn-danger" type="button" id="factoryResetBtn">恢复出厂设置</button></div><p class="accuracy-note" id="factoryResetHint" style="margin-top:10px;"></p></section><div class="actions settings-actions" data-page-actions="settings"><div class="action-group"><button class="action-control btn-save" type="submit">保存账号密码</button><a class="button action-control btn-danger" href="/logout">退出登录</a></div></div></form>
 <div class="page-panel active" data-page="monitor"><section class="card toolbar-card monitor-toolbar-card"><div><h2>实时监控</h2><p class="section-sub">K 线默认显示；关闭开关后不再请求 OKX/日志绘图，<strong>监控进程照常运行</strong>。下方模拟账户按 final_direction 满仓跟单（会话 $10,000 重置）。</p></div><div class="toolbar-right"><span class="section-sub" id="monitorChartLabel" style="margin:0;white-space:nowrap;">K线显示已开启</span><label class="switch" title="仅控制 Web 是否绘制 K 线与快照，不影响后台监控"><input type="checkbox" id="monitorChartEnableToggle" checked><span></span></label><div class="coin-tabs">{monitor_tabs}</div><button class="button btn-run action-control" type="button" id="monitorToggleBtn">开始监控</button></div></section><p class="accuracy-note accuracy-off-hint monitor-chart-off-hint" id="monitorChartOffHint" hidden>K 线显示已关闭。监控进程与磁盘日志照常运行；打开右上角开关后将请求 OKX 并绘制图表。</p><section class="market-card monitor-card" id="monitorChartPanel"><div class="market-head"><div><div class="market-title" id="monitorTitle">{esc(monitor_initial or "未配置币种")} K线</div><div class="market-sub" id="monitorMeta">{esc("选择周期查看蜡烛图 · 启动监控后叠加分析指标" if monitor_initial else "请先在配置页选择监控币种")}</div><div class="bar-tabs" id="monitorBarTabs">{monitor_bar_tabs}</div></div><div class="market-price" id="monitorPrice"><strong>--</strong><span>加载中</span></div></div><div class="market-canvas-wrap"><canvas id="monitorChart"></canvas><div class="market-loading" id="monitorLoading">正在加载 K 线...</div><div class="snapshot-panel" id="snapshotPanel"><div class="snapshot-head"><strong id="snapshotPanelTitle">最新快照</strong><button type="button" class="snapshot-toggle" id="snapshotToggleBtn" title="收起或展开快照面板">收起</button></div><div class="snapshot-body" id="snapshotPanelBody"><div class="snapshot-grid"><span>状态</span><b>加载中...</b><span>提示</span><b>点击 K 线查看 OHLC</b></div></div></div></div><div class="market-time-range"><span id="monitorProcessInfo">PID -- · Token --</span><span id="monitorUptime">已监控：未启动</span><span id="monitorPaperAccount">模拟账户：--</span><span id="monitorPointCount">K线：0</span></div></section></div>
 	<div class="page-panel" data-page="logs"><section class="card toolbar-card logs-toolbar-card"><div><h2>实时日志</h2><p class="section-sub">监控进程仍会照常写入磁盘（JSON 分析 + 控制台）；本页<strong>默认不拉取显示</strong>以节省资源。配置页可设单文件/总容量上限。</p></div><div class="toolbar-right" style="align-items:center;gap:10px;flex-wrap:wrap;"><span class="section-sub" id="logsDisplayLabel" style="margin:0;white-space:nowrap;">显示已关闭</span><label class="switch" title="仅控制 Web 是否读取并展示日志，不影响磁盘写入"><input type="checkbox" id="logsDisplayToggle"><span></span></label><span class="section-sub" id="analysisLogSwitchHint" style="margin:0;">{esc(log_size_summary_text(config))} · 修改后需重启监控</span><button class="button btn-log" type="button" id="refreshLogBtn">刷新全部</button><button class="button btn-log" type="button" id="openLogDirBtn">打开日志目录</button></div></section><p class="accuracy-note accuracy-off-hint" id="logsOffHint">Web 显示已关闭。监控仍正常写日志到磁盘；打开右上角开关后可在此查看本次启动后的内容。</p><section class="card logs-card" id="logPanelBody" hidden><div class="logs-grid"><div class="log-panel"><h3>JSON 分析日志</h3><p class="log-panel-desc">Web 图表/压测依赖的完整分析记录，分卷保存：{esc(MONITOR_JSON_LOG_FILE)} 及 .jsonl.1/.2 …</p><div class="log-panel-body"><textarea class="log-window" id="logWindow" readonly>正在加载日志...</textarea></div><div class="log-panel-footer"><div class="toolbar-card"><div><p class="section-sub" id="saveLogHint">可另存为 .jsonl 文件，便于回放与统计。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveLogBtn">另存为文件</button></div></div></div></div><div class="log-panel"><h3>控制台日志</h3><p class="log-panel-desc">监控进程精简调试输出（信号摘要、推送结果、错误）；详细重试日志需设置 CONSOLE_VERBOSE=1，默认保存：{esc(MONITOR_PROCESS_LOG_FILE)}</p><div class="log-panel-body"><textarea class="log-window log-window-console" id="consoleLogWindow" readonly>正在加载控制台日志...</textarea></div><div class="log-panel-footer"><div class="toolbar-card"><div><p class="section-sub" id="saveConsoleLogHint">可另存为 .log 文件，便于快速排查信号与推送。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearConsoleLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveConsoleLogBtn">另存为文件</button></div></div></div></div></div></section></div>
-	<div class="page-panel" data-page="tests"><section class="card diagnostic-export-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">问题排查导出</h2><p class="section-sub" style="margin:0;">一键打包配置（密钥已打码）、监控/回放状态、日志、压测图表与回放数据，便于反馈 bug 时分析。超大日志仅含尾部。</p></div><div class="toolbar-right"><button class="button action-control btn-save" type="button" id="diagnosticExportBtn">导出诊断包</button></div></div><p class="accuracy-note" id="diagnosticExportHint">将下载 ZIP 文件；包含 JSON 分析日志、控制台日志、回放数据、实时/回放压测 JSON、Token 统计与当前 AI 对话（如有）。</p></section><section class="card ai-chat-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">AI 对话测试</h2><p class="section-sub" style="margin:0;">使用配置页中的 AI 密钥与模型；发送前会先保存当前配置。对话历史仅保留在本页浏览器内存中。「获取简报」按监控同款逻辑拉取 OKX 盘面并生成 [简报]（不推送微信）。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="aiChatClearBtn">清空对话</button><button class="button action-control btn-test" type="button" id="aiChatBriefBtn">获取简报</button><button class="button action-control btn-test" type="button" id="aiChatPingBtn">连通性测试</button></div></div><div class="ai-chat-window" id="aiChatWindow"><div class="ai-chat-empty">输入下方消息开始与 AI 对话。可先点「连通性测试」验证配置是否可用。</div></div><div class="ai-chat-compose"><textarea id="aiChatInput" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea><button class="button action-control btn-test" type="button" id="aiChatSendBtn">发送</button></div></section><section class="card toolbar-card"><div><h2>微信推送测试</h2><p class="section-sub">测试 Server酱 推送是否可用。点击后会先保存配置页中的密钥，再发送与真实监控相同结构的格式预览（模拟 AI 全字段示例）。</p></div><div class="toolbar-right"><button class="button action-control btn-test" type="button" id="testPushBtn">测试微信推送</button></div></section><div id="connectivityTestNotice" class="notice" hidden></div><section class="card accuracy-card"><div class="toolbar-card" style="margin:0 0 12px;box-shadow:none;padding:0;background:transparent;border:none;align-items:flex-start;"><div><h2 style="margin:0 0 6px;">实时预测压测</h2><p class="section-sub" style="margin:0;">顶部<strong>分析次数、AI调用次数、Token总消耗</strong>按当前币种、范围和保留时长统计。模拟账户按 final_direction 从 $10,000 满仓跟单（方向变才换仓）；绿线为权益曲线。下方为分层预测准确度；<strong>AI前瞻命中率</strong>按每条 <code>forward_view</code> 的 horizon 独立验证。回放会话在价线上方标记<strong>应推送</strong>。<strong>默认关闭</strong>以节省资源，需要时再打开。</p></div><div class="toolbar-right" style="align-items:center;gap:10px;flex-shrink:0;"><span class="section-sub" id="accuracyEnableLabel" style="margin:0;white-space:nowrap;">压测已关闭</span><label class="switch" title="启用后才会读取分析日志并自动刷新压测图表"><input type="checkbox" id="accuracyEnableToggle"><span></span></label></div></div><p class="accuracy-note accuracy-off-hint" id="accuracyOffHint">压测已关闭。打开右上角开关后将读取分析日志并自动刷新图表。</p><div id="accuracyPanelBody" hidden><div class="accuracy-controls"><select id="accuracyInst">{accuracy_inst_options}</select>{accuracy_horizon_select_html}<select id="accuracyScope"><option value="session">本次启动后</option><option value="replay">回放会话</option><option value="all">全部历史日志</option></select><select id="accuracyRetentionHours" title="结合配置页轮询间隔计算图表最多保留多少点"><option value="1">保留1小时</option><option value="2">保留2小时</option><option value="4">保留4小时</option><option value="8">保留8小时</option><option value="12" selected>保留12小时</option><option value="24">保留24小时</option><option value="48">保留48小时</option></select><button class="btn-test" type="button" id="accuracyRefreshBtn">刷新压测</button><button class="btn-save" type="button" id="accuracyExportBtn">导出图表</button><button class="btn-save" type="button" id="accuracyImportBtn">导入图表</button><button class="btn-test" type="button" id="accuracyLiveBtn" style="display:none">返回实时</button><input type="file" id="accuracyImportInput" accept=".json,application/json" hidden></div><div class="accuracy-summary" id="accuracySummary"><div class="accuracy-primary"><span>分析次数</span><b>--</b></div><div class="accuracy-primary"><span>AI调用次数</span><b>--</b></div><div class="accuracy-primary"><span>Token总消耗</span><b>--</b></div></div><div class="accuracy-canvas-wrap"><canvas id="accuracyChart"></canvas><div class="accuracy-point-panel" id="accuracyPointPanel" hidden></div></div><p class="accuracy-note" id="accuracyNote">综合准确度用上方验证窗口；AI前瞻命中率用每条 forward_view 的 horizon（通常 15m）。观望：后续波动未超阈值即合理。交易：验证窗内价格朝做多/做空方向走即方向命中。</p></div></section><section class="card"><h2>离线回放压测</h2><p class="section-sub">配置页勾选「录制回放数据集」并运行监控，每轮原始输入写入 {esc(REPLAY_DATASET_FILE)}；停止监控后点击下方「开始回放」。回放按配置启用 AI 与微信推送（未开推送则只写日志），结论写入 {esc(REPLAY_ANALYSIS_LOG_FILE)} 的 <code>push_analysis</code> 与 <code>analysis</code> 字段，便于同一数据集多次回放对比；再选上方「回放会话」查看压测曲线。</p><div class="replay-status" id="replayDatasetInfo">正在加载数据集状态...</div><div class="field"><label>回放间隔(秒)</label><div><input type="number" id="replayInterval" value="0" min="0" max="120" step="0.1"><p>0 表示尽快跑完；大于 0 可在回放过程中观察压测曲线刷新。</p></div></div><div class="field"><label>控制</label><div><div class="toolbar-right" style="justify-content:flex-start;gap:8px;"><button class="btn-test" type="button" id="replayStartBtn">开始回放</button><button class="btn-danger action-control" type="button" id="replayStopBtn">停止回放</button><button class="button btn-log" type="button" id="replayRefreshBtn">刷新状态</button></div><p id="replayStatusText">等待加载...</p></div></div></section></div>
+	<div class="page-panel" data-page="tests"><section class="card diagnostic-export-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">问题排查导出</h2><p class="section-sub" style="margin:0;">一键打包配置（密钥已打码）、监控/回放状态、日志、压测图表与回放数据，便于反馈 bug 时分析。超大日志仅含尾部。</p></div><div class="toolbar-right"><button class="button action-control btn-save" type="button" id="diagnosticExportBtn">导出诊断包</button></div></div><p class="accuracy-note" id="diagnosticExportHint">将下载 ZIP 文件；包含 JSON 分析日志、控制台日志、回放数据、实时/回放压测 JSON、Token 统计与当前 AI 对话（如有）。</p></section><section class="card ai-chat-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">AI 对话测试</h2><p class="section-sub" style="margin:0;">使用配置页中的 AI 密钥与模型；发送前会先保存当前配置。对话历史仅保留在本页浏览器内存中。「获取简报」按监控同款逻辑拉取 OKX 盘面并生成 [简报]（不推送微信）。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="aiChatClearBtn">清空对话</button><button class="button action-control btn-test" type="button" id="aiChatBriefBtn">获取简报</button><button class="button action-control btn-test" type="button" id="aiChatPingBtn">连通性测试</button></div></div><div class="ai-chat-window" id="aiChatWindow"><div class="ai-chat-empty">输入下方消息开始与 AI 对话。可先点「连通性测试」验证配置是否可用。</div></div><div class="ai-chat-compose"><textarea id="aiChatInput" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea><button class="button action-control btn-test" type="button" id="aiChatSendBtn">发送</button></div></section><section class="card toolbar-card"><div><h2>微信推送测试</h2><p class="section-sub">测试 Server酱 推送是否可用。点击后会先保存配置页中的密钥，再发送与真实监控相同结构的格式预览（模拟 AI 全字段示例）。</p></div><div class="toolbar-right"><button class="button action-control btn-test" type="button" id="testPushBtn">测试微信推送</button></div></section><div id="connectivityTestNotice" class="notice" hidden></div><section class="card accuracy-card"><div class="toolbar-card" style="margin:0 0 12px;box-shadow:none;padding:0;background:transparent;border:none;align-items:flex-start;"><div><h2 style="margin:0 0 6px;">实时预测压测</h2><p class="section-sub" style="margin:0;">顶部<strong>分析次数、AI调用次数、Token总消耗</strong>按当前币种、范围和保留时长统计。模拟账户按 final_direction 从 $10,000 满仓跟单（方向变才换仓）；绿线为权益曲线。下方为分层预测准确度；<strong>AI前瞻命中率</strong>按每条 <code>forward_view</code> 的 horizon 独立验证。回放会话在价线上方标记<strong>应推送</strong>。<strong>默认关闭</strong>以节省资源，需要时再打开。</p></div><div class="toolbar-right" style="align-items:center;gap:10px;flex-shrink:0;"><span class="section-sub" id="accuracyEnableLabel" style="margin:0;white-space:nowrap;">压测已关闭</span><label class="switch" title="启用后才会读取分析日志并自动刷新压测图表"><input type="checkbox" id="accuracyEnableToggle"><span></span></label></div></div><p class="accuracy-note accuracy-off-hint" id="accuracyOffHint">压测已关闭。打开右上角开关后将读取分析日志并自动刷新图表。</p><div id="accuracyPanelBody" hidden><div class="accuracy-controls"><select id="accuracyInst">{accuracy_inst_options}</select>{accuracy_horizon_select_html}<select id="accuracyScope"><option value="session">本次启动后</option><option value="replay">回放会话</option><option value="all">全部历史日志</option></select><select id="accuracyRetentionHours" title="结合配置页轮询间隔计算图表最多保留多少点"><option value="1">保留1小时</option><option value="2">保留2小时</option><option value="4">保留4小时</option><option value="8">保留8小时</option><option value="12" selected>保留12小时</option><option value="24">保留24小时</option><option value="48">保留48小时</option></select><button class="btn-test" type="button" id="accuracyRefreshBtn">刷新压测</button><button class="btn-save" type="button" id="accuracyExportBtn">导出图表</button><button class="btn-save" type="button" id="accuracyImportBtn">导入图表</button><button class="btn-test" type="button" id="accuracyLiveBtn" style="display:none">返回实时</button><input type="file" id="accuracyImportInput" accept=".json,application/json" hidden></div><div class="accuracy-summary" id="accuracySummary"><div class="accuracy-primary"><span>分析次数</span><b>--</b></div><div class="accuracy-primary"><span>AI调用次数</span><b>--</b></div><div class="accuracy-primary"><span>Token总消耗</span><b>--</b></div></div><div class="accuracy-canvas-wrap"><canvas id="accuracyChart"></canvas><div class="accuracy-point-panel" id="accuracyPointPanel" hidden></div></div><p class="accuracy-note" id="accuracyNote">综合准确度用上方验证窗口；AI前瞻命中率用每条 forward_view 的 horizon（通常 15m）。观望：后续波动未超阈值即合理。交易：验证窗内价格朝做多/做空方向走即方向命中。</p></div></section><section class="card"><h2>历史回放生成</h2><p class="section-sub">从 OKX 拉取指定时间段的历史 K 线，并附带 OI / 资金费率 / 多空比，生成 <code>replay_dataset_historical.jsonl</code>。盘口为占位，盘口失衡类信号不会触发。合约默认与上方压测区所选一致。</p><div class="field"><label>开始时间</label><div><input type="datetime-local" id="replayBuildStart"><p>本地时间，建议不超过 48 小时跨度。</p></div></div><div class="field"><label>结束时间</label><div><input type="datetime-local" id="replayBuildEnd"></div></div><div class="field"><label>帧步长(秒)</label><div><input type="number" id="replayBuildStep" value="60" min="5" max="3600" step="1"><p>与策略轮询间隔接近即可（swing 建议 60，short/scalp 建议 5）。</p></div></div><div class="field"><label>操作</label><div><div class="toolbar-right" style="justify-content:flex-start;gap:8px;"><button class="button action-control btn-save" type="button" id="replayBuildBtn">生成回放数据</button></div><p class="accuracy-note" id="replayBuildStatus">尚未生成</p></div></div></section><section class="card"><h2>离线回放压测</h2><p class="section-sub">配置页勾选「录制回放数据集」并运行监控，每轮原始输入写入 {esc(REPLAY_DATASET_FILE)}；停止监控后点击下方「开始回放」。回放按配置启用 AI 与微信推送（未开推送则只写日志），结论写入 {esc(REPLAY_ANALYSIS_LOG_FILE)} 的 <code>push_analysis</code> 与 <code>analysis</code> 字段，便于同一数据集多次回放对比；再选上方「回放会话」查看压测曲线。</p><div class="replay-status" id="replayDatasetInfo">正在加载数据集状态...</div><div class="field"><label>回放间隔(秒)</label><div><input type="number" id="replayInterval" value="0" min="0" max="120" step="0.1"><p>0 表示尽快跑完；大于 0 可在回放过程中观察压测曲线刷新。</p></div></div><div class="field"><label>控制</label><div><div class="toolbar-right" style="justify-content:flex-start;gap:8px;"><button class="btn-test" type="button" id="replayStartBtn">开始回放</button><button class="btn-danger action-control" type="button" id="replayStopBtn">停止回放</button><button class="button btn-log" type="button" id="replayRefreshBtn">刷新状态</button></div><p id="replayStatusText">等待加载...</p></div></div></section></div>
 	{help_manual_html(config)}
 	{design_docs_html()}
 	</main></div></div>
@@ -5150,19 +5341,30 @@ if (factoryResetBtn) {{
     }}
   }});
 }}
-	function renderReplayDatasetInfo(info){{const box=document.getElementById('replayDatasetInfo');if(!box)return;const lines=[];lines.push('数据集: '+(info.exists?info.frame_count+' 帧 · '+((info.inst_ids||[]).join(', ')||'--'):'尚未录制'));if(info.exists){{lines.push('路径: '+(info.path||'--'));if(info.recorded_at)lines.push('录制 meta: '+info.recorded_at);if(info.interval_seconds)lines.push('录制间隔: '+info.interval_seconds+' 秒');}}if(info.replay_running&&info.analysis_log_bytes)lines.push('回放日志: 约 '+Math.max(1,Math.round(info.analysis_log_bytes/1024))+' KB');else if(info.analysis_log_lines)lines.push('上次回放分析日志: '+info.analysis_log_lines+' 行');const aiLabel=info.ai_enabled?(info.dry_run_ai?'AI: 干跑(不调接口)':'AI: 已启用'):'AI: 未启用';const pushLabel=info.push_enabled?'微信: 已启用':'微信: 未启用(仅日志)';lines.push(aiLabel+' · '+pushLabel+' · 录制开关: '+(info.record_enabled?'已勾选':'未勾选')+' · 监控: '+(info.monitor_running?'运行中':'未运行'));box.textContent=lines.join('\\n');}}
+	let replayBuildTimer=null;
+	function toDatetimeLocalValue(date){{const pad=n=>String(n).padStart(2,'0');return date.getFullYear()+'-'+pad(date.getMonth()+1)+'-'+pad(date.getDate())+'T'+pad(date.getHours())+':'+pad(date.getMinutes());}}
+	function initReplayBuildDefaults(){{const startEl=document.getElementById('replayBuildStart'),endEl=document.getElementById('replayBuildEnd'),stepEl=document.getElementById('replayBuildStep');if(!startEl||!endEl)return;if(!startEl.value||!endEl.value){{const end=new Date();end.setMinutes(0,0,0);const start=new Date(end.getTime()-6*3600*1000);startEl.value=toDatetimeLocalValue(start);endEl.value=toDatetimeLocalValue(end);}}if(stepEl&&!stepEl.value){{const mapped=Number(STRATEGY_INTERVAL_SECONDS[currentStrategyMode()]);stepEl.value=String(Number.isFinite(mapped)&&mapped>=5?mapped:60);}}}}
+	function renderReplayBuildStatus(st){{const box=document.getElementById('replayBuildStatus');if(!box)return;st=st||{{}};if(st.running){{const total=Number(st.total)||0,current=Number(st.current)||0,prefix=total>0?(current+'/'+total+' · '):'';box.textContent=prefix+(st.message||'生成中...');return;}}if(st.error){{box.textContent='生成失败：'+st.error;return;}}if(st.result&&st.result.frame_count){{box.textContent='已生成 '+st.result.frame_count+' 帧 · '+st.result.range_start+' ~ '+st.result.range_end;return;}}const hist=st.historical_dataset||{{}};box.textContent=hist.exists?('上次生成 '+hist.frame_count+' 帧 · '+hist.path):'尚未生成';}}
+	function stopReplayBuildPoll(){{if(replayBuildTimer){{clearInterval(replayBuildTimer);replayBuildTimer=null;}}}}
+	function startReplayBuildPoll(){{stopReplayBuildPoll();replayBuildTimer=setInterval(async function(){{if(currentPage()!=='tests')return;try{{const p=await fetch('/api/replay-build-status',{{cache:'no-store'}}).then(r=>r.json());if(!p.ok&&p.error)throw new Error(p.error);renderReplayBuildStatus(p);if(!p.running){{stopReplayBuildPoll();await refreshReplayInfo({{lite:false}});if(p.error)alert('历史回放生成失败：'+p.error);else if(p.result&&p.result.frame_count)alert('历史回放已生成 '+p.result.frame_count+' 帧');}}}}catch(e){{const box=document.getElementById('replayBuildStatus');if(box)box.textContent='生成状态加载失败：'+e;stopReplayBuildPoll();}}}},2000);}}
+	async function buildHistoricalReplay(){{const btn=document.getElementById('replayBuildBtn'),statusEl=document.getElementById('replayBuildStatus');initReplayBuildDefaults();const startEl=document.getElementById('replayBuildStart'),endEl=document.getElementById('replayBuildEnd'),stepEl=document.getElementById('replayBuildStep');if(!startEl||!endEl||!startEl.value||!endEl.value){{alert('请填写开始与结束时间');return;}}if(btn)btn.disabled=true;if(statusEl)statusEl.textContent='正在提交生成任务...';try{{const instEl=document.getElementById('accuracyInst');const payload={{inst_id:instEl&&instEl.value?instEl.value:'ETH-USDT-SWAP',start_time:startEl.value,end_time:endEl.value,step_seconds:Number(stepEl&&stepEl.value)||configuredMonitorInterval()}};const r=await fetch('/api/replay-build-historical',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload),cache:'no-store'}});const p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||p.message||'提交失败');renderReplayBuildStatus(p);startReplayBuildPoll();}}catch(e){{if(statusEl)statusEl.textContent='提交失败：'+e;alert('生成回放数据失败：'+e);}}finally{{if(btn)btn.disabled=false;}}}}
+	function renderReplayDatasetInfo(info){{const box=document.getElementById('replayDatasetInfo');if(!box)return;const lines=[];const hist=info.historical_dataset||{{}};lines.push('录制数据集: '+(info.exists?info.frame_count+' 帧 · '+((info.inst_ids||[]).join(', ')||'--'):'尚未录制'));if(info.exists){{lines.push('录制路径: '+(info.path||'--'));if(info.recorded_at)lines.push('录制 meta: '+info.recorded_at);if(info.interval_seconds)lines.push('录制间隔: '+info.interval_seconds+' 秒');}}lines.push('历史数据集: '+(hist.exists?hist.frame_count+' 帧 · '+((hist.inst_ids||[]).join(', ')||'--'):'尚未生成'));if(hist.exists)lines.push('历史路径: '+(hist.path||info.historical_dataset_path||'--'));if(info.replay_running&&info.analysis_log_bytes)lines.push('回放日志: 约 '+Math.max(1,Math.round(info.analysis_log_bytes/1024))+' KB');else if(info.analysis_log_lines)lines.push('上次回放分析日志: '+info.analysis_log_lines+' 行');const aiLabel=info.ai_enabled?(info.dry_run_ai?'AI: 干跑(不调接口)':'AI: 已启用'):'AI: 未启用';const pushLabel=info.push_enabled?'微信: 已启用':'微信: 未启用(仅日志)';lines.push(aiLabel+' · '+pushLabel+' · 录制开关: '+(info.record_enabled?'已勾选':'未勾选')+' · 监控: '+(info.monitor_running?'运行中':'未运行'));box.textContent=lines.join('\\n');const histToggle=document.getElementById('replayUseHistoricalDataset');if(histToggle&&!histToggle.dataset.userSet&&hist.exists)histToggle.checked=true;renderReplayBuildStatus(info.build_status||{{}});}}
 	function renderReplayStatus(info){{const text=document.getElementById('replayStatusText');if(!text)return;const st=info&&info.replay_status?info.replay_status:{{}};let msg=(st.text||'--')+(st.started_at?' · 开始 '+st.started_at:'')+(st.elapsed_seconds!=null?' · 已运行 '+st.elapsed_seconds+' 秒':'');if(info&&info.replay_running&&info.analysis_log_bytes)msg+=' · 日志约 '+Math.max(1,Math.round(info.analysis_log_bytes/1024))+' KB';else if(!info.replay_running&&info.analysis_log_lines)msg+=' · 分析日志 '+info.analysis_log_lines+' 行';text.textContent=msg;}}
 	function setReplayStartButtonState(mode){{const btn=document.getElementById('replayStartBtn');if(!btn)return;if(mode==='running'){{btn.disabled=false;btn.textContent='回放中...';btn.classList.add('is-starting');}}else if(mode==='starting'){{btn.disabled=true;btn.textContent='启动中...';btn.classList.add('is-starting');}}else{{btn.disabled=false;btn.textContent='开始回放';btn.classList.remove('is-starting');}}}}
-	async function refreshReplayInfo(options){{options=options||{{}};const lite=options.lite!==false;try{{const url='/api/replay-dataset'+(lite?'?lite=1':'');const r=await fetch(url,{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'加载失败');renderReplayDatasetInfo(p);renderReplayStatus(p);if(!lite&&syncAccuracyScopeWithReplay(p)&&isAccuracyEnabled())fetchAccuracy({{resetView:true}});if(!lite&&p.replay_running)startReplayProgress();return p;}}catch(e){{const box=document.getElementById('replayDatasetInfo');if(box)box.textContent='加载回放状态失败：'+e;renderReplayStatus({{replay_status:{{text:String(e)}}}});return null;}}}}
+	async function refreshReplayInfo(options){{options=options||{{}};const lite=options.lite!==false;try{{const url='/api/replay-dataset'+(lite?'?lite=1':'');const r=await fetch(url,{{cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||'加载失败');renderReplayDatasetInfo(p);renderReplayStatus(p);if(p.build_status&&p.build_status.running)startReplayBuildPoll();if(!lite&&syncAccuracyScopeWithReplay(p)&&isAccuracyEnabled())fetchAccuracy({{resetView:true}});if(!lite&&p.replay_running)startReplayProgress();return p;}}catch(e){{const box=document.getElementById('replayDatasetInfo');if(box)box.textContent='加载回放状态失败：'+e;renderReplayStatus({{replay_status:{{text:String(e)}}}});return null;}}}}
 	let replayProgressTimer=null,replayFinishedNotified=false,fetchAccuracyInFlight=null;
 	function stopReplayProgress(){{stopReplayAccuracyPoll();if(replayProgressTimer){{clearInterval(replayProgressTimer);replayProgressTimer=null;}}}}
 	function startReplayProgress(){{stopReplayProgress();replayFinishedNotified=false;switchAccuracyToReplaySession();replayProgressTimer=setInterval(async function(){{if(currentPage()!=='tests')return;const info=await refreshReplayInfo({{lite:true}});if(!info)return;setReplayStartButtonState(info.replay_running?'running':'idle');if(info.replay_running){{if(isAccuracyEnabled())fetchAccuracy({{resetView:false}});return;}}stopReplayProgress();if(isAccuracyEnabled())fetchAccuracy({{resetView:true}});if(!replayFinishedNotified){{replayFinishedNotified=true;const full=await refreshReplayInfo({{lite:false}});const lines=(full&&full.analysis_log_lines!=null)?full.analysis_log_lines:(info.analysis_log_lines!=null?info.analysis_log_lines:'--');alert('回放完成 · 分析日志 '+lines+' 行 · 上方压测已切到「回放会话」');}}}},2500);}}
-	async function startReplayRun(){{const intervalEl=document.getElementById('replayInterval'),interval=Number(intervalEl&&intervalEl.value),statusEl=document.getElementById('replayStatusText');setReplayStartButtonState('starting');if(statusEl)statusEl.textContent='正在启动回放，请稍候...';try{{const r=await fetch('/api/replay-start',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{interval:Number.isFinite(interval)?interval:0}}),cache:'no-store'}});let p=null;const ct=(r.headers.get('content-type')||'').toLowerCase();if(ct.includes('application/json')){{p=await r.json();}}else{{throw new Error('服务器返回异常页面（HTTP '+r.status+'），请刷新并重新登录后再试');}}if(!r.ok||p.ok===false)throw new Error(p.error||p.message||'启动失败');renderReplayDatasetInfo(p);renderReplayStatus(p);if(statusEl)statusEl.textContent=p.message||'回放已启动';setReplayStartButtonState('running');setAccuracyEnabled(true,{{fetchNow:true}});startReplayProgress();}}catch(e){{setReplayStartButtonState('idle');if(statusEl)statusEl.textContent='启动失败：'+e;alert('启动回放失败：'+e);}}}}
+	async function startReplayRun(){{const intervalEl=document.getElementById('replayInterval'),interval=Number(intervalEl&&intervalEl.value),statusEl=document.getElementById('replayStatusText');setReplayStartButtonState('starting');if(statusEl)statusEl.textContent='正在启动回放，请稍候...';try{{const r=await fetch('/api/replay-start',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{interval:Number.isFinite(interval)?interval:0,dataset:(document.getElementById('replayUseHistoricalDataset')&&document.getElementById('replayUseHistoricalDataset').checked)?'historical':'recorded'}}),cache:'no-store'}});let p=null;const ct=(r.headers.get('content-type')||'').toLowerCase();if(ct.includes('application/json')){{p=await r.json();}}else{{throw new Error('服务器返回异常页面（HTTP '+r.status+'），请刷新并重新登录后再试');}}if(!r.ok||p.ok===false)throw new Error(p.error||p.message||'启动失败');renderReplayDatasetInfo(p);renderReplayStatus(p);if(statusEl)statusEl.textContent=p.message||'回放已启动';setReplayStartButtonState('running');setAccuracyEnabled(true,{{fetchNow:true}});startReplayProgress();}}catch(e){{setReplayStartButtonState('idle');if(statusEl)statusEl.textContent='启动失败：'+e;alert('启动回放失败：'+e);}}}}
 	async function stopReplayRun(){{const btn=document.getElementById('replayStopBtn');if(btn)btn.disabled=true;try{{const r=await fetch('/api/replay-stop',{{method:'POST',cache:'no-store'}}),p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||p.message||'停止失败');stopReplayProgress();setReplayStartButtonState('idle');await refreshReplayInfo({{lite:false}});if(isAccuracyEnabled())fetchAccuracy({{resetView:true}});alert(p.message||'回放已停止');}}catch(e){{alert('停止回放失败：'+e);}}finally{{if(btn)btn.disabled=false;}}}}
 	const replayStartBtn=document.getElementById('replayStartBtn'),replayStopBtn=document.getElementById('replayStopBtn'),replayRefreshBtn=document.getElementById('replayRefreshBtn');
 	if(replayStartBtn)replayStartBtn.addEventListener('click',startReplayRun);
 	if(replayStopBtn)replayStopBtn.addEventListener('click',stopReplayRun);
 	if(replayRefreshBtn)replayRefreshBtn.addEventListener('click',refreshReplayInfo);
+	const replayBuildBtn=document.getElementById('replayBuildBtn'),replayUseHistorical=document.getElementById('replayUseHistoricalDataset');
+	if(replayBuildBtn)replayBuildBtn.addEventListener('click',buildHistoricalReplay);
+	if(replayUseHistorical)replayUseHistorical.addEventListener('change',function(){{replayUseHistorical.dataset.userSet='1';}});
+	initReplayBuildDefaults();
 	const accuracyRefreshBtn=document.getElementById('accuracyRefreshBtn');
 	const ACCURACY_ENABLE_KEY='okx_accuracy_enabled';
 	function isAccuracyEnabled(){{const el=document.getElementById('accuracyEnableToggle');return!!(el&&el.checked);}}
@@ -5336,7 +5538,7 @@ initSnapshotPanelToggle();
 bindMonitorTabs();
 bindMonitorBarTabs();
 const monitorToggleBtn=document.getElementById('monitorToggleBtn');
-if(monitorToggleBtn){{monitorToggleBtn.addEventListener('click',async()=>{{const status=await syncMonitorStatus();if(status&&status.running){{setMonitorButtonState('stopping','正在停止监控进程...');try{{await fetch('/stop#monitor',{{cache:'no-store'}});}}catch(e){{}}await syncMonitorStatus();monitorLiveMode=false;monitorViewStart=0;monitorViewEnd=1;monitorYZoom=1;monitorYPan=0;monitorSeriesByInst[monitorInst]=[];setMonitorButtonState('stopped','监控已停止，当前显示虚拟行情');if(isMonitorChartEnabled())drawVirtualMonitor();else showMonitorChartOffState();return;}}if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}setMonitorButtonState('starting','正在保存配置并启动监控...');monitorYPan=0;if(isMonitorChartEnabled())showRealtimeWaiting(true);try{{await autoSaveConfig();await fetch('/start#monitor',{{cache:'no-store'}});await syncMonitorStatus();switchAccuracyToLiveSession();if(isMonitorChartEnabled())bootstrapMonitorChart();}}catch(e){{setMonitorButtonState('stopped','启动监控失败');const l=document.getElementById('monitorLoading');if(l)l.textContent='启动监控失败：'+e;}}}});}}
+if(monitorToggleBtn){{monitorToggleBtn.addEventListener('click',async()=>{{const status=await syncMonitorStatus();if(status&&status.running){{setMonitorButtonState('stopping','正在停止监控进程...');try{{const response=await fetch('/api/monitor-stop',{{method:'POST',cache:'no-store'}});const payload=await response.json();if(!response.ok||payload.ok===false)throw new Error(payload.error||payload.message||'停止失败');}}catch(e){{setMonitorButtonState('running','停止失败：'+e);return;}}await syncMonitorStatus();monitorLiveMode=false;monitorViewStart=0;monitorViewEnd=1;monitorYZoom=1;monitorYPan=0;monitorSeriesByInst[monitorInst]=[];setMonitorButtonState('stopped','监控已停止，当前显示虚拟行情');if(isMonitorChartEnabled())drawVirtualMonitor();else showMonitorChartOffState();return;}}if(!monitorInst){{clearChartMessage('请先在配置页选择监控币种');return;}}setMonitorButtonState('starting','正在保存配置并启动监控...');monitorYPan=0;if(isMonitorChartEnabled())showRealtimeWaiting(true);try{{await autoSaveConfig();const response=await fetch('/api/monitor-start',{{method:'POST',cache:'no-store'}});const payload=await response.json();if(!response.ok||payload.ok===false)throw new Error(payload.error||payload.message||'启动失败');await syncMonitorStatus();switchAccuracyToLiveSession();if(isMonitorChartEnabled())bootstrapMonitorChart();}}catch(e){{setMonitorButtonState('stopped','启动监控失败');const l=document.getElementById('monitorLoading');if(l)l.textContent='启动监控失败：'+e;}}}});}}
 let logCleared=false,consoleLogCleared=false;
 const LOGS_DISPLAY_KEY='okx_logs_display_enabled';
 function isLogsDisplayEnabled(){{const el=document.getElementById('logsDisplayToggle');return!!(el&&el.checked);}}
@@ -5652,9 +5854,9 @@ if (saveConsoleLogBtn) {{
 const monitorCanvas=document.getElementById('monitorChart');
 if(monitorCanvas){{monitorCanvas.addEventListener('wheel',function(event){{event.preventDefault();const rect=monitorCanvas.getBoundingClientRect(),focus=Math.min(1,Math.max(0,(event.clientX-rect.left)/Math.max(1,rect.width))),span=monitorViewEnd-monitorViewStart,zoom=(event.deltaY<0?0.82:1.22),newSpan=Math.min(1,Math.max(.06,span*zoom)),center=monitorViewStart+span*focus;let ns=center-newSpan*focus,ne=ns+newSpan;if(ns<0){{ne-=ns;ns=0;}}if(ne>1){{ns-=ne-1;ne=1;}}monitorViewStart=Math.max(0,ns);monitorViewEnd=Math.min(1,ne);monitorYZoom=Math.max(.45,Math.min(10,monitorYZoom*(event.deltaY<0?1.14:.88)));redrawMonitorCached();}},{{passive:false}});monitorCanvas.addEventListener('mousedown',function(event){{monitorDrag={{x:event.clientX,y:event.clientY,start:monitorViewStart,end:monitorViewEnd,yPan:monitorYPan,yRange:monitorYRange,moved:false}};monitorCanvas.classList.add('dragging');}});window.addEventListener('mousemove',function(event){{if(!monitorDrag)return;const rect=monitorCanvas.getBoundingClientRect(),span=monitorDrag.end-monitorDrag.start,dx=(event.clientX-monitorDrag.x)/Math.max(1,rect.width),dy=(event.clientY-monitorDrag.y)/Math.max(1,rect.height);if(Math.abs(event.clientX-monitorDrag.x)>3||Math.abs(event.clientY-monitorDrag.y)>3)monitorDrag.moved=true;let ns=monitorDrag.start-dx*span,ne=monitorDrag.end-dx*span;if(ns<0){{ne-=ns;ns=0;}}if(ne>1){{ns-=ne-1;ne=1;}}monitorViewStart=Math.max(0,ns);monitorViewEnd=Math.min(1,ne);monitorYPan=monitorDrag.yPan+dy*Math.max(.01,monitorDrag.yRange||monitorYRange);redrawMonitorCached();}});window.addEventListener('mouseup',function(){{if(monitorDrag){{setTimeout(function(){{monitorDrag=null;}},0);}}monitorCanvas.classList.remove('dragging');}});function selectNearestPoint(event,strict){{if(!monitorPlotPoints.length)return;const rect=monitorCanvas.getBoundingClientRect(),x=event.clientX-rect.left,y=event.clientY-rect.top;let best=null,bestDist=Infinity;monitorPlotPoints.forEach(o=>{{const dx=o.x-x,dy=o.y-y,dist=Math.sqrt(dx*dx+dy*dy);if(dist<bestDist){{best=o;bestDist=dist;}}}});if(best&&bestDist<(strict?42:34)){{monitorSelectedKey=best.point.time||'';redrawMonitorCached();}}else if(!strict){{monitorSelectedKey='';redrawMonitorCached();}}}}monitorCanvas.addEventListener('click',function(event){{if(monitorDrag&&monitorDrag.moved)return;selectNearestPoint(event,false);}});monitorCanvas.addEventListener('dblclick',function(event){{selectNearestPoint(event,true);}});}}
 window.addEventListener('resize',()=>{{if(currentPage()==='monitor'&&isMonitorChartEnabled())redrawMonitorCached();else if(currentPage()==='tests')redrawAccuracyChart();}});
-setInterval(async()=>{{if(document.hidden||currentPage()!=='monitor')return;const status=await syncMonitorStatus();if(!isMonitorChartEnabled())return;if(status&&status.running){{monitorLiveMode=true;const now=Date.now();if(now-monitorLastTickerAt>=5000){{monitorLastTickerAt=now;fetchMonitor();}}}}else{{monitorLiveMode=false;drawVirtualMonitor();}}}},1000);
-setInterval(()=>{{if(document.hidden||currentPage()!=='tests')return;if(replayProgressTimer)return;if(!isAccuracyEnabled())return;refreshReplayInfo().then(function(){{fetchAccuracy({{resetView:false}});}});}},3000);
-setInterval(()=>{{if(document.hidden||currentPage()!=='logs')return;if(!isLogsDisplayEnabled())return;refreshLogs(false);refreshConsoleLogs(false);}},3000);window.addEventListener('hashchange',()=>showPage(currentPage()));
+setInterval(async()=>{{if(document.hidden||currentPage()!=='monitor')return;const status=await syncMonitorStatus();if(!isMonitorChartEnabled())return;if(status&&status.running){{monitorLiveMode=true;const now=Date.now();if(now-monitorLastTickerAt>=5000){{monitorLastTickerAt=now;fetchMonitor();}}}}else{{monitorLiveMode=false;drawVirtualMonitor();}}}},2000);
+setInterval(()=>{{if(document.hidden||currentPage()!=='tests')return;if(replayProgressTimer)return;if(!isAccuracyEnabled())return;refreshReplayInfo().then(function(){{fetchAccuracy({{resetView:false}});}});}},5000);
+setInterval(()=>{{if(document.hidden||currentPage()!=='logs')return;if(!isLogsDisplayEnabled())return;refreshLogs(false);refreshConsoleLogs(false);}},5000);window.addEventListener('hashchange',()=>showPage(currentPage()));
 function closePowerMenu(){{const menu=document.getElementById('powerMenu'),btn=document.getElementById('powerMenuBtn');if(menu)menu.hidden=true;if(btn)btn.setAttribute('aria-expanded','false');}}
 function togglePowerMenu(){{const menu=document.getElementById('powerMenu'),btn=document.getElementById('powerMenuBtn');if(!menu||!btn)return;const next=menu.hidden;menu.hidden=!next;btn.setAttribute('aria-expanded',next?'true':'false');}}
 function showPowerOverlay(message){{const overlay=document.createElement('div');overlay.className='power-overlay';overlay.id='powerOverlay';overlay.textContent=message||'正在处理…';document.body.appendChild(overlay);return overlay;}}
@@ -5893,6 +6095,8 @@ class Handler(BaseHTTPRequestHandler):
                 "default_path": str(MONITOR_PROCESS_LOG_FILE),
                 "start_at": MONITOR_LOG_START_AT,
             })
+        elif path == "/api/replay-build-status":
+            self.send_json({"ok": True, **replay_build_status_snapshot()})
         elif path == "/api/replay-dataset":
             params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             lite = params.get("lite", ["0"])[0] in ("1", "true", "yes")
@@ -5958,9 +6162,11 @@ class Handler(BaseHTTPRequestHandler):
             content = f"<pre>{esc(active_config_file().read_text(encoding='utf-8-sig'))}</pre>".encode("utf-8")
             self.send_html(content)
         elif path == "/start":
-            self.send_html(render_page(start_monitor()))
+            start_monitor()
+            self.redirect("/#monitor")
         elif path == "/stop":
-            self.send_html(render_page(stop_monitor()))
+            stop_monitor()
+            self.redirect("/#monitor")
         elif path == "/test-ai":
             result = test_ai_connection()
             self.send_html(render_page(result["message"]))
@@ -6113,11 +6319,20 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=400)
             return
+        if path == "/api/replay-build-historical":
+            try:
+                payload = json.loads(raw or "{}")
+                result = start_historical_replay_build(payload)
+                self.send_json(result, status=200 if result.get("ok") else 400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
         if path == "/api/replay-start":
             try:
                 payload = json.loads(raw or "{}")
                 replay_interval = float(payload.get("interval", 0))
-                message = start_replay(replay_interval)
+                dataset_path = resolve_replay_dataset_path(str(payload.get("dataset", "recorded")))
+                message = start_replay(replay_interval, dataset_path)
                 ok = "已启动" in message
                 body = {"ok": ok, "message": message, **replay_dataset_info(lite=True)}
                 if not ok:
@@ -6125,6 +6340,24 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(body, status=200 if ok else 400)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        if path == "/api/monitor-start":
+            if not self.require_auth(path):
+                return
+            try:
+                payload = monitor_start_payload()
+                self.send_json(payload, status=200 if payload.get("ok") else 400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if path == "/api/monitor-stop":
+            if not self.require_auth(path):
+                return
+            try:
+                payload = monitor_stop_payload()
+                self.send_json(payload, status=200 if payload.get("ok") else 400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
             return
         if path == "/api/replay-stop":
             try:
