@@ -36,14 +36,18 @@ class ConfigAlignmentTests(unittest.TestCase):
         visible = visible_config_keys()
         payload = {key: fresh[key] for key in visible if key in fresh}
         again = normalize_config(payload)
-        self.assertEqual(again["push_score"], 70)
-        self.assertEqual(again["short_push_score"], 68)
+        self.assertEqual(again["push_score"], 65)
+        self.assertEqual(again["short_push_score"], 65)
         self.assertEqual(again["strategy_mode"], "swing")
         self.assertEqual(again["risk_preference"], "aggressive")
         self.assertEqual(again["interval"], 60)
         self.assertEqual(again.get("custom_inst_ids"), [])
         self.assertEqual(again["inst_ids"], ["ETH-USDT-SWAP"])
-        self.assertEqual(again["ai_periodic_interval_minutes"], 10)
+        self.assertEqual(again["ai_periodic_interval_minutes"], 30)
+        self.assertTrue(again["ai_enabled"])
+        self.assertTrue(again["push_enabled"])
+        self.assertTrue(again["record_replay_enabled"])
+        self.assertEqual(again["wechat_silence_brief_minutes"], 120)
         self.assertFalse(config_value(again, "signal_watch_enabled"))
 
     def test_restart_detects_ai_periodic_interval_change(self):
@@ -61,12 +65,20 @@ class ConfigAlignmentTests(unittest.TestCase):
         after = {"push_score": 80, "paper_follow_ai_only": True}
         self.assertTrue(config_requires_monitor_restart(before, after))
 
-    def test_interval_follows_strategy_mode(self):
+    def test_interval_defaults_follow_strategy_mode(self):
         for mode, seconds in STRATEGY_DEFAULT_INTERVAL_SECONDS.items():
             synced = sync_strategy_bound_config({"strategy_mode": mode})
             self.assertEqual(synced["interval"], seconds)
-        swing = normalize_config({"strategy_mode": "swing", "interval": 5})
-        self.assertEqual(swing["interval"], 60)
+
+    def test_interval_respects_explicit_config(self):
+        swing = normalize_config({"strategy_mode": "swing", "interval": 300})
+        self.assertEqual(swing["interval"], 300)
+        clamped = normalize_config({"strategy_mode": "swing", "interval": 5})
+        self.assertEqual(clamped["interval"], 15)
+
+    def test_interval_without_explicit_uses_strategy_default(self):
+        fresh = normalize_config({"strategy_mode": "long"})
+        self.assertEqual(fresh["interval"], 180)
 
     def test_accuracy_horizon_follows_strategy_mode(self):
         for mode, seconds in STRATEGY_DEFAULT_ACCURACY_HORIZON_SECONDS.items():

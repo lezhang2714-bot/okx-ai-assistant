@@ -4,10 +4,6 @@ from __future__ import annotations
 # Each pipeline module is documented with five dimensions:
 # 职责 | 计算 | 指标含义 | 输出 | 后续用途
 
-_DOC_FRAME = """
-	<p class="section-sub">阅读方式：下文每个模块均按 <strong>职责 → 计算 → 指标含义 → 输出 → 后续用途</strong> 五维说明。源码 <code>okx_signal_monitor.py::_process_inst</code>；配置默认 <code>monitor_config_summary.MONITOR_BEHAVIOR_DEFAULTS</code>。</p>
-"""
-
 _DIM_CSS = """
 	<style>
 	.doc-dim{margin:14px 0 0;padding:12px 14px;border-left:3px solid #6366f1;background:#f8fafc;border-radius:0 10px 10px 0}
@@ -65,9 +61,8 @@ def render_design_docs_html() -> str:
     parts = [
         """
 	<div class="page-panel" data-page="design">
-	<section class="card toolbar-card"><div><h2>设计</h2>""",
-        _DOC_FRAME,
-        """</div><div class="toolbar-right"><a class="button btn-view" href="#help">返回操作手册</a></div></section>
+	<section class="card toolbar-card"><div><h2>设计</h2>
+	<p class="section-sub">架构、单轮链路与模块说明（职责·计算·指标·输出·用途）。操作步骤见「帮助」页。</p></div><div class="toolbar-right"><a class="button btn-view" href="#help">返回操作手册</a></div></section>
 	""",
         _DIM_CSS,
         """<div class="help-panel doc-panel">
@@ -168,7 +163,7 @@ def render_design_docs_html() -> str:
 
 		<div class="arch-row">
 			<div class="arch-box web"><strong>实时监控页</strong><small>K线、最新分析快照<br>进程与配置状态</small></div>
-			<div class="arch-box web"><strong>预测压测页</strong><small>蓝价格、紫预测、黄确认<br>绿模拟账户、命中率</small></div>
+			<div class="arch-box web"><strong>预测压测页</strong><small>价格曲线、模拟账户<br>命中率、应推送标记</small></div>
 			<div class="arch-box web"><strong>回放验证页</strong><small>同一数据重复运行<br>push_analysis 理论推送</small></div>
 			<div class="arch-box web"><strong>日志与诊断</strong><small>运行日志、诊断包<br>AI/微信连接测试</small></div>
 			<div class="arch-box web"><strong>设计文档</strong><small>monitor_design_docs.py<br>由 Web 动态渲染</small></div>
@@ -247,13 +242,9 @@ def render_design_docs_html() -> str:
 		<div class="arch-row">
 			<div class="arch-box store"><strong>log_result</strong><small>完整帧写入 JSONL<br>作为历史权威记录</small></div>
 			<div class="arch-arrow">→</div>
-			<div class="arch-box web"><strong>压测接口</strong><small>等待未来窗口成熟<br>验证方向与执行</small></div>
-			<div class="arch-arrow">→</div>
-			<div class="arch-box web"><strong>紫线</strong><small>AI forward 优先<br>否则 raw_direction</small></div>
-			<div class="arch-box web"><strong>黄线</strong><small>AI关=本地final<br>AI开=final_decision</small></div>
-			<div class="arch-box web"><strong>统计输出</strong><small>命中率、可靠性<br>理论推送、权益</small></div>
+			<div class="arch-box web"><strong>压测与诊断</strong><small>验证窗口成熟后统计<br>命中率、推送标记、诊断包</small></div>
 		</div>
-		<div class="arch-note">注意：紫线和黄线位于流程末端的“日志消费/压测展示层”，它们展示前面已经产生的方向，不反向参与当前轮评分或 AI 调用。AI 调用读取的是 score、signals 和 structure_forecast 原始字段，不读取图上的累计曲线。</div>
+		<div class="arch-note">压测与图表只读取已写入 JSONL 的历史结果，不参与当前轮评分或 AI 调用。</div>
 	</div>
 
 	<h4>图三：主要文件职责与依赖</h4>
@@ -268,235 +259,56 @@ def render_design_docs_html() -> str:
 	<tr><td><code>quality_tests/</code></td><td>指标、配置、决策和日志轮转回归测试</td><td>验证核心行为，不参与生产运行</td></tr>
 	</tbody></table>
 
-	<h3>0.5 从紫线、黄线到 AI 与微信的完整链路</h3>
-	<p>压测图里的紫线和黄线是本地分析阶段最直观的两个观察口径，但它们与“最终是否微信推送”之间还有多层状态转换。紫线回答<strong>“本轮较早预测哪一边”</strong>，黄线回答<strong>“本轮最终确认哪一边”</strong>；微信回答的是<strong>“经过 AI、复核、门槛和冷却后，这一轮是否值得打扰用户”</strong>。三者不能画等号。</p>
 
-	<table class="help-table"><thead><tr><th>阶段</th><th>主要字段</th><th>作用</th><th>是否直接决定微信</th></tr></thead><tbody>
-	<tr><td>紫线：预测方向</td><td><code>prediction_direction</code></td><td>AI 成功时优先取 <code>forward_view.direction</code>；否则取本地 <code>raw_direction</code>，再回退结构演变或最终方向</td><td>否，只说明较早方向倾向</td></tr>
-	<tr><td>黄线：确认方向</td><td><code>confirm_direction</code> / <code>final_direction</code></td><td>AI 关闭时取本地 <code>score.final_direction</code>；AI 开启时取合并并复核后的 <code>final_decision.direction</code></td><td>否，还缺推送类型、分数、冲突和冷却检查</td></tr>
-	<tr><td>AI 触发</td><td><code>local_trigger</code></td><td>把本地信号分为 L0–L3，决定本轮是否值得调用 AI</td><td>否，<code>should_call_ai=true</code> 只代表应调用</td></tr>
-	<tr><td>AI 前瞻</td><td><code>analysis.parsed.forward_view</code></td><td>独立阅读原始行情与中性指标，给出未来 horizon 的方向、概率、价位与失效条件</td><td>否，必须先校验、合并和复核</td></tr>
-	<tr><td>权威合并</td><td><code>final_decision</code></td><td>在 AI、未调用、调用失败三种场景中选出唯一对外结论</td><td>仍不直接发送，只形成候选</td></tr>
-	<tr><td>复核与内部门禁</td><td><code>post_audit</code> / <code>push_gate</code></td><td>检查短窗压力、scalp 冲突、direction_guard、结构演变对齐、置信度和类型开关</td><td>通过后成为 <code>would_push</code></td></tr>
-	<tr><td>微信门禁</td><td><code>push_analysis.tracks[]</code></td><td>再执行微信专用高门槛、候选竞争、同币种冷却和同类冷却</td><td>选中的唯一候选才会发送</td></tr>
+	<h3>0.5 从本地分析到微信推送</h3>
+	<p>每一轮监控先在本地完成行情采集、信号检测与八层评分，再按 L0–L3 决定是否调用 AI，合并为 <code>final_decision</code>，经 post-audit 与双轨推送门禁后，才可能发送微信。<strong>日志里的方向结论、压测图上的价格/模拟曲线、实际微信推送是三个不同层级</strong>，不能画等号。</p>
+
+	<table class="help-table"><thead><tr><th>阶段</th><th>主要字段</th><th>含义</th><th>是否直接决定微信</th></tr></thead><tbody>
+	<tr><td>本地预测</td><td><code>score.raw_direction</code></td><td>策略规则给出的较早多/空/观望倾向</td><td>否</td></tr>
+	<tr><td>本地确认</td><td><code>score.final_direction</code>、<code>final_trade_score</code></td><td>经 guard、入场质量与方向分门槛后的本地执行方向</td><td>否；AI 关闭且分数达门槛时才可能本地 trade</td></tr>
+	<tr><td>结构演变</td><td><code>score.structure_forecast</code></td><td>本地独立前瞻轨，可产生 forecast 推送候选</td><td>否，须单独过 forecast gate</td></tr>
+	<tr><td>AI 触发</td><td><code>local_trigger</code></td><td>L0–L3 与指纹去重，决定本轮是否调用 AI</td><td>否</td></tr>
+	<tr><td>AI 前瞻</td><td><code>analysis.parsed.forward_view</code></td><td>模型独立阅读行情事实，给出 horizon 内方向与概率</td><td>否，须校验、merge、post_audit</td></tr>
+	<tr><td>权威结论</td><td><code>final_decision</code></td><td>AI 成功 / 未调用 / 失败三种场景下的唯一对外方向与 recommendation</td><td>仍须过 push_gate 与微信门禁</td></tr>
+	<tr><td>推送分析</td><td><code>push_analysis</code></td><td>记录 would_push、阻断原因、候选轨道</td><td><code>would_push=true</code> 仍可能被冷却或缺少 SendKey 拦截</td></tr>
 	</tbody></table>
 
-	<div class="flow-chain"><span>紫线 raw/forward</span><span>黄线 local/final</span><span>L0–L3触发</span><span>AI前瞻</span><span>JSON校验</span><span>final_decision</span><span>post_audit</span><span>push_gate</span><span>微信门禁</span><span>Server酱</span></div>
+	<div class="flow-chain"><span>collect_snapshot</span><span>detect_signals</span><span>score_snapshot</span><span>evaluate_ai_trigger</span><span>analyze_with_ai</span><span>merge_final_decision</span><span>post_audit</span><span>push_gate</span><span>微信门禁</span><span>Server酱</span></div>
 
-	<h4>第 1 步：本地双轨先完成，不因启用 AI 而停止</h4>
-	<p>每轮仍先执行行情采集、指标画像、信号检测和 <code>score_snapshot</code>。因此启用 AI 后，本地 <code>raw_direction</code>、<code>score.final_direction</code>、入场计划、三种策略视图和 <code>structure_forecast</code> 仍会照常计算并写日志。AI 不会回头修改这些本地对象；它只在后面产生另一份 <code>analysis</code> 和对外 <code>final_decision</code>。</p>
+	<h4>0.5.1 启用 AI 时的权威来源</h4>
+	<table class="help-table"><thead><tr><th>场景</th><th><code>decision_source</code></th><th>对外方向</th></tr></thead><tbody>
+	<tr><td>AI 返回有效 JSON</td><td><code>ai</code></td><td>优先 <code>forward_view.direction</code>，经 post_audit 后写入 final_decision</td></tr>
+	<tr><td>AI 开启但本轮未调用</td><td><code>local_screening</code></td><td>保留 <code>score.final_direction</code>；trade 须达方向推送阈值 +5</td></tr>
+	<tr><td>AI 调用失败或 JSON 无效</td><td><code>local_fallback</code></td><td>回退本地 final，同一高门槛规则</td></tr>
+	<tr><td>AI 关闭</td><td><code>local_screening</code></td><td>完整本地模式；压测、模拟与推送均读本地 final</td></tr>
+	</tbody></table>
+
+	<h4>0.5.2 confirmed 与 forecast 双轨</h4>
 	<ul class="help-list">
-	<li><strong>本地 raw_direction：</strong>较灵敏的方向预测，是未经过 guard 与入场质量降级的候选。</li>
-	<li><strong>本地 score.final_direction：</strong>经过 guard、分数和入场质量确认后的本地执行方向。</li>
-	<li><strong>本地 structure_forecast：</strong>预测结构可能如何演变，是独立 forecast 轨，不直接覆盖 raw/final。</li>
+	<li><strong>confirmed</strong>：来自审计后的 <code>final_decision.push_recommendation</code>，类型可为 trade / spike / watch。</li>
+	<li><strong>forecast</strong>：来自本地 <code>structure_forecast</code>，表示结构演变概率达到提醒线，不等于已确认结构单。</li>
+	<li>两轨分别过 gate；微信层再提高门槛、按 trade → spike → forecast 选唯一候选，并执行同向冷却与同币种间隔。</li>
 	</ul>
 
-	<h4>第 1.1 步：紫线和黄线到底在什么时候“产生”</h4>
-	<div class="help-note"><strong>先说结论：</strong>业务主流程不会生成名为“紫线”或“黄线”的交易对象。主流程生成的是方向和分数字段并写入 JSONL；压测接口等未来验证窗口成熟后，再从日志中选择方向字段，最后由浏览器把方向累计画成紫线与黄线。因此应区分<strong>业务方向产生时刻</strong>和<strong>图表曲线生成时刻</strong>。</div>
-
-	<table class="help-table"><thead><tr><th>时刻</th><th>主流程动作</th><th>产生字段</th><th>与曲线的关系</th></tr></thead><tbody>
-	<tr><td>A. 本地评分阶段</td><td><code>score_snapshot</code></td><td><code>raw_direction</code>、<code>direction_score</code>、<code>raw_total_score</code>、<code>score.final_direction</code>、<code>final_trade_score</code></td><td>AI 关闭时，raw 是紫线来源，score.final 是黄线来源</td></tr>
-	<tr><td>B. AI 与审计阶段</td><td><code>analyze_with_ai → merge → post_audit</code></td><td><code>forward_view.direction</code>、<code>final_decision.direction</code></td><td>AI 成功时，forward 是紫线来源，审计后的 final_decision 是黄线来源</td></tr>
-	<tr><td>C. 日志阶段</td><td><code>log_result</code></td><td>同时保存 <code>score</code>、<code>analysis</code>、<code>final_decision</code></td><td>为以后还原两条线保留完整数据血缘</td></tr>
-	<tr><td>D. 压测验证阶段</td><td><code>read_accuracy_items / evaluate_realtime_advice</code></td><td><code>prediction_direction</code>、<code>confirm_direction</code></td><td>只有未来验证窗口成熟的日志帧才会成为图表点</td></tr>
-	<tr><td>E. 浏览器绘图阶段</td><td><code>drawAccuracyChart</code></td><td>紫/黄累计值</td><td>做多 +1、做空 −1、观望 0，逐点累加后绘制</td></tr>
-	</tbody></table>
-
-	<p>也就是说，某一轮本地分析在 02:00 已经产生 raw/final 方向，但如果压测窗口是 5 分钟，这个点通常要到 02:05 以后才会进入紫线、黄线。曲线出现得晚，不代表方向在 02:05 才产生。</p>
-
-	<h4>第 1.2 步：紫线究竟使用哪个方向</h4>
-	<p>压测接口调用 <code>prediction_direction_from_log_item</code>，按以下顺序选择一个<strong>方向字段</strong>作为紫线点：</p>
-	<table class="help-table"><thead><tr><th>优先级</th><th>条件</th><th>紫线方向</th><th><code>prediction_source</code></th></tr></thead><tbody>
-	<tr><td>1</td><td><code>decision_source=ai</code> 且存在合法 forward</td><td><code>final_decision.forward_view.direction</code></td><td><code>ai_forward</code></td></tr>
-	<tr><td>2</td><td>没有可用 AI forward</td><td><code>score.raw_direction</code></td><td><code>raw_direction</code></td></tr>
-	<tr><td>3</td><td>旧日志没有 raw，但结构演变 active</td><td><code>score.structure_forecast.direction</code></td><td><code>structure_forecast</code></td></tr>
-	<tr><td>4</td><td>以上字段都缺失</td><td><code>final_direction/direction</code></td><td><code>final_fallback</code></td></tr>
-	</tbody></table>
-	<p><strong>紫线没有专属分数。</strong>图上每个紫点只读取方向，并转换为 +1/−1/0。AI forward 的 <code>probability</code>、本地 <code>direction_score</code> 或 <code>raw_total_score</code> 都不会改变这个点上升或下降的幅度；无论 55 分还是 90 分，只要都是做多，该点都只增加 1。</p>
-
-	<h4>第 1.3 步：黄线究竟使用哪个方向</h4>
-	<p>黄线读取压测行的 <code>confirm_direction</code>，它来自 <code>effective_fields_from_log_item</code> 处理后的最终方向：</p>
-	<table class="help-table"><thead><tr><th>运行模式</th><th>黄线方向来源</th><th>实际含义</th></tr></thead><tbody>
-	<tr><td>日志明确 <code>ai_enabled=false</code></td><td><code>score.final_direction</code></td><td>纯本地确认结果，不允许外层 local_screening=观望 覆盖</td></tr>
-	<tr><td>AI 成功且 JSON 有效</td><td>审计后的 <code>final_decision.direction</code></td><td>通常是 AI forward 方向；L3 本地 scalp 覆盖时可能改成 scalp 方向</td></tr>
-	<tr><td>AI 开启但本轮未调用</td><td><code>final_decision.direction=score.final_direction</code></td><td>黄线继续显示本地确认方向；达到方向阈值 +5 才具备本地 trade 推送资格</td></tr>
-	<tr><td>AI 调用失败或 JSON 无效</td><td><code>final_decision.direction=score.final_direction</code></td><td>忽略失败 AI 内容，黄线回退本地确认方向，并使用同一高门槛推送规则</td></tr>
-	</tbody></table>
-	<p><strong>黄线也没有专属分数。</strong>它最终同样只把方向换算为 +1/−1/0。分数的作用发生在黄线方向被确定之前：决定本地方向是否降为观望、AI 是否值得调用、AI 置信度能否被接受、以及最终是否有推送资格。</p>
-
-	<h4>第 1.4 步：raw_direction 如何生成，又怎样参与评分</h4>
-	<p><code>raw_direction</code> 首先由当前策略自己的方向规则产生。它是一个<strong>分类结果</strong>，不是“最高分方向”：超短线主要读取 1m/3m/5m，短线主要读取 5m/15m 并参考 1H/4H，中线读取 1H/4H，长线读取 1D/1W。价格领先、趋势结构、动量、情绪及 prior_direction 等规则共同返回做多、做空或观望。</p>
-	<p>方向确定后，<code>_layer_scores</code> 才以这个方向为参照计算八层分。例如 raw=做多时，trend_up、买盘支持、量价同向会给多头候选加分；短窗压力向下、数据不足、距离 EMA20 太远会扣分。若 raw=做空，则同一批指标按空头一致性解释。</p>
-	<table class="help-table"><thead><tr><th>层</th><th>上限</th><th>回答的问题</th><th>是否进入 direction_score</th></tr></thead><tbody>
-	<tr><td>market_regime</td><td>12</td><td>当前市场形态是否支持 raw 方向</td><td>是</td></tr>
-	<tr><td>trend</td><td>16</td><td>EMA、ADX、结构与多周期趋势是否同向</td><td>是</td></tr>
-	<tr><td>momentum</td><td>12</td><td>RSI、MACD、KDJ、价格斜率是否支持延续</td><td>是</td></tr>
-	<tr><td>volume_price</td><td>12</td><td>量价、突破和成交量是否支持</td><td>是</td></tr>
-	<tr><td>derivatives</td><td>14</td><td>OI、费率、多空比是否支持</td><td>是</td></tr>
-	<tr><td>orderbook</td><td>8</td><td>盘口是否同向且价差可接受</td><td>是</td></tr>
-	<tr><td>entry_quality</td><td>14</td><td>现在追入是否合适</td><td>否，单独换算为 execution_score</td></tr>
-	<tr><td>risk_control</td><td>14</td><td>风险是否可控</td><td>否，单独换算为 risk_score</td></tr>
-	</tbody></table>
-
-	<p>方向强度计算为：</p>
-	<p><code>direction_score = (状态 + 趋势 + 动量 + 量价 + 衍生品 + 盘口) ÷ 74 × 100</code></p>
-	<p>另外两项先从 14 分制换成百分制：</p>
-	<p><code>execution_score = entry_quality_score ÷ 14 × 100</code><br>
-	<code>risk_score = risk_control_score ÷ 14 × 100</code></p>
-	<p>再得到综合观察分：</p>
-	<p><code>raw_total_score = direction_score × 65% + execution_score × 25% + risk_score × 10%</code></p>
-
-	<h4>第 1.5 步：哪个分数决定黄线从 raw 变成 final</h4>
-	<p>本地黄线方向的确认顺序是：</p>
-	<div class="flow-chain"><span>raw_direction</span><span>direction_guard</span><span>entry_plan.quality</span><span>direction_score门槛</span><span>score.final_direction</span></div>
-	<ol class="help-list">
-	<li>先令 <code>final_direction = raw_direction</code>。</li>
-	<li><code>direction_guard</code> 非空，立即降为观望。</li>
-	<li>按该方向生成入场计划，得到 <code>quality</code>：confirmed、wait_confirmation 或 no_trade 等。</li>
-	<li><code>_should_downgrade_direction</code> 检查质量与最低确认分。<strong>当前调用实际传入的是 direction_score</strong>；函数形参仍叫 raw_total_score，阅读源码时不要被这个旧名字误导。</li>
-	<li>需要等待确认时，标准风险偏好的基础门槛为：scalp 55、short 60、swing 64、long 68；保守 +6，激进 −5。</li>
-	<li>若属于价格领先的快速方向，且短窗压力与 raw 同向，可取消质量降级，避免滞后指标把急跌/急涨强制改成观望。</li>
-	</ol>
-	<p>方向保留后才计算交易分：</p>
-	<p><code>final_trade_score = direction_score × 70% + execution_score × 30%</code></p>
-	<p>如果 final_direction 已经是观望，<code>final_trade_score=0</code>。因此：</p>
+	<h4>0.5.3 压测页如何读图</h4>
 	<ul class="help-list">
-	<li><code>direction_score</code> 主要决定“raw 方向能不能成为本地黄线方向”；</li>
-	<li><code>final_trade_score</code> 描述方向保留后的交易执行强度；</li>
-	<li><code>raw_total_score</code> 更偏综合观察质量，并且是 AI 触发的重要输入。</li>
+	<li><strong>蓝线</strong>：选定范围内该币种的价格轨迹。</li>
+	<li><strong>绿线</strong>：按 <code>final_direction</code> 从 $10,000 满仓跟单的模拟权益。</li>
+	<li><strong>点颜色</strong>：验证窗口成熟后，绿点=方向判定合理，红点=不合理，灰点=尚未到期。</li>
+	<li><strong>价上方标记</strong>：该帧 <code>push_analysis.would_push=true</code> 的理论推送（◆急变 ■观察 △演变 ★结构单等）。</li>
+	<li>范围可选「本次启动后 / 全部历史 / 回放会话」；测试页「导出诊断包」会打包 JSON、SVG/PNG 图与 runtime 全量日志。</li>
 	</ul>
+	<div class="help-note"><strong>排查建议：</strong>对照 JSONL 中的 <code>decision_source</code>、<code>local_trigger.should_call_ai</code>、<code>analysis.valid_json</code>、<code>post_audit</code> 与 <code>push_analysis</code>，区分「方向判断」「推送资格」「实际发送」三个问题。评分与 guard 细节见 §C、§G、§J。</div>
 
-	<h4>第 1.6 步：这些方向和分数怎样影响 AI 调用</h4>
-	<p>AI 调用不是读取紫线或黄线的累计高度，而是读取生成曲线之前的原始字段。影响关系如下：</p>
-	<table class="help-table"><thead><tr><th>字段</th><th>怎样影响 AI 触发</th><th>是否直接传给 AI 模型</th></tr></thead><tbody>
-	<tr><td><code>signals[]</code></td><td>无信号=L0；多信号、交易信号、多观察信号可升 L2；极端费率可升 L3</td><td>会，以事实和阈值证据形式传递</td></tr>
-	<tr><td><code>raw_direction</code></td><td>与 sentiment 同向且强度≥3 → <code>sentiment_leading</code>；raw 有方向但 final 被拦且情绪有方向 → <code>sentiment_structure_conflict</code></td><td>不会作为本地结论传给模型</td></tr>
-	<tr><td><code>score.final_direction</code></td><td>参与“raw 有方向但 final=观望”的冲突识别；还写入 AI 去重指纹中的方向部分</td><td>不会作为本地结论传给模型</td></tr>
-	<tr><td><code>raw_total_score</code></td><td>达到 72 可产生 <code>raw_score_high</code> L2；单独 structure_break 时达到 65 可通过 L2 资格；按 5 分桶进入指纹</td><td>不会直接传给模型</td></tr>
-	<tr><td><code>direction_score</code></td><td>先决定 final 是否被降为观望，因而间接影响冲突原因和指纹方向</td><td>不会直接传给模型</td></tr>
-	<tr><td><code>final_trade_score</code></td><td>不直接决定 L2/L3；主要保留在 local_hint、日志和后续本地执行解释中</td><td>不会直接传给模型</td></tr>
-	<tr><td><code>strategy_views.scalp.score</code></td><td>scalp 为“急速异动/可短打”且达到 spike 门槛 → L3</td><td>不会作为本地分数传给模型</td></tr>
-	<tr><td><code>structure_forecast.active</code></td><td>可产生 <code>structure_forecast_active</code> L2；超短/短线可直接参与资格，中线/长线仍须强证据、方向分和周期对齐成熟</td><td>不会把本地 forecast 结论传给模型</td></tr>
-	</tbody></table>
-
-	<p>满足 L2/L3 后还不一定调用。系统生成：</p>
-	<p><code>fingerprint = 排序后的信号类型 : score.direction : raw_total_score的5分桶</code></p>
-	<p>其中 <code>score.direction</code> 就是本地 <code>score.final_direction</code>。超短/短线允许指纹变化解除普通去重；中线/长线 L2 必须先达到策略成熟条件，并分别遵守至少5/10分钟硬间隔。黄线对应的本地 final 方向会参与资格和指纹，但图上的累计曲线数值不会影响 AI。</p>
-
-	<h4>第 1.7 步：本地分数虽不进提示词，仍会约束 AI 结果</h4>
-	<p>模型独立分析时看不到本地 raw/final 与分数，但 AI 返回后，合并层会用本地证据限制 AI confidence：</p>
+	<h4>0.5.4 微信层补充规则</h4>
 	<ul class="help-list">
-	<li>基础上限约为 <code>max(raw_total_score+15, short_view.score+8, 52)</code>；</li>
-	<li>AI 有 forward probability 时，上限可放宽到 <code>probability+6</code>，但仍受总上限约束；</li>
-	<li>活跃 scalp 与 AI 同向时，可用 scalp 分提高上限；</li>
-	<li>AI 未提供 confidence 时，交易方向可回退参考 <code>final_trade_score/raw_total_score</code>。</li>
+	<li>内部 <code>would_push</code> 不等于实际发微信；watch / spike / trade / forecast 各有额外分数门槛。</li>
+	<li>每币种每轮最多一条；同向重复推送受冷却约束（含同趋势 leg 加长间隔）。</li>
+	<li><code>push_enabled=false</code> 或缺少 SendKey 时只记 dry-run / skipped，不请求 Server酱。</li>
 	</ul>
-	<p>随后，审计层还会使用本地短窗压力、scalp 方向、<code>direction_guard</code> 与 <code>structure_forecast</code> 检查 AI trade。于是本地字段对 AI 有三种不同作用：</p>
-	<ol class="help-list">
-	<li><strong>调用前：</strong>决定是否值得调用以及是否去重；</li>
-	<li><strong>模型分析时：</strong>不把本地结论喂给模型，保持独立；</li>
-	<li><strong>模型返回后：</strong>限制置信度并执行安全复核。</li>
-	</ol>
-
-	<h4>第 1.8 步：两个完整算例</h4>
-	<p><strong>算例 A：AI 关闭，本地预测和确认一致</strong></p>
-	<ul class="help-list">
-	<li>短线规则得到 <code>raw_direction=做空</code>；</li>
-	<li>六个方向层合计 50/74，得到 <code>direction_score≈68</code>；</li>
-	<li><code>entry_quality</code> 换算后为 60，风险分为 70，则 <code>raw_total≈66</code>；</li>
-	<li>guard 为空，entry quality=wait_confirmation；标准 short 门槛为 60，direction_score=68 通过；</li>
-	<li><code>score.final_direction=做空</code>，<code>final_trade_score≈66</code>；</li>
-	<li>AI 关闭：紫线读取 raw=做空，本点 −1；黄线读取 local final=做空，本点 −1。</li>
-	</ul>
-
-	<p><strong>算例 B：AI 开启，本地预测偏空但本轮未调用 AI</strong></p>
-	<ul class="help-list">
-	<li>本地仍得到 <code>raw_direction=做空</code>，但 signals 只有一条普通 MACD，等级可能为 L1，<code>should_call_ai=false</code>；</li>
-	<li>merge 输出 <code>decision_source=local_screening</code>，并把 <code>score.final_direction</code> 保留到 <code>final_decision.direction</code>；</li>
-	<li>紫线没有 AI forward，于是回退读取 raw=做空，本点 −1；</li>
-	<li>黄线读取对外 final_decision=观望，本点 +0；</li>
-	<li>结果是紫线下降、黄线横盘：表示本地提前偏空，但 AI 模式下尚未获得一次权威确认。</li>
-	</ul>
-
-	<p><strong>算例 C：AI 开启并成功返回反向判断</strong></p>
-	<ul class="help-list">
-	<li>本地 <code>raw_direction=做空</code>，多信号形成 L2，去重允许，调用 AI；</li>
-	<li>AI 独立读取行情后给出 <code>forward_view.direction=做多</code>、probability=72；</li>
-	<li>JSON 有效，merge 采用 AI 做多；post_audit 未发现压力/scalp/forecast 冲突，保留做多；</li>
-	<li>紫线优先读取 AI forward=做多，本点 +1；黄线读取审计后的 final_decision=做多，本点 +1；</li>
-	<li>本地 raw=做空仍保存在日志中，但这一个图表点的紫线已经切换为 AI forward，而不是继续展示本地 raw。</li>
-	</ul>
-
-	<h4>第 2 步：AI 不是每轮调用，而是由事件触发</h4>
-	<p><code>evaluate_ai_trigger</code> 根据 signals、raw 分数、情绪、结构演变和 scalp 急变形成 L0–L3。只有 AI 已启用、等级为 L2/L3、满足资格，并通过指纹去重时，<code>should_call_ai</code> 才为 true。</p>
-	<table class="help-table"><thead><tr><th>状态</th><th>AI 行为</th><th>启用 AI 后的黄线/对外方向</th><th>交易微信可能性</th></tr></thead><tbody>
-	<tr><td>L0：无信号</td><td>不调用</td><td><code>local_screening → score.final_direction</code></td><td>无信号时 push_gate 仍阻止 confirmed 推送；forecast 也须独立满足条件</td></tr>
-	<tr><td>L1：普通信号</td><td>不调用</td><td><code>local_screening → score.final_direction</code>，同时保留 local_bias</td><td>本地交易分达到方向阈值 +5 才可进入 trade 推送，否则仅 watch/none</td></tr>
-	<tr><td>L2：值得分析</td><td>资格和指纹允许时调用</td><td>成功后采用 AI；未调用时仍为观望</td><td>AI 成功且通过全部门禁后可能推送</td></tr>
-	<tr><td>L3：急变/极端</td><td>AI 开启时进入高优先分析；中线 scalp 急变须达到基础门槛 +10、具备强证据、与中线方向或15m确认一致，并连续两轮成立；同一事件只升级一次，分数回落到有效门槛约8分以下才重新解锁</td><td>通常采用 AI；配置允许时本地强 scalp 可覆盖成 spike</td><td>可能走 AI spike，或受控的本地 L3 spike；中线仍须通过策略化推送门槛</td></tr>
-	</tbody></table>
-
-	<h4>第 3 步：AI 独立分析未来，不读取紫线/黄线结论</h4>
-	<p>真正调用时，模型收到的是裁剪后的原始 K 线、中性技术指标、衍生品、盘口、市场环境、触发事实和策略配置；不会收到本地 <code>raw_direction</code>、本地分数、黄线结论或 <code>structure_forecast</code>。这样 AI 的 <code>forward_view</code> 是一条独立证据链，避免只是复述本地结果。</p>
-	<p>AI 必须返回可解析、可校验的 JSON。核心对象 <code>forward_view</code> 包含：</p>
-	<ul class="help-list">
-	<li><code>direction</code>：做多、做空或观望；</li>
-	<li><code>horizon_minutes</code>：预测所针对的未来时间窗口；</li>
-	<li><code>probability</code>：该方向在对应窗口内成立的概率；</li>
-	<li><code>entry_plan</code>：入场、止损、止盈；</li>
-	<li><code>summary</code> 与 <code>invalidation</code>：理由和失效条件。</li>
-	</ul>
-
-	<h4>第 4 步：AI 成功、未调用和失败采用不同权威来源</h4>
-	<table class="help-table"><thead><tr><th>实际结果</th><th><code>decision_source</code></th><th>最终方向</th><th>设计目的</th></tr></thead><tbody>
-	<tr><td>AI 返回有效 JSON</td><td><code>ai</code></td><td>优先 <code>forward_view.direction</code></td><td>由独立 AI 前瞻成为对外候选</td></tr>
-	<tr><td>AI 已开启，但本轮没有调用</td><td><code>local_screening</code></td><td>保留本地 <code>score.final_direction</code></td><td>交易分达到方向推送阈值 +5 才允许 trade；低于门槛为 watch/none</td></tr>
-	<tr><td>本轮调用 AI，但请求失败或 JSON 无效</td><td><code>local_fallback</code></td><td>保留本地 <code>score.final_direction</code></td><td>使用同一高门槛本地兜底，不使用无效 AI 文本</td></tr>
-	<tr><td>AI 整体关闭</td><td><code>local_screening</code></td><td>保留本地 <code>score.final_direction</code></td><td>完整保留本地验证模式；走势图、最终决策与推送审计使用同一方向</td></tr>
-	</tbody></table>
-
-	<h4>第 5 步：AI 结论还要接受本地安全复核</h4>
-	<p><code>merge_final_decision</code> 产生的只是候选。<code>_apply_decision_post_audit</code> 会重新检查 AI trade/spike 是否与已经发生的快速价格、scalp 方向、市场压力、direction_guard 和活跃结构演变冲突。结论可能保持、降为 watch、阻断为 none，或在受控 L3 场景改成 spike。</p>
-	<p>这一步体现本项目的职责分工：<strong>AI 负责前瞻判断，本地层负责证据上限和执行安全</strong>。AI 可以与本地紫线、黄线不同，但不能绕过数据质量、风险和冲突检查直接发送。</p>
-
-	<h4>第 6 步：同时产生 confirmed 与 forecast 两条推送候选轨</h4>
-	<table class="help-table"><thead><tr><th>轨道</th><th>来源</th><th>可能类型</th><th>含义</th></tr></thead><tbody>
-	<tr><td><code>confirmed</code></td><td>审计后的 <code>final_decision.push_recommendation</code></td><td>trade / spike / watch</td><td>方向或观察结论已经达到内部确认条件</td></tr>
-	<tr><td><code>forecast</code></td><td>本地 <code>structure_forecast</code></td><td>forecast</td><td>结构尚未完全确认，但演变概率已达到提醒门槛</td></tr>
-	</tbody></table>
-	<p>confirmed 与 forecast 分别执行自己的 gate。trade 必须有有效多空方向与对应分数；watch 必须有足够置信度及 AI/观察信号依据；spike 必须达到急变门槛；forecast 必须 active、校准后概率达标，并且不能与短窗压力、scalp 或 AI forward 冲突。</p>
-
-	<h4>第 7 步：微信层再次提高门槛并只选一条</h4>
-	<p>内部 <code>would_push</code> 并不等于实际发微信。微信层会进一步要求：</p>
-	<ul class="help-list">
-	<li><strong>watch：</strong>必须是本轮真实调用 AI 后明确给出的 watch，且比普通 watch 门槛再高 5 分；</li>
-	<li><strong>spike：</strong>超短/短线按基础门槛；中线还必须满足基础门槛 +10、强证据、方向/15m 对齐和连续两轮确认。纯本地 L3 spike 仍须显式开启，且微信层继续执行额外校验；</li>
-	<li><strong>trade：</strong>L2/L3 可进入，否则置信度必须比对应多空门槛再高 3 分；</li>
-	<li><strong>forecast：</strong>概率至少比有效门槛高 7 分；非 L2/L3 时至少高 12 分。</li>
-	</ul>
-	<p>若 confirmed 已有 trade 或 spike，forecast 会被覆盖。剩余候选按 <code>trade → spike → forecast</code> 排序；watch 没有显式高优先级，只在没有更高优先候选时发送。每个币种每轮最多发送一条。</p>
-
-	<h4>第 8 步：冷却、配置和 Server酱发送</h4>
-	<ul class="help-list">
-	<li>先检查反向 trade 冷却、<code>kind + inst_id + direction</code> 类型冷却，以及同币种任意微信默认 600 秒最小间隔。</li>
-	<li><code>push_enabled=false</code> 时只记 dry-run 事件，不请求 Server酱；当前实现仍写入冷却状态，避免每轮重复记录。</li>
-	<li>缺少 <code>WECHAT_SEND_KEY</code> 时记录 <code>skipped(no wechat key)</code>；当前实现同样写入冷却。</li>
-	<li>配置完整时，通过 Server酱 <code>https://sctapi.ftqq.com/{SENDKEY}.send</code> 发送标题和 Markdown 正文。</li>
-	<li>发送成功或失败都会写推送事件；失败不会中断监控主循环。</li>
-	</ul>
-
-	<h4>0.6 开启 AI 后如何读紫线与黄线</h4>
-	<table class="help-table"><thead><tr><th>图形现象</th><th>可能来源</th><th>正确解释</th></tr></thead><tbody>
-	<tr><td>紫线变化，黄线横盘</td><td>本地 raw 已预测方向，但 AI 未被触发、被去重，或最终仍观望</td><td>有早期倾向，尚未形成权威确认，更不代表会推微信</td></tr>
-	<tr><td>紫线与黄线同时转向</td><td>AI forward 成功成为 final_direction，或本地预测通过确认</td><td>预测与确认一致，但仍需查看 recommendation、审计和 gate</td></tr>
-	<tr><td>紫线与黄线反向</td><td>AI 与本地 raw 判断不同，或 L3 本地 scalp 审计覆盖</td><td>代表证据链发生冲突，应查看 prediction_source、decision_source 和 post_audit</td></tr>
-	<tr><td>黄线有方向但没微信</td><td>recommendation=none、分数不足、冲突、冷却、类型关闭或缺少 SendKey</td><td>方向确认与通知资格是两个不同层级</td></tr>
-	<tr><td>收到 forecast 微信但黄线仍横盘</td><td>本地结构演变轨提前达到高概率，confirmed 尚未确认</td><td>这是“可能即将形成”的提前观察，不是正式结构单</td></tr>
-	</tbody></table>
-	<div class="help-note"><strong>验证建议：</strong>启用 AI 后不要只看紫线、黄线是否贴合价格。应同时对照 <code>prediction_source</code>、<code>decision_source</code>、<code>local_trigger.should_call_ai</code>、<code>analysis.valid_json</code>、<code>post_audit</code> 和 <code>push_analysis.tracks</code>，这样才能区分“本地预测准”“AI 前瞻准”“最终确认准”和“通知门槛合理”四个问题。</div>
 	</section>
 
-	<section class="card help-card"><h2>§A 数据采集 collect_snapshot</h2>""",
+		<section class="card help-card"><h2>§A 数据采集 collect_snapshot</h2>""",
         _mod(
             "A.1 原始行情与衍生品",
             "拉取 OKX 当前价、多周期 K 线、成交量、OI、资金费率、多空比、盘口；<strong>不判方向、不推送</strong>。可选写入 replay_dataset。",

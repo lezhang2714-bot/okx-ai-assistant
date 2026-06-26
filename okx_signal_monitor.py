@@ -48,7 +48,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
@@ -68,6 +68,7 @@ from monitor_config_summary import (
     build_effective_config_lines,
     build_log_config_snapshot,
     config_value,
+    normalize_interval_for_strategy,
     recommended_interval_for_strategy,
     sync_strategy_bound_config,
 )
@@ -125,6 +126,25 @@ WECHAT_FORECAST_MIN_MARGIN = 7
 WECHAT_TRADE_MIN_MARGIN = 3
 WECHAT_FORECAST_HIGH_PROB_MARGIN = 12
 CONFIDENCE_HUG_MARGIN = 3
+EARLY_RALLY_EXEMPT_PCT = 4.0
+SESSION_TOP_RALLY_PCT = 5.5
+POST_PEAK_DRAWDOWN_PCT = 0.85
+POST_PEAK_SHORT_BOOST = 8
+POST_PEAK_SHORT_THRESHOLD_CUT = 8
+POST_PEAK_MIN_SHORT_CONF = 38
+DEEP_PULLBACK_FROM_HIGH_PCT = 2.5
+TOP_NEAR_BLOCK_PCT = 0.65
+# 同趋势同方向重复推送：默认 2h；大趋势未变时同向少推，首次仍及时放行。
+DEFAULT_SAME_TREND_PUSH_COOLDOWN_SECONDS = 7200
+# 同向复推至少已过去 1h，且 confidence 高出上次此 margin，才考虑提前放行。
+SAME_DIRECTION_REPUSH_CONF_MARGIN = 15
+SAME_TREND_REPUSH_MIN_ELAPSED_SECONDS = 3600
+# 相对上次同向推送价反弹/回撤达到此幅度，视为新一波，可重置同趋势冷却。
+SAME_TREND_LEG_RESET_BOUNCE_PCT = 0.85
+# 同向复推时，价格距短窗极值过近则视为追单（首次同向推送不受限）。
+REPEAT_SHORT_NEAR_LOCAL_LOW_PCT = 0.30
+REPEAT_LONG_NEAR_LOCAL_HIGH_PCT = 0.30
+AI_TRADE_PUSH_PERSIST_SECONDS = 1800
 DEFAULT_AI_CALL_MIN_INTERVAL_SECONDS = 60
 # 500MB；12h 写入量约 177MB，留足余量避免过早轮转导致 Web 图表/压测丢数据。
 DEFAULT_LOG_MAX_BYTES = 500 * 1024 * 1024
@@ -1270,6 +1290,11 @@ class SignalConfig:
     calibration_blend_weight: float = 0.65
     calibration_disable_below_hit_rate: float = 0.38
     calibration_save_interval_seconds: int = 60
+    late_long_entry_guard: bool = True
+    pullback_long_entry_guard: bool = True
+    post_peak_long_entry_guard: bool = True
+    post_peak_short_entry_favor: bool = True
+    ai_trade_push_persist_seconds: int = AI_TRADE_PUSH_PERSIST_SECONDS
     paper_follow_ai_only: bool = True
     paper_fee_bps: float = 5.0
     forward_require_forecast_alignment: bool = True
@@ -2565,6 +2590,7 @@ class OkxAiShortTermAssistant:
 
         # 推送冷却状态。key 为 push_kind:inst_id:direction，避免信号组合变化绕过冷却。
         self.last_push_at: Dict[str, float] = {}
+        self.last_push_meta: Dict[str, Dict[str, Any]] = {}
         self.last_wechat_push_at: Dict[str, float] = {}
         # 静默简报独立计时，不与 trade/spike/watch 等业务推送共用 epoch。
         self.last_silence_brief_at: Dict[str, float] = {}
@@ -2621,6 +2647,7 @@ class OkxAiShortTermAssistant:
         self._spike_candidate_streak: Dict[str, int] = {}
         self._spike_event_latched: Set[str] = set()
         self.replay_ai_cache: Dict[str, Dict[str, Any]] = {}
+        self.last_ai_trade_decision: Dict[str, Dict[str, Any]] = {}
 
         # 回放/录制：录制保存 collect_snapshot 原始输入；回放时注入同一套 collect/analyze 链路。
         self.replay_mode = False
@@ -5361,6 +5388,41 @@ class OkxAiShortTermAssistant:
                 }
                 opened.append(opened_item)
                 self.pending_decision_reviews.append(opened_item)
+        elif push == "none" and direction in ("做多", "做空"):
+            shadow = final_decision.get("calibration_shadow_track")
+            if isinstance(shadow, dict):
+                shadow_kind = str(shadow.get("push_kind", "") or "")
+                if shadow_kind in ("trade", "spike") and confidence >= 50:
+                    regime = str(snapshot.get("market_context", {}).get("regime", "unknown") or "unknown")
+                    track_key = f"{inst_id}:{source}:shadow:{shadow_kind}:{direction}:{regime}"
+                    if now_ts - self.last_signal_track_at.get(f"cal:{track_key}", 0.0) >= 300:
+                        self.last_signal_track_at[f"cal:{track_key}"] = now_ts
+                        bucket_key = self._decision_calibration_key(inst_id, source, shadow_kind, direction, regime)
+                        horizon_seconds = self._effective_forecast_horizon() * 60
+                        opened_item = {
+                            "id": f"{int(now_ts)}:{track_key}",
+                            "kind": "decision",
+                            "inst_id": inst_id,
+                            "decision_source": source,
+                            "push_kind": shadow_kind,
+                            "direction": direction,
+                            "confidence": confidence,
+                            "regime": regime,
+                            "state": "pending",
+                            "open_time": snapshot.get("time"),
+                            "created_ts": now_ts,
+                            "settle_ts": now_ts + horizon_seconds,
+                            "open_price": price,
+                            "horizon_minutes": self._effective_forecast_horizon(),
+                            "structure_bar": structure_bar,
+                            "open_structure_trend": current_structure_trend,
+                            "calibration_key": bucket_key,
+                            "price_hit_threshold_pct": self._price_hit_threshold_pct(snapshot),
+                            "shadow_blocked": True,
+                            "shadow_reason": shadow.get("reason"),
+                        }
+                        opened.append(opened_item)
+                        self.pending_decision_reviews.append(opened_item)
 
         if len(self.pending_decision_reviews) > 400:
             self.pending_decision_reviews = self.pending_decision_reviews[-400:]
@@ -5371,10 +5433,620 @@ class OkxAiShortTermAssistant:
             "pending_count": len(self.pending_decision_reviews),
         }
 
+    def _reset_replay_calibration_state(self, inst_ids: Iterable[str]) -> None:
+        """回放使用独立 decision 校准桶，避免 live/旧回放样本污染当前走势评估。"""
+        targets = {str(item) for item in inst_ids if item}
+        if not targets:
+            return
+        buckets = self.calibration_state.setdefault("buckets", {})
+        drop_keys = [
+            key
+            for key in list(buckets.keys())
+            if key.startswith("decision:") and any(f":{inst}:" in key for inst in targets)
+        ]
+        for key in drop_keys:
+            buckets.pop(key, None)
+        self.pending_decision_reviews = [
+            item for item in self.pending_decision_reviews if str(item.get("inst_id", "")) not in targets
+        ]
+        self._calibration_dirty = bool(drop_keys)
+
+    def _direction_pressure_aligned(self, direction: str, pressure: str) -> bool:
+        if direction == "做多":
+            return pressure in ("up", "neutral")
+        if direction == "做空":
+            return pressure in ("down", "neutral")
+        return False
+
+    def _trend_aligned_with_direction(
+        self,
+        direction: str,
+        context: Dict[str, Any],
+        score: Optional[Dict[str, Any]] = None,
+        final_decision: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if direction not in ("做多", "做空"):
+            return False
+        pressure = str(context.get("recent_price_pressure", "neutral") or "neutral")
+        regime = str(context.get("regime", "unknown") or "unknown")
+        bias = str(context.get("bias", "neutral") or "neutral")
+        local_bias = ""
+        if isinstance(final_decision, dict):
+            local_bias = str(
+                final_decision.get("local_bias")
+                or final_decision.get("local_hint_direction")
+                or ""
+            )
+        if not local_bias and isinstance(score, dict):
+            local_bias = str(score.get("final_direction") or score.get("direction") or "")
+        if direction == "做多":
+            if regime in ("high_volatility", "trend_up") and self._direction_pressure_aligned(direction, pressure):
+                return True
+            if bias == "long" or local_bias == "做多":
+                return self._direction_pressure_aligned(direction, pressure)
+        if direction == "做空":
+            if regime in ("trend_down", "high_volatility") and self._pullback_favors_short(context, score):
+                return True
+            if bias == "short" or local_bias == "做空":
+                return self._direction_pressure_aligned(direction, pressure) or self._pullback_favors_short(context, score)
+        return False
+
+    def _pullback_favors_short(
+        self,
+        context: Dict[str, Any],
+        score: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        regime = str(context.get("regime", "unknown") or "unknown")
+        bias = str(context.get("bias", "neutral") or "neutral")
+        if regime == "trend_down" or bias == "short":
+            return True
+        trade_down = int(context.get("trade_down", 0) or 0)
+        trade_up = int(context.get("trade_up", 0) or 0)
+        if trade_down >= 2 and trade_down > trade_up:
+            return True
+        if isinstance(score, dict):
+            direction = str(score.get("final_direction") or score.get("direction") or "")
+            if direction == "做空":
+                return True
+        return False
+
+    def _horizon_price_window_extremes(self, snapshot: Dict[str, Any]) -> Tuple[float, float]:
+        """策略主周期高点/低点（1H/4H/240m），不用 15m 局部极值，避免涨段早中期误伤。"""
+        profiles = snapshot.get("trend_profiles") or {}
+        if not isinstance(profiles, dict):
+            profiles = {}
+        spec = self._forecast_timeframe_spec()
+        highs: List[float] = []
+        lows: List[float] = []
+        for bar in (spec["target"], spec["background"]):
+            profile = profiles.get(bar, {})
+            if isinstance(profile, dict):
+                recent_high = to_float(profile.get("recent_high"))
+                recent_low = to_float(profile.get("recent_low"))
+                if recent_high > 0:
+                    highs.append(recent_high)
+                if recent_low > 0:
+                    lows.append(recent_low)
+        candles = snapshot.get("candles", {})
+        if isinstance(candles, dict):
+            rows_1m = confirmed_candles(candles.get("1m", []))
+            horizon = min(len(rows_1m), max(120, self._effective_forecast_horizon()))
+            if horizon >= 10 and rows_1m:
+                window = rows_1m[:horizon]
+                highs.append(max(to_float(item.get("high")) for item in window))
+                lows.append(min(to_float(item.get("low")) for item in window))
+        return (max(highs) if highs else 0.0, min(lows) if lows else 0.0)
+
+    def _structural_high_price(self, snapshot: Dict[str, Any]) -> float:
+        high, _ = self._horizon_price_window_extremes(snapshot)
+        return high
+
+    def _session_rally_pct(self, price: float, window_low: float) -> float:
+        if price <= 0 or window_low <= 0:
+            return 0.0
+        return max(0.0, pct_change(price, window_low))
+
+    def _drawdown_from_session_high_pct(self, price: float, session_high: float) -> float:
+        if price <= 0 or session_high <= 0:
+            return 0.0
+        if price >= session_high:
+            return 0.0
+        return max(0.0, -pct_change(price, session_high))
+
+    def _market_leg_label(self, snapshot: Dict[str, Any], context: Dict[str, Any]) -> str:
+        price = to_float(snapshot.get("price"))
+        horizon_high, horizon_low = self._horizon_price_window_extremes(snapshot)
+        rally_pct = self._session_rally_pct(price, horizon_low)
+        drawdown_pct = self._drawdown_from_session_high_pct(price, horizon_high)
+        pressure = str(context.get("recent_price_pressure", "neutral") or "neutral")
+        trade_down = int(context.get("trade_down", 0) or 0)
+        trade_up = int(context.get("trade_up", 0) or 0)
+        if rally_pct < EARLY_RALLY_EXEMPT_PCT:
+            return "pre_rally"
+        if rally_pct >= SESSION_TOP_RALLY_PCT and drawdown_pct >= POST_PEAK_DRAWDOWN_PCT:
+            return "post_peak"
+        if (
+            horizon_high > 0
+            and pct_change(price, horizon_high) >= -TOP_NEAR_BLOCK_PCT
+            and rally_pct >= SESSION_TOP_RALLY_PCT
+        ):
+            return "top"
+        if pressure == "down" and trade_down > trade_up:
+            return "pullback"
+        if drawdown_pct >= DEEP_PULLBACK_FROM_HIGH_PCT:
+            return "pullback"
+        if rally_pct >= EARLY_RALLY_EXEMPT_PCT:
+            return "main_rally"
+        return "transition"
+
+    def _post_peak_long_entry_eval(
+        self,
+        snapshot: Dict[str, Any],
+        context: Dict[str, Any],
+        final_decision: Dict[str, Any],
+        push: str,
+    ) -> Dict[str, Any]:
+        metrics: Dict[str, Any] = {
+            "blocked": False,
+            "reason": "",
+            "drawdown_from_high_pct": 0.0,
+            "rally_pct": 0.0,
+            "post_peak": False,
+        }
+        if not self.config.post_peak_long_entry_guard:
+            return metrics
+        if push not in ("trade", "spike"):
+            return metrics
+        if str(final_decision.get("direction", "")) != "做多":
+            return metrics
+
+        price = to_float(snapshot.get("price"))
+        horizon_high, horizon_low = self._horizon_price_window_extremes(snapshot)
+        if price <= 0 or horizon_high <= 0:
+            return metrics
+
+        rally_pct = self._session_rally_pct(price, horizon_low)
+        drawdown_pct = self._drawdown_from_session_high_pct(price, horizon_high)
+        metrics["drawdown_from_high_pct"] = round(drawdown_pct, 4)
+        metrics["rally_pct"] = round(rally_pct, 4)
+
+        if rally_pct < SESSION_TOP_RALLY_PCT or drawdown_pct < POST_PEAK_DRAWDOWN_PCT:
+            return metrics
+
+        phase = str(context.get("trend_phase", "transition") or "transition")
+        pressure = str(context.get("recent_price_pressure", "neutral") or "neutral")
+        if phase == "pullback_in_uptrend" and pressure == "down":
+            return metrics
+
+        metrics["blocked"] = True
+        metrics["post_peak"] = True
+        metrics["reason"] = "post_peak_blocks_long_trade"
+        return metrics
+
+    def _post_peak_long_entry_block_reason(
+        self,
+        snapshot: Dict[str, Any],
+        context: Dict[str, Any],
+        final_decision: Dict[str, Any],
+        push: str,
+    ) -> str:
+        return str(
+            self._post_peak_long_entry_eval(snapshot, context, final_decision, push).get("reason", "") or ""
+        )
+
+    def _post_peak_rollover_active(self, snapshot: Dict[str, Any], context: Dict[str, Any]) -> bool:
+        price = to_float(snapshot.get("price"))
+        horizon_high, horizon_low = self._horizon_price_window_extremes(snapshot)
+        rally_pct = self._session_rally_pct(price, horizon_low)
+        drawdown_pct = self._drawdown_from_session_high_pct(price, horizon_high)
+        if rally_pct < SESSION_TOP_RALLY_PCT or drawdown_pct < POST_PEAK_DRAWDOWN_PCT:
+            return False
+        pressure = str(context.get("recent_price_pressure", "neutral") or "neutral")
+        trade_down = int(context.get("trade_down", 0) or 0)
+        trade_up = int(context.get("trade_up", 0) or 0)
+        if pressure == "down" or trade_down > trade_up:
+            return True
+        profiles = snapshot.get("trend_profiles") or {}
+        if not isinstance(profiles, dict):
+            return False
+        spec = self._forecast_timeframe_spec()
+        down_trends = sum(
+            1
+            for bar in (spec["lead"], spec["target"])
+            if str((profiles.get(bar) or {}).get("trend", "mixed") or "mixed") == "down"
+        )
+        return down_trends >= 1
+
+    def _post_peak_short_favor_eval(
+        self,
+        snapshot: Dict[str, Any],
+        context: Dict[str, Any],
+        score: Dict[str, Any],
+        drawdown_pct: float,
+        rally_pct: float,
+    ) -> Dict[str, Any]:
+        metrics: Dict[str, Any] = {
+            "active": False,
+            "drawdown_from_high_pct": round(drawdown_pct, 4),
+            "rally_pct": round(rally_pct, 4),
+            "threshold_cut": 0,
+            "boost": 0,
+        }
+        if not self.config.post_peak_short_entry_favor:
+            return metrics
+        if rally_pct < SESSION_TOP_RALLY_PCT or drawdown_pct < POST_PEAK_DRAWDOWN_PCT:
+            return metrics
+        if not self._post_peak_rollover_active(snapshot, context):
+            return metrics
+        metrics["active"] = True
+        metrics["threshold_cut"] = POST_PEAK_SHORT_THRESHOLD_CUT
+        metrics["boost"] = POST_PEAK_SHORT_BOOST
+        if drawdown_pct >= DEEP_PULLBACK_FROM_HIGH_PCT:
+            metrics["threshold_cut"] = POST_PEAK_SHORT_THRESHOLD_CUT + 2
+            metrics["boost"] = POST_PEAK_SHORT_BOOST + 2
+        return metrics
+
+    def _post_peak_short_promote_eligible(
+        self,
+        direction: str,
+        push: str,
+        confidence: int,
+        short_favor: Dict[str, Any],
+        context: Dict[str, Any],
+        drawdown_pct: float,
+    ) -> bool:
+        if not short_favor.get("active") or direction != "做空" or push not in ("none", "watch"):
+            return False
+        threshold_cut = int(short_favor.get("threshold_cut", 0) or 0)
+        favor_threshold = max(50, self.trade_push_score("做空") - threshold_cut)
+        if confidence >= favor_threshold:
+            return True
+        if drawdown_pct < DEEP_PULLBACK_FROM_HIGH_PCT or confidence < POST_PEAK_MIN_SHORT_CONF:
+            return False
+        pressure = str(context.get("recent_price_pressure", "neutral") or "neutral")
+        trade_down = int(context.get("trade_down", 0) or 0)
+        trade_up = int(context.get("trade_up", 0) or 0)
+        return pressure == "down" or trade_down > trade_up
+
+    def _ai_trade_persist_seconds(self) -> int:
+        return max(60, int(self.config.ai_trade_push_persist_seconds or AI_TRADE_PUSH_PERSIST_SECONDS))
+
+    def _ai_trade_persist_active(self, entry: Dict[str, Any]) -> bool:
+        if not entry:
+            return False
+        saved_at = float(entry.get("ts", 0) or 0)
+        return saved_at > 0 and self._now_ts() - saved_at <= self._ai_trade_persist_seconds()
+
+    def _record_ai_trade_decision(self, inst_id: str, final_decision: Dict[str, Any]) -> None:
+        if not inst_id:
+            return
+        direction = str(final_decision.get("direction", "") or "")
+        push = str(final_decision.get("push_recommendation", "none") or "none")
+        if direction not in ("做多", "做空") or push not in ("trade", "spike"):
+            self.last_ai_trade_decision.pop(inst_id, None)
+            return
+        forward = (
+            final_decision.get("forward_view")
+            if isinstance(final_decision.get("forward_view"), dict)
+            else {}
+        )
+        self.last_ai_trade_decision[inst_id] = {
+            "direction": direction,
+            "push_recommendation": push,
+            "confidence": int(final_decision.get("confidence", 0) or 0),
+            "forward_view": dict(forward),
+            "ts": self._now_ts(),
+        }
+
+    def _persisted_ai_trade_decision(self, inst_id: str) -> Optional[Dict[str, Any]]:
+        entry = self.last_ai_trade_decision.get(inst_id)
+        if not entry or not self._ai_trade_persist_active(entry):
+            if inst_id in self.last_ai_trade_decision:
+                self.last_ai_trade_decision.pop(inst_id, None)
+            return None
+        return entry
+
+    def _blend_persisted_ai_trade(
+        self,
+        local_decision: Dict[str, Any],
+        persisted: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        merged = dict(local_decision)
+        merged["direction"] = persisted.get("direction", merged.get("direction"))
+        merged["push_recommendation"] = persisted.get("push_recommendation", merged.get("push_recommendation"))
+        merged["confidence"] = max(
+            int(merged.get("confidence", 0) or 0),
+            int(persisted.get("confidence", 0) or 0),
+        )
+        forward = persisted.get("forward_view")
+        if isinstance(forward, dict) and forward:
+            merged["forward_view"] = dict(forward)
+        merged["decision_source"] = "ai_persisted"
+        merged["ai_trade_persisted"] = True
+        return merged
+
+    def _update_ai_trade_persist(
+        self,
+        inst_id: str,
+        final_decision: Dict[str, Any],
+        trigger: Dict[str, Any],
+    ) -> None:
+        if not inst_id:
+            return
+        if trigger.get("ai_invoked") and str(final_decision.get("decision_source", "")) == "ai":
+            self._record_ai_trade_decision(inst_id, final_decision)
+
+    def _confirmed_push_exempt_no_signals(self, final_decision: Dict[str, Any]) -> bool:
+        push = str(final_decision.get("push_recommendation", "none") or "none")
+        if push not in ("trade", "spike"):
+            return False
+        direction = str(final_decision.get("direction", "") or "")
+        if direction not in ("做多", "做空"):
+            return False
+        source = str(final_decision.get("decision_source", "") or "")
+        if source in ("ai", "ai_persisted"):
+            return True
+        return bool(final_decision.get("ai_trade_persisted"))
+
+    def _post_peak_rollover_ai_reason(
+        self,
+        inst_id: str,
+        score: Dict[str, Any],
+        snapshot: Dict[str, Any],
+    ) -> Optional[str]:
+        if not self.config.post_peak_short_entry_favor:
+            return None
+        context = snapshot.get("market_context", {}) if isinstance(snapshot.get("market_context"), dict) else {}
+        if not self._post_peak_rollover_active(snapshot, context):
+            return None
+        review_key = f"{inst_id}:post_peak_rollover"
+        last_at = self._ai_supplemental_last_at.get(review_key, 0.0)
+        if last_at > 0 and self._now_ts() - last_at < SWING_AI_SUSTAINED_REVIEW_INTERVAL_SECONDS:
+            return None
+        self._ai_supplemental_last_at[review_key] = self._now_ts()
+        return "post_peak_rollover"
+
+    def _late_long_entry_eval(
+        self,
+        snapshot: Dict[str, Any],
+        context: Dict[str, Any],
+        score: Dict[str, Any],
+        final_decision: Dict[str, Any],
+        push: str,
+    ) -> Dict[str, Any]:
+        empty = {
+            "blocked": False,
+            "reason": "",
+            "proximity_pct": 0.0,
+            "distance_pct": 0.0,
+            "rally_pct": 0.0,
+            "absolute_top": False,
+            "chase_signals": 0,
+        }
+        if not self.config.late_long_entry_guard:
+            return empty
+        if push not in ("trade", "spike"):
+            return empty
+        if str(final_decision.get("direction", "")) != "做多":
+            return empty
+
+        price = to_float(snapshot.get("price"))
+        horizon_high, horizon_low = self._horizon_price_window_extremes(snapshot)
+        if price <= 0 or horizon_high <= 0:
+            return empty
+
+        volatility = snapshot.get("volatility") or {}
+        atr_pct = max(to_float(volatility.get("atr_pct_15m")), 0.08)
+        mode = self._strategy_mode()
+        proximity_pct = {
+            "scalp": max(0.18, atr_pct * 0.45),
+            "short": max(0.25, atr_pct * 0.55),
+            "swing": max(0.50, atr_pct * 0.85),
+            "long": max(0.55, atr_pct * 1.0),
+        }.get(mode, max(0.30, atr_pct * 0.6))
+        distance_pct = pct_change(price, horizon_high)
+        rally_pct = self._session_rally_pct(price, horizon_low)
+        metrics = {
+            **empty,
+            "proximity_pct": round(proximity_pct, 4),
+            "distance_pct": round(distance_pct, 4),
+            "rally_pct": round(rally_pct, 4),
+        }
+
+        if rally_pct < EARLY_RALLY_EXEMPT_PCT:
+            return metrics
+
+        if rally_pct >= SESSION_TOP_RALLY_PCT and distance_pct >= -TOP_NEAR_BLOCK_PCT:
+            metrics["blocked"] = True
+            metrics["reason"] = "late_long_entry_near_structural_high"
+            metrics["absolute_top"] = True
+            metrics["chase_signals"] = 1
+            return metrics
+
+        if distance_pct < -proximity_pct:
+            return metrics
+
+        pressure = str(context.get("recent_price_pressure", "neutral") or "neutral")
+        phase = str(context.get("trend_phase", "transition") or "transition")
+        if pressure == "down" or phase == "pullback_in_uptrend":
+            return metrics
+        if phase == "breakout_attempt_up" and pressure == "up" and rally_pct < SESSION_TOP_RALLY_PCT:
+            return metrics
+
+        profiles = snapshot.get("trend_profiles") or {}
+        spec = self._forecast_timeframe_spec()
+        target = profiles.get(spec["target"], {}) if isinstance(profiles, dict) else {}
+        rsi_14 = 50.0
+        if isinstance(target, dict):
+            rsi_meta = target.get("rsi")
+            if isinstance(rsi_meta, dict):
+                rsi_14 = to_float(rsi_meta.get("14"), 50.0)
+
+        move_strategy = abs(to_float(context.get("price_change_strategy"), 0.0))
+        moves = context.get("recent_move_pct") or {}
+        move_20m = abs(to_float(moves.get("20m"), 0.0))
+        extension_floor = {
+            "scalp": max(0.35, atr_pct * 0.55),
+            "short": max(0.55, atr_pct * 0.75),
+            "swing": max(0.90, atr_pct * 1.10),
+            "long": max(1.20, atr_pct * 1.35),
+        }.get(mode, max(0.65, atr_pct * 0.85))
+
+        absolute_top = rally_pct >= SESSION_TOP_RALLY_PCT and distance_pct >= -proximity_pct
+        metrics["absolute_top"] = absolute_top
+        if absolute_top:
+            top_signals = 0
+            if rsi_14 >= 64:
+                top_signals += 1
+            if phase in ("trend_decelerating_up", "reversal_candidate_up", "transition"):
+                top_signals += 1
+            if distance_pct >= -max(0.15, proximity_pct * 0.30):
+                top_signals += 1
+            if rally_pct >= SESSION_TOP_RALLY_PCT + 1.0:
+                top_signals += 1
+            metrics["chase_signals"] = top_signals
+            if top_signals >= 1:
+                metrics["blocked"] = True
+                metrics["reason"] = "late_long_entry_near_structural_high"
+                return metrics
+
+        if move_strategy < extension_floor and move_20m < extension_floor * 0.65:
+            return metrics
+
+        chase_signals = 0
+        if rsi_14 >= 66:
+            chase_signals += 1
+        if phase in ("trend_decelerating_up", "reversal_candidate_up"):
+            chase_signals += 1
+        if distance_pct >= -max(0.12, proximity_pct * 0.35):
+            chase_signals += 1
+        if move_strategy >= extension_floor * 1.35:
+            chase_signals += 1
+        metrics["chase_signals"] = chase_signals
+        if chase_signals >= 2:
+            metrics["blocked"] = True
+            metrics["reason"] = "late_long_entry_near_structural_high"
+        return metrics
+
+    def _late_long_entry_block_reason(
+        self,
+        snapshot: Dict[str, Any],
+        context: Dict[str, Any],
+        score: Dict[str, Any],
+        final_decision: Dict[str, Any],
+        push: str,
+    ) -> str:
+        return str(self._late_long_entry_eval(snapshot, context, score, final_decision, push).get("reason", "") or "")
+
+    def _pullback_long_entry_eval(
+        self,
+        snapshot: Dict[str, Any],
+        context: Dict[str, Any],
+        score: Dict[str, Any],
+        final_decision: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        metrics: Dict[str, Any] = {
+            "blocked": False,
+            "reason": "",
+            "drawdown_from_high_pct": 0.0,
+            "rally_pct": 0.0,
+            "structure_weak": False,
+        }
+        if not self.config.pullback_long_entry_guard:
+            return metrics
+        if str(final_decision.get("direction", "")) != "做多":
+            return metrics
+
+        price = to_float(snapshot.get("price"))
+        horizon_high, horizon_low = self._horizon_price_window_extremes(snapshot)
+        drawdown_pct = self._drawdown_from_session_high_pct(price, horizon_high)
+        rally_pct = self._session_rally_pct(price, horizon_low)
+        metrics["drawdown_from_high_pct"] = round(drawdown_pct, 4)
+        metrics["rally_pct"] = round(rally_pct, 4)
+
+        phase = str(context.get("trend_phase", "transition") or "transition")
+        if phase == "pullback_in_uptrend":
+            return metrics
+
+        pressure = str(context.get("recent_price_pressure", "neutral") or "neutral")
+        regime = str(context.get("regime", "unknown") or "unknown")
+        trade_down = int(context.get("trade_down", 0) or 0)
+        trade_up = int(context.get("trade_up", 0) or 0)
+
+        profiles = snapshot.get("trend_profiles") or {}
+        if not isinstance(profiles, dict):
+            profiles = {}
+        spec = self._forecast_timeframe_spec()
+        entry_trend = str((profiles.get(spec["lead"]) or {}).get("trend", "mixed") or "mixed")
+        trade_trend = str((profiles.get(spec["target"]) or {}).get("trend", "mixed") or "mixed")
+        down_trends = sum(1 for trend in (entry_trend, trade_trend) if trend == "down")
+        metrics["structure_weak"] = down_trends >= 1
+
+        if drawdown_pct >= DEEP_PULLBACK_FROM_HIGH_PCT:
+            if pressure == "down" or trade_down > trade_up or down_trends >= 1:
+                metrics["blocked"] = True
+                metrics["reason"] = "pullback_downtrend_blocks_long_trade"
+                return metrics
+
+        if regime == "trend_down":
+            metrics["blocked"] = True
+            metrics["reason"] = "pullback_downtrend_blocks_long_trade"
+            return metrics
+        if pressure == "down" and trade_down >= 2 and trade_down > trade_up:
+            if down_trends >= 1 or regime in ("high_volatility", "mixed", "range", "trend_down"):
+                metrics["blocked"] = True
+                metrics["reason"] = "pullback_downtrend_blocks_long_trade"
+        return metrics
+
+    def _pullback_blocks_long_trade(
+        self,
+        snapshot: Dict[str, Any],
+        context: Dict[str, Any],
+        score: Dict[str, Any],
+        final_decision: Dict[str, Any],
+    ) -> str:
+        return str(
+            self._pullback_long_entry_eval(snapshot, context, score, final_decision).get("reason", "") or ""
+        )
+
+    def _trade_push_confidence(self, final_decision: Dict[str, Any], score: Dict[str, Any]) -> int:
+        confidence = max(0, min(100, int(final_decision.get("confidence", 0) or 0)))
+        if str(final_decision.get("decision_source", "") or "") != "ai":
+            return confidence
+        forward = final_decision.get("forward_view") if isinstance(final_decision.get("forward_view"), dict) else {}
+        forward_prob = int(forward.get("probability", 0) or 0)
+        if forward_prob > 0:
+            return min(confidence, forward_prob)
+        return confidence
+
+    def _calibration_threshold_penalty(
+        self,
+        hit_rate: float,
+        disable_below: float,
+        *,
+        trend_aligned: bool,
+    ) -> int:
+        if hit_rate >= disable_below:
+            return 0
+        gap = max(0.0, disable_below - hit_rate)
+        multiplier = 8 if trend_aligned else 22
+        return max(0, int(round(gap * multiplier)))
+
+    def _calibration_base_push_threshold(
+        self,
+        direction: str,
+        push: str,
+        score: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        if push == "spike":
+            return self._strategy_spike_score_threshold()
+        return self.trade_push_score(direction)
+
     def _apply_ai_calibration_audit(
         self,
         audited: Dict[str, Any],
         snapshot: Dict[str, Any],
+        score: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if not self.config.calibration_enabled:
             return audited
@@ -5390,30 +6062,60 @@ class OkxAiShortTermAssistant:
         bucket_key = self._decision_calibration_key(inst_id, "ai", push, direction, regime)
         meta = calibration_bucket_stats(self._calibration_buckets(), bucket_key)
         samples = int(meta.get("total", 0) or 0)
-        if samples < max(6, int(self.config.calibration_min_samples)):
+        min_samples = max(12, int(self.config.calibration_min_samples))
+        if samples < min_samples:
             return audited
 
         hit_rate = float(meta.get("hit_rate", 0.0) or 0.0)
         audit = dict(audited.get("post_audit") or {"action": "kept", "reasons": []})
-        if hit_rate < float(self.config.calibration_disable_below_hit_rate):
-            audited = dict(audited)
-            audited["push_recommendation"] = self._downgrade_push_recommendation(
-                push,
-                int(audited.get("confidence", 0) or 0),
+        context = snapshot.get("market_context", {}) if isinstance(snapshot.get("market_context"), dict) else {}
+        trend_aligned = self._trend_aligned_with_direction(direction, context, score, audited)
+        disable_below = float(self.config.calibration_disable_below_hit_rate)
+        base_threshold = self._calibration_base_push_threshold(direction, push, score)
+        confidence = int(audited.get("confidence", 0) or 0)
+        audited = dict(audited)
+        audited["pre_calibration_recommendation"] = push
+        hint = {
+            "bucket": bucket_key,
+            "hit_rate": round(hit_rate, 4),
+            "samples": samples,
+            "trend_aligned": trend_aligned,
+        }
+
+        if hit_rate < disable_below:
+            penalty = self._calibration_threshold_penalty(
+                hit_rate,
+                disable_below,
+                trend_aligned=trend_aligned,
             )
+            effective_threshold = min(100, base_threshold + penalty)
+            audited["calibration_effective_threshold"] = effective_threshold
+            hint["effective_threshold"] = effective_threshold
+            hint["threshold_penalty"] = penalty
+            audited["calibration_hint"] = hint
+            if confidence >= effective_threshold:
+                audit.setdefault("reasons", []).append(
+                    f"ai_calibration_threshold_raised:{effective_threshold}"
+                )
+                audited["post_audit"] = audit
+                return audited
+
+            audited["push_recommendation"] = self._downgrade_push_recommendation(push, confidence)
             audit["action"] = "downgraded"
             audit.setdefault("reasons", []).append(f"ai_calibration_low_hit_rate:{hit_rate:.2f}")
             audited["post_audit"] = audit
-            audited["calibration_hint"] = {
-                "bucket": bucket_key,
-                "hit_rate": round(hit_rate, 4),
-                "samples": samples,
+            audited["calibration_shadow_track"] = {
+                "push_kind": push,
+                "direction": direction,
+                "confidence": confidence,
+                "reason": f"ai_calibration_low_hit_rate:{hit_rate:.2f}",
             }
-        elif hit_rate >= 0.6 and push == "trade":
-            audited = dict(audited)
-            conf = int(audited.get("confidence", 0) or 0)
+            return audited
+
+        audited["calibration_hint"] = hint
+        if hit_rate >= 0.6 and push == "trade":
             threshold = self.trade_push_score(direction)
-            if conf < threshold and conf >= threshold - 2:
+            if confidence < threshold and confidence >= threshold - 2:
                 audited["confidence"] = min(100, threshold)
                 audit.setdefault("reasons", []).append(f"ai_calibration_boost:{hit_rate:.2f}")
                 audited["post_audit"] = audit
@@ -7514,6 +8216,7 @@ class OkxAiShortTermAssistant:
                 "sentiment_leading",
                 "sentiment_structure_conflict",
                 "structure_forecast_active",
+                "post_peak_rollover",
             }
         ):
             return True
@@ -7555,6 +8258,9 @@ class OkxAiShortTermAssistant:
             return []
 
         reasons: List[str] = []
+        rollover = self._post_peak_rollover_ai_reason(inst_id, score, snapshot)
+        if rollover:
+            reasons.append(rollover)
         direction = str(score.get("final_direction", score.get("direction", "")) or "")
         if direction not in ("做多", "做空"):
             direction = str(score.get("raw_direction", "") or "")
@@ -7666,7 +8372,7 @@ class OkxAiShortTermAssistant:
     ) -> bool:
         reason_set = set(trigger_reasons or [])
         if reason_set.intersection(
-            {"sustained_displacement", "high_probability_forecast", "direction_reversal"}
+            {"sustained_displacement", "high_probability_forecast", "direction_reversal", "post_peak_rollover"}
         ):
             return True
         strong_types = signal_types.intersection({"volume_spike", "structure_break", "oi_change"})
@@ -7794,6 +8500,44 @@ class OkxAiShortTermAssistant:
         push = str(audited.get("push_recommendation", "none") or "none")
         confidence = int(audited.get("confidence", 0) or 0)
 
+        horizon_high, horizon_low = self._horizon_price_window_extremes(snapshot)
+        price = to_float(snapshot.get("price"))
+        drawdown_pct = self._drawdown_from_session_high_pct(price, horizon_high)
+        rally_pct = self._session_rally_pct(price, horizon_low)
+        audited["drawdown_from_high_pct"] = round(drawdown_pct, 4)
+        audited["market_leg"] = self._market_leg_label(snapshot, context)
+        short_favor = self._post_peak_short_favor_eval(snapshot, context, score, drawdown_pct, rally_pct)
+        audited["post_peak_short_favor"] = short_favor
+
+        if short_favor.get("active") and self.config.post_peak_short_entry_favor:
+            local_dir = str(score.get("final_direction", score.get("direction", "")) or "")
+            local_score = int(score.get("final_trade_score", score.get("raw_total_score", 0)) or 0)
+            if (
+                direction == "观望"
+                and local_dir == "做空"
+                and local_score >= POST_PEAK_MIN_SHORT_CONF
+                and drawdown_pct >= DEEP_PULLBACK_FROM_HIGH_PCT
+            ):
+                pressure = str(context.get("recent_price_pressure", "neutral") or "neutral")
+                trade_down = int(context.get("trade_down", 0) or 0)
+                trade_up = int(context.get("trade_up", 0) or 0)
+                if pressure == "down" or trade_down > trade_up:
+                    audited["direction"] = "做空"
+                    audited["confidence"] = max(confidence, local_score)
+                    direction = "做空"
+                    confidence = int(audited["confidence"])
+                    audited["push_recommendation"] = "trade"
+                    push = "trade"
+                    audit["action"] = "promoted"
+                    audit["reasons"].append("post_peak_local_short_promote")
+            elif self._post_peak_short_promote_eligible(
+                direction, push, confidence, short_favor, context, drawdown_pct
+            ):
+                audited["push_recommendation"] = "trade"
+                push = "trade"
+                audit["action"] = "promoted"
+                audit["reasons"].append("post_peak_short_favor_promote")
+
         if scalp_active and scalp_dir in ("做多", "做空"):
             audited["scalp_direction"] = scalp_dir
             audited["scalp_score"] = int(scalp_view.get("score", 0) or 0)
@@ -7804,6 +8548,24 @@ class OkxAiShortTermAssistant:
                 audit["reasons"].append("l3_trade_to_spike")
                 push = "spike"
                 confidence = int(audited.get("confidence", 0) or 0)
+
+        if (
+            push in ("none", "watch")
+            and direction in ("做多", "做空")
+            and trigger.get("level") == "L3"
+            and "scalp_spike" in trigger_reasons
+            and scalp_active
+            and scalp_dir in ("做多", "做空")
+            and direction == scalp_dir
+        ):
+            audited["push_recommendation"] = "spike"
+            audited["confidence"] = max(confidence, int(scalp_view.get("score", 0) or 0))
+            audited["strategy_spike_qualified"] = True
+            audited["effective_spike_score"] = self._strategy_spike_score_threshold()
+            audit["action"] = "promoted"
+            audit["reasons"].append("l3_scalp_spike_from_ai_watch")
+            push = "spike"
+            confidence = int(audited.get("confidence", 0) or 0)
 
         if push == "spike" and scalp_active:
             audited["confidence"] = max(confidence, int(scalp_view.get("score", 0) or 0))
@@ -7834,10 +8596,11 @@ class OkxAiShortTermAssistant:
                 audit["reasons"].append("opposes_scalp_spike")
                 blocked = True
             elif direction == "做空" and pressure == "up" and push == "trade":
-                audited["push_recommendation"] = self._downgrade_push_recommendation("trade", confidence)
-                audit["action"] = "blocked"
-                audit["reasons"].append("pressure_up_blocks_short_trade")
-                blocked = True
+                if not self._pullback_favors_short(context, score) and not short_favor.get("active"):
+                    audited["push_recommendation"] = self._downgrade_push_recommendation("trade", confidence)
+                    audit["action"] = "blocked"
+                    audit["reasons"].append("pressure_up_blocks_short_trade")
+                    blocked = True
             elif direction == "做多" and pressure == "down" and push == "trade":
                 audited["push_recommendation"] = self._downgrade_push_recommendation("trade", confidence)
                 audit["action"] = "blocked"
@@ -7856,7 +8619,11 @@ class OkxAiShortTermAssistant:
                         audited["push_recommendation"] = "none"
                         audit["action"] = "blocked"
                         audit["reasons"].append("confidence_hug_opposes_scalp")
-                    elif context.get("regime") in ("range", "mixed") and context.get("bias", "neutral") == "neutral":
+                    elif (
+                        context.get("regime") in ("range", "mixed")
+                        and context.get("bias", "neutral") == "neutral"
+                        and not self._trend_aligned_with_direction(direction, context, score, audited)
+                    ):
                         audited["push_recommendation"] = self._downgrade_push_recommendation("trade", confidence)
                         audit["action"] = "downgraded"
                         audit["reasons"].append("confidence_hug_range_neutral")
@@ -7876,9 +8643,55 @@ class OkxAiShortTermAssistant:
                 )
                 audit["action"] = "blocked"
                 audit["reasons"].append(align_reason)
+                push = str(audited.get("push_recommendation", "none") or "none")
+
+        if push in ("trade", "spike"):
+            post_peak_eval = self._post_peak_long_entry_eval(snapshot, context, audited, push)
+            audited["post_peak_eval"] = post_peak_eval
+            if post_peak_eval.get("blocked"):
+                audited["push_recommendation"] = self._downgrade_push_recommendation(
+                    push,
+                    int(audited.get("confidence", 0) or 0),
+                )
+                audit["action"] = "blocked"
+                audit["reasons"].append(str(post_peak_eval.get("reason", "") or "post_peak_blocks_long_trade"))
+                push = str(audited.get("push_recommendation", "none") or "none")
+
+        if push in ("trade", "spike"):
+            pullback_eval = self._pullback_long_entry_eval(snapshot, context, score, audited)
+            audited["pullback_eval"] = pullback_eval
+            if pullback_eval.get("blocked"):
+                audited["push_recommendation"] = self._downgrade_push_recommendation(
+                    push,
+                    int(audited.get("confidence", 0) or 0),
+                )
+                audit["action"] = "blocked"
+                audit["reasons"].append(str(pullback_eval.get("reason", "") or "pullback_downtrend_blocks_long_trade"))
+                push = str(audited.get("push_recommendation", "none") or "none")
+
+        if push in ("trade", "spike") and direction == "做空":
+            boost = 0
+            if self._pullback_favors_short(context, score):
+                boost = max(boost, 5)
+            if short_favor.get("active"):
+                boost = max(boost, int(short_favor.get("boost", 0) or 0))
+            if boost > 0:
+                audited["downtrend_short_boost"] = boost
+
+        if push in ("trade", "spike"):
+            late_eval = self._late_long_entry_eval(snapshot, context, score, audited, push)
+            audited["late_entry_eval"] = late_eval
+            late_long_reason = str(late_eval.get("reason", "") or "")
+            if late_long_reason:
+                audited["push_recommendation"] = self._downgrade_push_recommendation(
+                    push,
+                    int(audited.get("confidence", 0) or 0),
+                )
+                audit["action"] = "blocked"
+                audit["reasons"].append(late_long_reason)
 
         audited["post_audit"] = audit
-        audited = self._apply_ai_calibration_audit(audited, snapshot)
+        audited = self._apply_ai_calibration_audit(audited, snapshot, score)
         return audited
 
     def _in_reverse_trade_cooldown(self, inst_id: str, direction: str) -> bool:
@@ -8122,12 +8935,12 @@ class OkxAiShortTermAssistant:
             return ""
         if not self.ai_enabled:
             return "wechat_requires_ai_enabled"
-        if not trigger.get("ai_invoked"):
+        if not trigger.get("ai_invoked") and not decision.get("ai_trade_persisted"):
             return f"{push_kind}_wechat_requires_ai_review"
         source = str(decision.get("decision_source", "") or "")
         if source == "local_fallback":
             return f"{push_kind}_wechat_ai_review_failed"
-        if source != "ai":
+        if source not in ("ai", "ai_persisted"):
             return f"{push_kind}_wechat_requires_ai_decision"
         if not analysis or not analysis.get("valid_json"):
             return f"{push_kind}_wechat_ai_invalid"
@@ -8192,19 +9005,22 @@ class OkxAiShortTermAssistant:
         trigger: Dict[str, Any],
         snapshot: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        inst_id = str(snapshot.get("inst_id", "")) if isinstance(snapshot, dict) else ""
         if analysis and analysis.get("valid_json") and isinstance(analysis.get("parsed"), dict):
             return self._build_ai_final_decision(analysis, score, signals, trigger, snapshot)
 
-        source = "local_fallback" if trigger.get("ai_invoked") else "local_screening"
-        ai_called = bool(trigger.get("ai_invoked"))
-        return self._build_local_final_decision(
+        decision = self._build_local_final_decision(
             score,
             signals,
             trigger,
             snapshot,
-            decision_source=source,
-            ai_called=ai_called,
+            decision_source="local_fallback" if trigger.get("ai_invoked") else "local_screening",
+            ai_called=bool(trigger.get("ai_invoked")),
         )
+        persisted = self._persisted_ai_trade_decision(inst_id) if inst_id else None
+        if persisted:
+            decision = self._blend_persisted_ai_trade(decision, persisted)
+        return decision
 
     def push_gate(
         self,
@@ -8212,7 +9028,7 @@ class OkxAiShortTermAssistant:
         signals: List[Dict[str, Any]],
         score: Optional[Dict[str, Any]] = None,
     ) -> str:
-        if not signals:
+        if not signals and not self._confirmed_push_exempt_no_signals(final_decision):
             return ""
 
         recommendation = str(final_decision.get("push_recommendation", "none") or "none")
@@ -8225,7 +9041,9 @@ class OkxAiShortTermAssistant:
         if recommendation == "spike":
             if not self.config.signal_spike_enabled:
                 return ""
-            threshold = self._strategy_spike_score_threshold()
+            threshold = int(final_decision.get("calibration_effective_threshold") or 0)
+            if threshold <= 0:
+                threshold = self._strategy_spike_score_threshold()
             if confidence < threshold:
                 return ""
             if self._strategy_mode() in ("swing", "long"):
@@ -8253,7 +9071,27 @@ class OkxAiShortTermAssistant:
                 return ""
             if final_decision.get("direction") not in ("做多", "做空"):
                 return ""
-            if confidence < self.trade_push_score(final_decision.get("direction", "")):
+            direction = str(final_decision.get("direction", "") or "")
+            threshold = int(final_decision.get("calibration_effective_threshold") or 0)
+            if threshold <= 0:
+                threshold = self.trade_push_score(direction)
+            boost = int(final_decision.get("downtrend_short_boost", 0) or 0)
+            if boost > 0 and direction == "做空":
+                threshold = max(50, threshold - boost)
+            gate_confidence = self._trade_push_confidence(final_decision, score)
+            forward = (
+                final_decision.get("forward_view")
+                if isinstance(final_decision.get("forward_view"), dict)
+                else {}
+            )
+            forward_prob = int(forward.get("probability", 0) or 0)
+            if (
+                str(final_decision.get("decision_source", "") or "") == "ai"
+                and forward_prob > 0
+                and forward_prob < threshold
+            ):
+                return ""
+            if gate_confidence < threshold:
                 return ""
             if self._forward_alignment_block_reason(final_decision, score, push_kind="trade"):
                 return ""
@@ -8374,7 +9212,7 @@ class OkxAiShortTermAssistant:
             "direction": final_decision.get("direction"),
             "confidence": final_decision.get("confidence"),
         }
-        if not signals:
+        if not signals and not self._confirmed_push_exempt_no_signals(final_decision):
             return {**base, "kind": "", "status": "skipped", "reason": "no_signals"}
         if recommendation == "none":
             return {**base, "kind": "", "status": "skipped", "reason": "push_recommendation_none"}
@@ -8388,14 +9226,31 @@ class OkxAiShortTermAssistant:
                 "reason": self._push_gate_block_reason(final_decision, signals, score, recommendation),
             }
 
-        if push_kind == "trade" and self._in_reverse_trade_cooldown(
-            snapshot["inst_id"], final_decision.get("direction", "")
-        ):
-            return {**base, "kind": push_kind, "status": "blocked", "reason": "reverse_trade_cooldown"}
-
-        push_key = self._push_key(snapshot, push_kind, str(final_decision.get("direction", "观望") or "观望"))
-        if self._in_push_cooldown(push_key, push_kind):
-            return {**base, "kind": push_kind, "status": "blocked", "reason": "cooldown", "push_key": push_key}
+        direction = str(final_decision.get("direction", "观望") or "观望")
+        push_key = self._push_key(snapshot, push_kind, direction)
+        push_confidence = int(final_decision.get("confidence", 0) or 0)
+        repeat_block = self._repeat_direction_entry_block(
+            snapshot, snapshot["inst_id"], direction, push_kind
+        )
+        if repeat_block:
+            return {
+                **base,
+                "kind": push_kind,
+                "status": "blocked",
+                "reason": repeat_block,
+                "push_key": push_key,
+            }
+        cooldown_reason = self._push_cooldown_block_reason(
+            push_key, push_kind, snapshot, push_confidence, direction
+        )
+        if cooldown_reason:
+            return {
+                **base,
+                "kind": push_kind,
+                "status": "blocked",
+                "reason": cooldown_reason,
+                "push_key": push_key,
+            }
 
         return {
             **base,
@@ -8407,9 +9262,67 @@ class OkxAiShortTermAssistant:
     def _push_key(self, snapshot: Dict[str, Any], push_kind: str, direction: str) -> str:
         return f"{push_kind}:{snapshot['inst_id']}:{direction or '观望'}"
 
-    def _in_inst_wechat_cooldown(self, inst_id: str) -> bool:
+    def _direction_cooldown_key(self, inst_id: str, direction: str) -> str:
+        return f"dir:{inst_id}:{direction or '观望'}"
+
+    def _same_trend_push_cooldown_seconds(self) -> int:
+        return max(
+            600,
+            env_int(
+                "SAME_TREND_PUSH_COOLDOWN_SECONDS",
+                DEFAULT_SAME_TREND_PUSH_COOLDOWN_SECONDS,
+            ),
+        )
+
+    def _repeat_direction_entry_block(
+        self,
+        snapshot: Dict[str, Any],
+        inst_id: str,
+        direction: str,
+        push_kind: str,
+    ) -> str:
+        if push_kind not in ("trade", "spike") or direction not in ("做多", "做空"):
+            return ""
+        dir_key = self._direction_cooldown_key(inst_id, direction)
+        if self.last_push_at.get(dir_key, 0.0) <= 0:
+            return ""
+        price = to_float(snapshot.get("price"))
+        if price <= 0:
+            return ""
+        horizon_high, horizon_low = self._horizon_price_window_extremes(snapshot)
+        if direction == "做空" and horizon_low > 0:
+            if pct_change(price, horizon_low) <= REPEAT_SHORT_NEAR_LOCAL_LOW_PCT:
+                return "repeat_short_near_local_low"
+        if direction == "做多" and horizon_high > 0:
+            if pct_change(horizon_high, price) <= REPEAT_LONG_NEAR_LOCAL_HIGH_PCT:
+                return "repeat_long_near_local_high"
+        return ""
+
+    def _same_direction_trend_leg_reset(
+        self,
+        meta: Dict[str, Any],
+        snapshot: Optional[Dict[str, Any]],
+        direction: str,
+    ) -> bool:
+        if not snapshot or direction not in ("做多", "做空"):
+            return False
+        last_price = to_float(meta.get("price"))
+        price = to_float(snapshot.get("price"))
+        if last_price <= 0 or price <= 0:
+            return False
+        if direction == "做空":
+            return pct_change(price, last_price) >= SAME_TREND_LEG_RESET_BOUNCE_PCT
+        return pct_change(last_price, price) >= SAME_TREND_LEG_RESET_BOUNCE_PCT
+
+    def _in_inst_wechat_cooldown(self, inst_id: str, direction: str = "") -> bool:
         last_at = self.last_wechat_push_at.get(inst_id, 0.0)
-        return self._now_ts() - last_at < DEFAULT_WECHAT_MIN_INTERVAL_SECONDS
+        if self._now_ts() - last_at >= DEFAULT_WECHAT_MIN_INTERVAL_SECONDS:
+            return False
+        if direction in ("做多", "做空"):
+            last_trade = self.last_trade_push_at.get(inst_id)
+            if last_trade and last_trade[0] != direction:
+                return False
+        return True
 
     def _mark_wechat_push_sent(
         self,
@@ -8417,9 +9330,21 @@ class OkxAiShortTermAssistant:
         push_key: str,
         push_kind: str,
         decision: Dict[str, Any],
+        snapshot: Optional[Dict[str, Any]] = None,
     ) -> None:
         now = self._now_ts()
+        direction = str(decision.get("direction", "观望") or "观望")
+        push_meta = {
+            "price": to_float(snapshot.get("price")) if snapshot else 0.0,
+            "ts": now,
+            "confidence": int(decision.get("confidence", 0) or 0),
+        }
         self.last_push_at[push_key] = now
+        self.last_push_meta[push_key] = push_meta
+        if push_kind in ("trade", "spike") and direction in ("做多", "做空"):
+            dir_key = self._direction_cooldown_key(inst_id, direction)
+            self.last_push_at[dir_key] = now
+            self.last_push_meta[dir_key] = push_meta
         self.last_wechat_push_at[inst_id] = now
         if push_kind == "brief":
             lifecycle = str(decision.get("lifecycle_event") or "")
@@ -8593,11 +9518,10 @@ class OkxAiShortTermAssistant:
                     refined[idx] = blocked
 
         inst_id = snapshot["inst_id"]
-        inst_blocked = self._in_inst_wechat_cooldown(inst_id)
         selected: Optional[Dict[str, Any]] = None
         selected_index = -1
 
-        if eligible and not inst_blocked:
+        if eligible:
             ordered = sorted(
                 eligible,
                 key=lambda row: WECHAT_PUSH_KIND_PRIORITY.index(row[1])
@@ -8605,11 +9529,15 @@ class OkxAiShortTermAssistant:
                 else 99,
             )
             for ref_index, kind, decision, push_key in ordered:
-                if kind == "trade" and self._in_reverse_trade_cooldown(
-                    inst_id, decision.get("direction", "")
-                ):
+                direction = str(decision.get("direction", "观望") or "观望")
+                if self._in_inst_wechat_cooldown(inst_id, direction):
                     continue
-                if self._in_push_cooldown(push_key, kind):
+                push_confidence = int(decision.get("confidence", 0) or 0)
+                if self._repeat_direction_entry_block(snapshot, inst_id, direction, kind):
+                    continue
+                if self._in_push_cooldown(
+                    push_key, kind, snapshot, push_confidence, direction
+                ):
                     continue
                 selected_index = ref_index
                 selected = {
@@ -8625,10 +9553,7 @@ class OkxAiShortTermAssistant:
             if selected_index >= 0 and idx == selected_index:
                 continue
             blocked = dict(item)
-            if inst_blocked:
-                blocked["status"] = "blocked"
-                blocked["reason"] = "wechat_inst_cooldown"
-            elif selected_index >= 0:
+            if selected_index >= 0:
                 blocked["status"] = "gate_blocked"
                 blocked["reason"] = "wechat_superseded"
             else:
@@ -8660,14 +9585,14 @@ class OkxAiShortTermAssistant:
         if not self.push_enabled:
             label = dry_run_label or "dry-run"
             self._log_push_event(snapshot, signals, decision, push_kind, label)
-            self._mark_wechat_push_sent(inst_id, push_key, push_kind, decision)
+            self._mark_wechat_push_sent(inst_id, push_key, push_kind, decision, snapshot)
             return
 
         send_key = os.getenv("WECHAT_SEND_KEY", "").strip()
         if not send_key:
             console_debug(f"[{now_text()}] WeChat push skipped: WECHAT_SEND_KEY is not configured")
             self._log_push_event(snapshot, signals, decision, push_kind, "skipped(no wechat key)")
-            self._mark_wechat_push_sent(inst_id, push_key, push_kind, decision)
+            self._mark_wechat_push_sent(inst_id, push_key, push_kind, decision, snapshot)
             return
 
         self._push_wechat(
@@ -8680,7 +9605,7 @@ class OkxAiShortTermAssistant:
             local_score=score,
             trigger=trigger or {},
         )
-        self._mark_wechat_push_sent(inst_id, push_key, push_kind, decision)
+        self._mark_wechat_push_sent(inst_id, push_key, push_kind, decision, snapshot)
 
     def dispatch_wechat_push_if_needed(
         self,
@@ -8790,8 +9715,18 @@ class OkxAiShortTermAssistant:
 
         direction = str(forecast.get("direction", "观望") or "观望")
         push_key = self._push_key(snapshot, push_kind, direction)
-        if self._in_push_cooldown(push_key, push_kind):
-            return {**base, "kind": push_kind, "status": "blocked", "reason": "cooldown", "push_key": push_key}
+        forecast_confidence = int(probability)
+        cooldown_reason = self._push_cooldown_block_reason(
+            push_key, push_kind, snapshot, forecast_confidence, direction
+        )
+        if cooldown_reason:
+            return {
+                **base,
+                "kind": push_kind,
+                "status": "blocked",
+                "reason": cooldown_reason,
+                "push_key": push_key,
+            }
 
         return {
             **base,
@@ -8851,12 +9786,38 @@ class OkxAiShortTermAssistant:
         for item in tracks:
             if item.get("status") == "would_push":
                 item["wechat"] = wechat_mode
+        post_audit = final_decision.get("post_audit") if isinstance(final_decision.get("post_audit"), dict) else {}
+        cal_hint = final_decision.get("calibration_hint") if isinstance(final_decision.get("calibration_hint"), dict) else {}
+        pre_push = str(final_decision.get("pre_calibration_recommendation", "") or "")
+        current_push = str(final_decision.get("push_recommendation", "none") or "none")
+        late_eval = final_decision.get("late_entry_eval") if isinstance(final_decision.get("late_entry_eval"), dict) else {}
         return {
             "would_push": would_push,
             "push_enabled": self.push_enabled,
             "wechat_sent": would_push and self.push_enabled,
             "tracks": tracks,
             "ai": self._build_ai_analysis_summary(analysis, trigger, final_decision),
+            "calibration": {
+                "pre_recommendation": pre_push or None,
+                "effective_threshold": final_decision.get("calibration_effective_threshold"),
+                "hint": cal_hint or None,
+                "post_audit_action": post_audit.get("action"),
+                "post_audit_reasons": post_audit.get("reasons") or [],
+                "would_push_without_calibration": bool(
+                    pre_push in ("trade", "spike")
+                    and current_push == "none"
+                    and pre_push
+                ),
+            },
+            "guard": {
+                "market_leg": final_decision.get("market_leg"),
+                "drawdown_from_high_pct": final_decision.get("drawdown_from_high_pct"),
+                "late_entry_eval": late_eval or None,
+                "pullback_eval": final_decision.get("pullback_eval"),
+                "post_peak_eval": final_decision.get("post_peak_eval"),
+                "post_peak_short_favor": final_decision.get("post_peak_short_favor"),
+                "downtrend_short_boost": final_decision.get("downtrend_short_boost"),
+            },
         }
 
     def _forecast_push_decision(
@@ -9146,6 +10107,7 @@ class OkxAiShortTermAssistant:
 
         final_decision = self.merge_final_decision(analysis, score, signals, trigger, snapshot)
         final_decision = self._apply_decision_post_audit(final_decision, score, signals, trigger, snapshot)
+        self._update_ai_trade_persist(inst_id, final_decision, trigger)
         snapshot["forecast_tracking"] = self.update_forecast_tracking(snapshot, score)
         snapshot["decision_calibration_tracking"] = self.update_decision_calibration_tracking(
             snapshot, final_decision, score
@@ -9157,11 +10119,10 @@ class OkxAiShortTermAssistant:
             self._paper_direction_from_final_decision(final_decision),
         )
         self._log_console_summary(snapshot, signals, final_decision, analysis, trigger, score)
-        push_analysis: Optional[Dict[str, Any]] = None
+        push_analysis = self._build_push_analysis(
+            snapshot, signals, final_decision, score, analysis, trigger
+        )
         if self.replay_mode:
-            push_analysis = self._build_push_analysis(
-                snapshot, signals, final_decision, score, analysis, trigger
-            )
             if self.push_enabled:
                 self.dispatch_wechat_push_if_needed(
                     snapshot,
@@ -9179,7 +10140,13 @@ class OkxAiShortTermAssistant:
             self._log_replay_push_summary(snapshot, final_decision, push_analysis)
         else:
             self.dispatch_wechat_push_if_needed(
-                snapshot, signals, final_decision, analysis, score, trigger
+                snapshot,
+                signals,
+                final_decision,
+                analysis,
+                score,
+                trigger,
+                push_analysis=push_analysis,
             )
         self.log_result(snapshot, signals, score, analysis, trigger, final_decision, push_analysis)
 
@@ -9203,6 +10170,15 @@ class OkxAiShortTermAssistant:
             f"[{now_text()}] replay start: {total} frames -> {self.replay_log_file} "
             f"{ai_note} {push_note}"
         )
+        replay_inst_ids = sorted(
+            {
+                str(frame.get("inst_id", ""))
+                for frame in frames
+                if str(frame.get("inst_id", ""))
+            }
+        )
+        self._reset_replay_calibration_state(replay_inst_ids)
+        self.last_ai_trade_decision.clear()
         for index, frame in enumerate(frames, start=1):
             inst_id = str(frame.get("inst_id", ""))
             if inst_id not in self.instruments:
@@ -9222,7 +10198,11 @@ class OkxAiShortTermAssistant:
 
     def _prune_runtime_caches(self) -> None:
         now = time.time()
-        push_keep = max(3600.0, float(self.runtime_config.push_cooldown_seconds) * 2)
+        push_keep = max(
+            14400.0,
+            float(self.runtime_config.push_cooldown_seconds) * 2,
+            float(self._same_trend_push_cooldown_seconds()) * 1.5,
+        )
         for key, last_at in list(self.last_push_at.items()):
             if now - last_at > push_keep:
                 self.last_push_at.pop(key, None)
@@ -11790,9 +12770,76 @@ class OkxAiShortTermAssistant:
         )
         return f"[OKX AI短线助手][{push_kind}] {title}\n\n{desp}"
 
-    def _in_push_cooldown(self, push_key: str, push_kind: str = "trade") -> bool:
-        last_at = self.last_push_at.get(push_key, 0.0)
-        return self._now_ts() - last_at < self._push_cooldown_seconds(push_kind)
+    def _push_cooldown_check_keys(
+        self,
+        push_key: str,
+        push_kind: str,
+        snapshot: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        keys = [push_key]
+        if push_kind not in ("trade", "spike") or not snapshot:
+            return keys
+        direction = push_key.rsplit(":", 1)[-1]
+        inst_id = str(snapshot.get("inst_id", "") or "")
+        if inst_id and direction in ("做多", "做空"):
+            dir_key = self._direction_cooldown_key(inst_id, direction)
+            if dir_key not in keys:
+                keys.append(dir_key)
+        return keys
+
+    def _same_direction_cooldown_seconds(self, push_kind: str) -> int:
+        if push_kind in ("trade", "spike"):
+            return max(
+                self._push_cooldown_seconds("trade"),
+                self._push_cooldown_seconds("spike"),
+                self._same_trend_push_cooldown_seconds(),
+            )
+        return self._push_cooldown_seconds(push_kind)
+
+    def _push_cooldown_block_reason(
+        self,
+        push_key: str,
+        push_kind: str,
+        snapshot: Optional[Dict[str, Any]],
+        confidence: Optional[int],
+        direction: str,
+    ) -> str:
+        if self._in_push_cooldown(push_key, push_kind, snapshot, confidence, direction):
+            dir_key = ""
+            if push_kind in ("trade", "spike") and snapshot and direction in ("做多", "做空"):
+                dir_key = self._direction_cooldown_key(str(snapshot.get("inst_id", "") or ""), direction)
+            if dir_key and self.last_push_at.get(dir_key, 0.0) > 0:
+                return "same_trend_cooldown"
+            return "cooldown"
+        return ""
+
+    def _in_push_cooldown(
+        self,
+        push_key: str,
+        push_kind: str = "trade",
+        snapshot: Optional[Dict[str, Any]] = None,
+        confidence: Optional[int] = None,
+        direction: str = "",
+    ) -> bool:
+        if not direction and push_key.count(":") >= 2:
+            direction = push_key.rsplit(":", 1)[-1]
+        cooldown = self._same_direction_cooldown_seconds(push_kind)
+        for key in self._push_cooldown_check_keys(push_key, push_kind, snapshot):
+            last_at = self.last_push_at.get(key, 0.0)
+            if last_at <= 0:
+                continue
+            elapsed = self._now_ts() - last_at
+            meta = self.last_push_meta.get(key, {})
+            if self._same_direction_trend_leg_reset(meta, snapshot, direction):
+                continue
+            if elapsed >= cooldown:
+                continue
+            if confidence is not None and elapsed >= SAME_TREND_REPUSH_MIN_ELAPSED_SECONDS:
+                last_conf = int(meta.get("confidence", 0) or 0)
+                if confidence >= last_conf + SAME_DIRECTION_REPUSH_CONF_MARGIN:
+                    continue
+            return True
+        return False
 
     def _push_wechat(
         self,
@@ -11898,7 +12945,9 @@ def short_count_greater(trends: Dict[str, str]) -> bool:
 
 
 def _assistant_from_user_config(config: Dict[str, Any]) -> OkxAiShortTermAssistant:
-    config = sync_strategy_bound_config(config)
+    config = sync_strategy_bound_config(
+        {**config, "_interval_explicit": "interval" in config}
+    )
     inst_ids = config.get("inst_ids") or list(DEFAULT_MONITOR_INSTRUMENTS)
     if isinstance(inst_ids, str):
         inst_ids = [inst_ids]
@@ -11951,6 +13000,13 @@ def _assistant_from_user_config(config: Dict[str, Any]) -> OkxAiShortTermAssista
                 0.1, min(0.9, float(config.get("calibration_disable_below_hit_rate", 0.38)))
             ),
             calibration_save_interval_seconds=max(15, int(config.get("calibration_save_interval_seconds", 60))),
+            late_long_entry_guard=bool(config.get("late_long_entry_guard", True)),
+            pullback_long_entry_guard=bool(config.get("pullback_long_entry_guard", True)),
+            post_peak_long_entry_guard=bool(config.get("post_peak_long_entry_guard", True)),
+            post_peak_short_entry_favor=bool(config.get("post_peak_short_entry_favor", True)),
+            ai_trade_push_persist_seconds=max(
+                60, int(config.get("ai_trade_push_persist_seconds", AI_TRADE_PUSH_PERSIST_SECONDS))
+            ),
             paper_follow_ai_only=bool(config.get("paper_follow_ai_only", True)),
             paper_fee_bps=max(0.0, float(config.get("paper_fee_bps", 5.0))),
             forward_require_forecast_alignment=bool(config.get("forward_require_forecast_alignment", True)),
@@ -12270,7 +13326,7 @@ def parse_args() -> argparse.Namespace:
         "--interval",
         type=int,
         default=int(os.getenv("OKX_INTERVAL", str(DEFAULT_INTERVAL_SECONDS))),
-        help="Deprecated: interval follows --strategy-mode (scalp/short=5s, swing=60s, long=180s)",
+        help="Monitor loop interval in seconds; defaults to strategy recommendation if omitted",
     )
     parser.add_argument("--runtime", type=int, default=int(os.getenv("OKX_RUNTIME", "0")))
     parser.add_argument("--flag", default=os.getenv("OKX_FLAG", "0"), choices=("0", "1"))
@@ -12454,7 +13510,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     # 程序入口：解析参数，创建助手实例，进入循环。
     args = parse_args()
-    interval = max(recommended_interval_for_strategy(args.strategy_mode), 1)
+    interval = normalize_interval_for_strategy(
+        args.strategy_mode,
+        args.interval,
+        interval_explicit=True,
+    )
     assistant = OkxAiShortTermAssistant(
         instruments=args.inst_ids,
         interval=interval,

@@ -6,6 +6,7 @@ This file intentionally uses only Python standard library modules so the
 Windows deployment can start the UI without installing a web framework.
 """
 
+import base64
 import html
 import io
 import json
@@ -27,7 +28,7 @@ import zipfile
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -45,6 +46,7 @@ from monitor_config_summary import (  # noqa: E402
     STRATEGY_ACCURACY_HORIZON_HINTS,
     STRATEGY_DEFAULT_ACCURACY_HORIZON_SECONDS,
     STRATEGY_DEFAULT_INTERVAL_SECONDS,
+    STRATEGY_INTERVAL_BOUNDS,
 )
 from monitor_design_docs import render_design_docs_html  # noqa: E402
 
@@ -161,6 +163,7 @@ SESSION_TTL_SECONDS = float(os.getenv("WEB_SESSION_TTL_SECONDS", str(7 * 24 * 36
 SESSION_ABSOLUTE_TTL_SECONDS = float(os.getenv("WEB_SESSION_ABSOLUTE_TTL_SECONDS", str(30 * 24 * 3600)))
 REALTIME_LOG_TAIL_BYTES = int(os.getenv("WEB_REALTIME_LOG_TAIL_BYTES", str(16 * 1024 * 1024)))
 ACCURACY_LOG_TAIL_BYTES = int(os.getenv("WEB_ACCURACY_LOG_TAIL_BYTES", str(32 * 1024 * 1024)))
+DEFAULT_ACCURACY_RETENTION_HOURS = 24.0
 LOG_DISPLAY_MAX_LINES = max(500, int(os.getenv("WEB_LOG_DISPLAY_MAX_LINES", "2000")))
 CONSOLE_LOG_MAX_BYTES = int(os.getenv("WEB_CONSOLE_LOG_MAX_BYTES", str(100 * 1024 * 1024)))
 CONSOLE_LOG_TOTAL_MAX_BYTES = int(os.getenv("WEB_CONSOLE_LOG_TOTAL_MAX_BYTES", str(300 * 1024 * 1024)))
@@ -174,7 +177,8 @@ WEB_MAX_CONCURRENT_REQUESTS = max(8, int(os.getenv("WEB_MAX_CONCURRENT_REQUESTS"
 WEB_MONITOR_AUTO_RESTART = os.getenv("WEB_MONITOR_AUTO_RESTART", "1").strip().lower() in ("1", "true", "yes")
 DIAG_EXPORT_MAX_FILE_BYTES = int(os.getenv("WEB_DIAG_EXPORT_MAX_FILE_BYTES", str(32 * 1024 * 1024)))
 DIAG_EXPORT_MAX_ZIP_BYTES = int(os.getenv("WEB_DIAG_EXPORT_MAX_ZIP_BYTES", str(150 * 1024 * 1024)))
-DIAG_EXPORT_REPLAY_DATASET_TAIL_BYTES = int(os.getenv("WEB_DIAG_EXPORT_REPLAY_DATASET_TAIL_BYTES", str(4 * 1024 * 1024)))
+DIAG_EXPORT_REPLAY_DATASET_TAIL_BYTES = int(os.getenv("WEB_DIAG_EXPORT_REPLAY_DATASET_TAIL_BYTES", str(32 * 1024 * 1024)))
+DIAG_EXPORT_REPLAY_DATASET_NAMES = frozenset({"replay_dataset.jsonl", "replay_dataset_historical.jsonl"})
 ACCURACY_HORIZON_OPTIONS: Tuple[Tuple[int, str], ...] = (
     (5, "5秒"),
     (15, "15秒"),
@@ -276,24 +280,25 @@ CONFIG_FIELDS = [
     ("基础运行", "log_max_mb", "number", "单文件日志上限(MB)", "当前分卷达到此大小后轮转；默认500MB，适合约12小时写入量。"),
     ("基础运行", "log_total_max_mb", "number", "日志总容量上限(MB)", "所有分卷合计超过此值时自动删除最旧分卷；默认8192MB（8GB）。监控图表与压测依赖分析日志，建议保持开启。"),
     ("基础运行", "record_replay_enabled", "checkbox", "录制回放数据集", "监控运行时把每轮 collect_snapshot 原始输入写入 replay_dataset.jsonl，供离线回放压测。"),
-    ("策略", "strategy_mode", "strategy_choice", "策略周期", "决定轮询间隔与画像：超短线5秒、短线5秒、中线60秒（推荐）、长线180秒。切换策略会自动更新轮询间隔。"),
+    ("策略", "strategy_mode", "strategy_choice", "策略周期", "决定画像参数、主方向与评分周期：超短线/短线/中线/长线。与下方「轮询间隔」配合使用。"),
+    ("策略", "interval", "number", "轮询间隔(秒)", "监控主循环 sleep 间隔；中线推荐 60，可改为 180/300 等。修改后需重启监控。"),
     ("策略", "risk_preference", "risk_choice", "确认严格度", "保守：更高动量阈值与确认分(88)；标准：默认平衡；激进（推荐）：更低阈值(65)且短线可凭短窗压力给方向。变更后可在下方推送说明中一键填入建议分数。"),
     ("AI与推送", "ai_enabled", "checkbox", "启用AI分析", "开启后除 L2/L3 事件触发外，还可按下方「定时 AI 间隔」固定复核；事件触发仍受策略冷却约束。", "left"),
     ("AI与推送", "push_enabled", "checkbox", "启用微信推送", "每轮最多 1 条；trade/spike/watch 须 AI 复核；演变/静默简报规则见各间隔配置；同币种最短间隔 10 分钟。", "right"),
-    ("AI与推送", "ai_periodic_interval_minutes", "number", "定时 AI 间隔(分钟)", "启用 AI 后，每个监控币种按此间隔固定调用一次分析（无信号也会调）；0 表示关闭。默认 10。修改后需重启监控。", "left"),
+    ("AI与推送", "ai_periodic_interval_minutes", "number", "定时 AI 间隔(分钟)", "启用 AI 后，每个监控币种按此间隔固定调用一次分析（无信号也会调）；0 表示关闭。默认 30。修改后需重启监控。", "left"),
     ("AI与推送", "wechat_silence_brief_minutes", "number", "静默简报间隔(分钟)", "启用后：监控启动/停止各推一次[简报]；距上次静默简报满此分钟后再发例行[简报]（与结构单/急变是否推送无关）。0=关闭。需 AI+微信推送。修改后需重启监控。", "right"),
     ("AI与推送", "push_score", "number", "做多推送门槛(trade)", "direction 为做多且 confidence ≥ 此值时可推 trade。建议见下方「推送分数建议」。", "right"),
     ("AI与推送", "short_push_score", "number", "做空推送门槛(trade)", "direction 为做空且 confidence ≥ 此值时可推 trade；标准模式建议与做多对称(75/75)。", "right"),
 ]
 
 ENV_DEFAULTS = {
-    "AI_MODEL": "gpt-5.5",
-    "AI_BASE_URL": "https://www.right.codes/codex/v1",
+    "AI_MODEL": "",
+    "AI_BASE_URL": "",
 }
 
 ENV_FIELDS = [
     ("OPENAI_API_KEY", "AI API Key", "在 DeepSeek、OpenAI 等平台申请的密钥；须与下方 Base URL 对应。"),
-    ("AI_MODEL", "AI模型", "须与接口匹配，如 DeepSeek 用 deepseek-chat；留空则用环境默认。"),
+    ("AI_MODEL", "AI模型", "须与接口匹配，如 DeepSeek 用 deepseek-chat；留空则须自行填写。"),
     ("AI_BASE_URL", "AI Base URL", "OpenAI 兼容 Base URL；DeepSeek 填 https://api.deepseek.com。"),
     ("WECHAT_SEND_KEY", "微信推送 SendKey", "Server酱 SendKey，用于推送到个人微信。在 https://sct.ftqq.com 获取。"),
 ]
@@ -305,11 +310,11 @@ def default_config() -> Dict[str, Any]:
         "inst_ids": list(DEFAULT_MONITOR_INSTRUMENTS),
         "custom_inst_ids": [],
         "removed_inst_ids": [],
-        "interval": 5,
+        "interval": 60,
         "log_max_mb": DEFAULT_LOG_MAX_BYTES // (1024 * 1024),
         "log_total_max_mb": DEFAULT_LOG_TOTAL_MAX_BYTES // (1024 * 1024),
         "analysis_log_enabled": True,
-        "record_replay_enabled": False,
+        "record_replay_enabled": True,
         "strategy_mode": "swing",
         "risk_preference": "aggressive",
         "signal_trade_enabled": True,
@@ -320,13 +325,13 @@ def default_config() -> Dict[str, Any]:
         "allow_oi_divergence_momentum": False,
         "scalp_move_pct_5m": 0.22,
         "scalp_move_pct_10m": 0.35,
-        "ai_enabled": False,
-        "ai_periodic_interval_minutes": 10,
-        "wechat_silence_brief_minutes": 0,
+        "ai_enabled": True,
+        "ai_periodic_interval_minutes": 30,
+        "wechat_silence_brief_minutes": 120,
         "dry_run_ai": False,
-        "push_enabled": False,
-        "push_score": 70,
-        "short_push_score": 68,
+        "push_enabled": True,
+        "push_score": 65,
+        "short_push_score": 65,
         "volume_multiplier": 2.0,
         "oi_change_pct_15m": 5.0,
         "funding_abs_threshold": 0.0008,
@@ -615,25 +620,26 @@ def normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     merged["ai_output_style"] = derive_ai_output_style(merged)
     loaded = config if isinstance(config, dict) else {}
     suggested = suggested_push_scores(str(merged.get("risk_preference", "standard")))
-    if "push_score" not in loaded:
+    if "push_score" not in loaded and "risk_preference" in loaded:
         merged["push_score"] = suggested["push_score"]
-    if "short_push_score" not in loaded:
+    if "short_push_score" not in loaded and "risk_preference" in loaded:
         merged["short_push_score"] = suggested.get("short_push_score", suggested["push_score"])
     merged["push_score"] = max(0, min(100, int(merged.get("push_score", suggested["push_score"]))))
     merged["short_push_score"] = max(0, min(100, int(merged.get("short_push_score", suggested.get("short_push_score", merged["push_score"])))))
     try:
         merged["ai_periodic_interval_minutes"] = max(
-            0, min(1440, int(merged.get("ai_periodic_interval_minutes", 10) or 0))
+            0, min(1440, int(merged.get("ai_periodic_interval_minutes", 30) or 0))
         )
     except (TypeError, ValueError):
-        merged["ai_periodic_interval_minutes"] = 10
+        merged["ai_periodic_interval_minutes"] = 30
     try:
         merged["wechat_silence_brief_minutes"] = max(
-            0, min(1440, int(merged.get("wechat_silence_brief_minutes", 0) or 0))
+            0, min(1440, int(merged.get("wechat_silence_brief_minutes", 120) or 0))
         )
     except (TypeError, ValueError):
-        merged["wechat_silence_brief_minutes"] = 0
+        merged["wechat_silence_brief_minutes"] = 120
     merged["allow_scalp_trade"] = merged.get("strategy_mode") == "scalp" or bool(merged.get("allow_scalp_trade"))
+    merged["_interval_explicit"] = "interval" in loaded
     normalize_log_size_config(merged, loaded)
     inst_ids = order_configured_inst_ids(merged.get("inst_ids", [])) or list(DEFAULT_MONITOR_INSTRUMENTS)
     custom = order_configured_inst_ids(merged.get("custom_inst_ids", []))
@@ -2674,17 +2680,198 @@ def export_file_bytes(path: Path, *, max_bytes: int, prefer_tail: bool = True) -
     return None, meta
 
 
+def diagnostic_replay_log_has_data() -> bool:
+    if not REPLAY_ANALYSIS_LOG_FILE.exists():
+        return False
+    try:
+        return REPLAY_ANALYSIS_LOG_FILE.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def iter_diagnostic_log_entries() -> List[Tuple[str, Path, int, bool]]:
+    """Archive paths for runtime logs/state (oldest segments first where applicable)."""
+    entries: List[Tuple[str, Path, int, bool]] = []
+    seen: Set[str] = set()
+
+    def add(path: Path, archive_name: str, *, max_bytes: int, prefer_tail: bool = True) -> None:
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path)
+        if key in seen:
+            return
+        seen.add(key)
+        entries.append((archive_name, path, max_bytes, prefer_tail))
+
+    for seg in list_analysis_log_segments(MONITOR_JSON_LOG_FILE):
+        add(seg, f"logs/{seg.name}", max_bytes=DIAG_EXPORT_MAX_FILE_BYTES)
+    if LOG_DIR.exists():
+        for path in sorted(LOG_DIR.iterdir(), key=lambda item: item.name.lower()):
+            if not path.is_file():
+                continue
+            if path in list_analysis_log_segments(MONITOR_JSON_LOG_FILE):
+                continue
+            max_bytes = (
+                DIAG_EXPORT_REPLAY_DATASET_TAIL_BYTES
+                if path.name in DIAG_EXPORT_REPLAY_DATASET_NAMES
+                else DIAG_EXPORT_MAX_FILE_BYTES
+            )
+            add(path, f"logs/{path.name}", max_bytes=max_bytes)
+    for path in (MONITOR_PID_FILE, REPLAY_PID_FILE, WEB_RESTART_SESSIONS_FILE, PORTABLE_CONFIG_FILE):
+        if path.exists() and path.is_file():
+            add(path, f"state/{path.name}", max_bytes=512 * 1024, prefer_tail=False)
+    return entries
+
+
+def _accuracy_direction_value(direction_text: str) -> int:
+    text = str(direction_text or "").strip().lower()
+    if text in ("做多", "long"):
+        return 1
+    if text in ("做空", "short"):
+        return -1
+    return 0
+
+
+def _accuracy_confirm_value(point: Dict[str, Any]) -> int:
+    direction = str(point.get("confirm_direction") or point.get("final_direction") or point.get("direction") or "")
+    return _accuracy_direction_value(direction)
+
+
+def _accuracy_prediction_value(point: Dict[str, Any]) -> int:
+    direction = str(point.get("prediction_direction") or point.get("raw_direction") or "")
+    return _accuracy_direction_value(direction)
+
+
+def _decimate_chart_points(points: List[Dict[str, Any]], max_points: int = 900) -> List[Dict[str, Any]]:
+    if len(points) <= max_points:
+        return points
+    indices = {0, len(points) - 1}
+    slots = max(1, max_points - 2)
+    for slot in range(slots):
+        indices.add(int(round(slot * (len(points) - 1) / max(1, slots - 1))))
+    return [points[index] for index in sorted(indices)]
+
+
+def render_accuracy_chart_svg(bundle: Dict[str, Any]) -> str:
+    raw_points: List[Dict[str, Any]] = []
+    for point in bundle.get("points") or []:
+        if not isinstance(point, dict):
+            continue
+        try:
+            float(point.get("price"))
+        except (TypeError, ValueError):
+            continue
+        raw_points.append(point)
+    points = _decimate_chart_points(raw_points)
+    width, height = 1280, 720
+    pad_l, pad_r, pad_t, pad_b = 72, 72, 56, 52
+    chart_w = width - pad_l - pad_r
+    chart_h = height - pad_t - pad_b
+    inst_id = html.escape(str(bundle.get("inst_id") or ""))
+    scope = html.escape(str(bundle.get("scope") or ""))
+    horizon = int(bundle.get("horizon_seconds") or 0)
+    summary = bundle.get("summary") if isinstance(bundle.get("summary"), dict) else {}
+    acc_pct = summary.get("prediction_accuracy_pct", summary.get("decision_accuracy_pct"))
+    title = f"{inst_id} · {scope} · {horizon}s"
+    subtitle = f"样本 {summary.get('total', summary.get('raw_log_total', len(raw_points)))} · 综合准确 {acc_pct if acc_pct is not None else '--'}%"
+    if not points:
+        return (
+            f'<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">'
+            f'<rect width="100%" height="100%" fill="#0f172a"/>'
+            f'<text x="{width/2:.1f}" y="{height/2:.1f}" fill="#cbd5e1" font-family="Segoe UI, Microsoft YaHei, sans-serif" '
+            f'font-size="18" text-anchor="middle">{title} · 暂无压测点</text></svg>'
+        )
+    if len(points) == 1:
+        points = [points[0], dict(points[0])]
+    prices = [safe_float(point.get("price")) for point in points]
+    confirm_vals: List[int] = []
+    forecast_vals: List[int] = []
+    confirm_acc = 0
+    forecast_acc = 0
+    for point in points:
+        confirm_acc += _accuracy_confirm_value(point)
+        forecast_acc += _accuracy_prediction_value(point)
+        confirm_vals.append(confirm_acc)
+        forecast_vals.append(forecast_acc)
+    price_min, price_max = min(prices), max(prices)
+    dir_min, dir_max = min(confirm_vals + forecast_vals), max(confirm_vals + forecast_vals)
+    price_span = max((price_max - price_min) * 1.12, price_max * 0.001, 0.01)
+    dir_span = max((dir_max - dir_min) * 1.12, 1.0)
+    price_base = price_min - (price_span - (price_max - price_min)) / 2
+    dir_base = dir_min - (dir_span - (dir_max - dir_min)) / 2
+
+    def x_at(index: int) -> float:
+        return pad_l + chart_w * index / max(1, len(points) - 1)
+
+    def y_price(value: float) -> float:
+        norm = (value - price_base) / price_span
+        return pad_t + chart_h - norm * chart_h
+
+    def y_dir(value: int) -> float:
+        norm = (value - dir_base) / dir_span
+        return pad_t + chart_h - norm * chart_h
+
+    def polyline(values: List[float], y_fn, color: str, width: float = 2.0) -> str:
+        coords = " ".join(f"{x_at(i):.1f},{y_fn(values[i]):.1f}" for i in range(len(values)))
+        return f'<polyline fill="none" stroke="{color}" stroke-width="{width}" points="{coords}"/>'
+
+    grid_lines = []
+    for step in range(5):
+        y = pad_t + chart_h * step / 4
+        grid_lines.append(f'<line x1="{pad_l}" y1="{y:.1f}" x2="{width-pad_r}" y2="{y:.1f}" stroke="rgba(148,163,184,0.22)" stroke-width="1"/>')
+    markers = []
+    push_times = {str(point.get("time") or "") for point in points if point.get("would_push")}
+    for marker in bundle.get("push_markers") or []:
+        if not isinstance(marker, dict):
+            continue
+        key = str(marker.get("time") or "")
+        if not key or key in push_times:
+            continue
+        try:
+            price = float(marker.get("price"))
+        except (TypeError, ValueError):
+            continue
+        index = min(range(len(points)), key=lambda idx: abs(idx - (len(points) - 1) * 0.5))
+        for idx, point in enumerate(points):
+            if str(point.get("time") or "") == key:
+                index = idx
+                break
+        markers.append(
+            f'<circle cx="{x_at(index):.1f}" cy="{y_price(price)-16:.1f}" r="5" fill="#f472b6" stroke="#831843" stroke-width="1.2"/>'
+        )
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        f'<rect width="100%" height="100%" fill="#0f172a"/>',
+        f'<text x="{pad_l}" y="28" fill="#e2e8f0" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="18">{title}</text>',
+        f'<text x="{pad_l}" y="48" fill="#94a3b8" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="13">{html.escape(subtitle)}</text>',
+        *grid_lines,
+        polyline(prices, y_price, "#60a5fa", 2.4),
+        polyline([float(v) for v in forecast_vals], y_dir, "#a78bfa", 2.0),
+        polyline([float(v) for v in confirm_vals], y_dir, "#fbbf24", 2.0),
+        *markers,
+        f'<text x="{pad_l}" y="{height-18}" fill="#60a5fa" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="12">蓝线价格</text>',
+        f'<text x="{pad_l+72}" y="{height-18}" fill="#4ade80" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="12">绿线模拟</text>',
+        f'<text x="{width-pad_r}" y="{height-18}" fill="#94a3b8" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="12" text-anchor="end">绘制 {len(points)}/{len(raw_points)} 点</text>',
+        "</svg>",
+    ]
+    return "\n".join(parts)
+
+
 def build_accuracy_export_bundle(
     inst_id: str,
     scope: str,
     horizon_seconds: int,
     *,
-    retention_hours: float = 12.0,
+    retention_hours: float = DEFAULT_ACCURACY_RETENTION_HOURS,
     interval_seconds: Optional[int] = None,
+    for_diagnostic: bool = False,
 ) -> Dict[str, Any]:
     config = normalize_config(load_config())
     interval = max(1, int(interval_seconds or config.get("interval", 5)))
-    retention = max(0.5, min(168.0, float(retention_hours or 12)))
+    retention = max(0.5, min(168.0, float(retention_hours or DEFAULT_ACCURACY_RETENTION_HOURS)))
     horizon = clamp_accuracy_horizon_seconds(horizon_seconds)
     try:
         report = accuracy_report(
@@ -2693,6 +2880,7 @@ def build_accuracy_export_bundle(
             scope=scope,
             retention_hours=retention,
             interval_seconds=interval,
+            for_diagnostic=for_diagnostic,
         )
         return {
             "name": "OKX_Accuracy_Chart",
@@ -2739,8 +2927,11 @@ def diagnostic_readme_text(manifest: Dict[str, Any]) -> str:
         "- README.txt / manifest.json — 本说明与文件清单",
         "- config/bundle.json — 配置与环境变量（API Key / SendKey 已打码）",
         "- status/ — 监控、回放、Token 统计",
-        "- logs/ — JSON 分析、控制台、回放、信号表现等日志",
-        "- accuracy/ — 实时/回放压测图表数据（JSON，可导入测试页「导入图表」）",
+        "- logs/ — 运行时全量日志（分析 JSONL 分卷、控制台、回放、校准、模拟账户等）",
+        "- state/ — 当前 PID、配置快照等运行态文件",
+        "- accuracy/ — 实时/回放/全部历史压测数据（JSON，可导入测试页「导入图表」）",
+        "- charts/svg/ — 压测走势图（SVG，浏览器可直接打开）",
+        "- charts/png/ — 压测/监控走势图（PNG，浏览器导出时附带）",
         "- client/ — 浏览器侧附加（AI 对话、当前压测 UI 快照，如有）",
         "",
         "注意:",
@@ -2764,7 +2955,7 @@ def create_diagnostic_zip(extras: Optional[Dict[str, Any]] = None) -> Tuple[byte
     config = normalize_config(load_config())
     insts = configured_instruments()
     interval = max(1, int(config.get("interval", 5)))
-    retention = 12.0
+    retention = DEFAULT_ACCURACY_RETENTION_HOURS
     files_meta: List[Dict[str, Any]] = []
     total_added = 0
     buf = io.BytesIO()
@@ -2806,7 +2997,7 @@ def create_diagnostic_zip(extras: Optional[Dict[str, Any]] = None) -> Tuple[byte
             "config/bundle.json",
             {
                 "name": "OKX_AI_Diagnostic",
-                "version": "1.0",
+                "version": "1.1",
                 "exported_at": exported_at,
                 "config": config_bundle.get("config", {}),
                 "env": redact_secrets_mapping(config_bundle.get("env", {})),
@@ -2826,48 +3017,39 @@ def create_diagnostic_zip(extras: Optional[Dict[str, Any]] = None) -> Tuple[byte
                 "replay_started_at": REPLAY_STARTED_AT,
                 "replay_stopped_at": REPLAY_STOPPED_AT,
                 "log_size_summary": log_size_summary_text(config),
+                "diagnostic_log_files": [
+                    {"archive": name, "path": str(path), "max_bytes": max_bytes, "prefer_tail": prefer_tail}
+                    for name, path, max_bytes, prefer_tail in iter_diagnostic_log_entries()
+                ],
             },
         )
 
-        for seg in list_analysis_log_segments(MONITOR_JSON_LOG_FILE):
-            arc_name = f"logs/{seg.name}"
-            add_path(arc_name, seg, max_bytes=DIAG_EXPORT_MAX_FILE_BYTES, prefer_tail=True)
-        for path in (
-            MONITOR_PROCESS_LOG_FILE,
-            REPLAY_PROCESS_LOG_FILE,
-            REPLAY_ANALYSIS_LOG_FILE,
-            LOG_DIR / "signal_performance.jsonl",
-            PAPER_ACCOUNT_FILE,
-        ):
-            add_path(f"logs/{path.name}", path, max_bytes=DIAG_EXPORT_MAX_FILE_BYTES, prefer_tail=True)
-        add_path(
-            f"logs/{REPLAY_DATASET_FILE.name}",
-            REPLAY_DATASET_FILE,
-            max_bytes=DIAG_EXPORT_REPLAY_DATASET_TAIL_BYTES,
-            prefer_tail=True,
-        )
+        for archive_name, path, max_bytes, prefer_tail in iter_diagnostic_log_entries():
+            add_path(archive_name, path, max_bytes=max_bytes, prefer_tail=prefer_tail)
 
+        diagnostic_scopes = ["session", "all"]
+        if diagnostic_replay_log_has_data():
+            diagnostic_scopes.append("replay")
         for inst in insts:
+            safe_inst = str(inst).replace("/", "_")
             for horizon in diagnostic_accuracy_horizons(config):
-                bundle = build_accuracy_export_bundle(
-                    inst,
-                    "session",
-                    horizon,
-                    retention_hours=retention,
-                    interval_seconds=interval,
-                )
-                add_json(f"accuracy/session/{inst}_h{horizon}.json", bundle)
-        if replay_results_available():
-            for inst in insts:
-                for horizon in diagnostic_accuracy_horizons(config):
+                for scope in diagnostic_scopes:
                     bundle = build_accuracy_export_bundle(
                         inst,
-                        "replay",
+                        scope,
                         horizon,
                         retention_hours=retention,
                         interval_seconds=interval,
+                        for_diagnostic=True,
                     )
-                    add_json(f"accuracy/replay/{inst}_h{horizon}.json", bundle)
+                    base = f"accuracy/{scope}/{safe_inst}_h{horizon}"
+                    add_json(f"{base}.json", bundle)
+                    svg = render_accuracy_chart_svg(bundle)
+                    add_bytes(
+                        f"charts/svg/{scope}_{safe_inst}_h{horizon}.svg",
+                        svg.encode("utf-8"),
+                        {"kind": "accuracy_chart_svg", "scope": scope, "inst_id": inst},
+                    )
 
         ai_chat = extras.get("ai_chat")
         if isinstance(ai_chat, list) and ai_chat:
@@ -2875,10 +3057,38 @@ def create_diagnostic_zip(extras: Optional[Dict[str, Any]] = None) -> Tuple[byte
         accuracy_snapshot = extras.get("accuracy_snapshot")
         if isinstance(accuracy_snapshot, dict) and accuracy_snapshot:
             add_json("client/accuracy_ui_snapshot.json", accuracy_snapshot)
+        accuracy_images = extras.get("accuracy_images")
+        if isinstance(accuracy_images, list):
+            for item in accuracy_images:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "accuracy_chart.png").replace("\\", "_").replace("/", "_")
+                if not name.lower().endswith(".png"):
+                    name += ".png"
+                raw_b64 = str(item.get("data") or item.get("png_base64") or "").strip()
+                if raw_b64.startswith("data:"):
+                    raw_b64 = raw_b64.split(",", 1)[-1]
+                if not raw_b64:
+                    continue
+                try:
+                    png_bytes = base64.b64decode(raw_b64, validate=True)
+                except ValueError:
+                    continue
+                add_bytes(f"charts/png/{name}", png_bytes, {"kind": "accuracy_chart_png"})
+        monitor_chart_png = extras.get("monitor_chart_png")
+        if isinstance(monitor_chart_png, str) and monitor_chart_png.strip():
+            raw_b64 = monitor_chart_png.strip()
+            if raw_b64.startswith("data:"):
+                raw_b64 = raw_b64.split(",", 1)[-1]
+            try:
+                png_bytes = base64.b64decode(raw_b64, validate=True)
+                add_bytes("charts/png/monitor_kline.png", png_bytes, {"kind": "monitor_chart_png"})
+            except ValueError:
+                pass
 
         manifest = {
             "name": "OKX_AI_Diagnostic",
-            "version": "1.0",
+            "version": "1.1",
             "exported_at": exported_at,
             "app_version": APP_VERSION,
             "zip_bytes": total_added,
@@ -3955,7 +4165,7 @@ def reliability_level(
 def accuracy_chart_max_points(retention_hours: float, interval_seconds: int) -> int:
     """图表保留点数 = 保留时长 / 轮询间隔，与配置页 interval 对齐。"""
     interval_seconds = max(1, int(interval_seconds or 5))
-    retention_hours = max(0.5, min(168.0, float(retention_hours or 12)))
+    retention_hours = max(0.5, min(168.0, float(retention_hours or DEFAULT_ACCURACY_RETENTION_HOURS)))
     return max(100, min(50000, int(retention_hours * 3600 / interval_seconds)))
 
 
@@ -3978,14 +4188,15 @@ def accuracy_report(
     horizon_seconds: int = 5,
     max_points: int = 2400,
     scope: str = "session",
-    retention_hours: float = 12.0,
+    retention_hours: float = DEFAULT_ACCURACY_RETENTION_HOURS,
     interval_seconds: int = 5,
+    for_diagnostic: bool = False,
 ) -> Dict[str, Any]:
     if inst_id not in configured_instruments():
         raise ValueError(f"{inst_id} 未在配置中启用，不能统计压测。")
     horizon_seconds = clamp_accuracy_horizon_seconds(horizon_seconds)
     interval_seconds = max(1, int(interval_seconds or 5))
-    retention_hours = max(0.5, min(168.0, float(retention_hours or 12)))
+    retention_hours = max(0.5, min(168.0, float(retention_hours or DEFAULT_ACCURACY_RETENTION_HOURS)))
     max_points = max(100, min(50000, int(max_points or accuracy_chart_max_points(retention_hours, interval_seconds))))
     replay_scope = scope == "replay"
     session_scope = scope == "session"
@@ -4012,7 +4223,7 @@ def accuracy_report(
     if replay_scope:
         # 回放日志里的 time 是录制时的虚拟时间，不能用启动回放的墙钟时间过滤。
         # 未点击「开始回放」时不展示磁盘上的旧 replay_analysis.jsonl，避免误以为自动回放。
-        if not replay_results_available():
+        if not for_diagnostic and not replay_results_available():
             pending = dict(empty_accuracy_payload)
             pending["replay_pending"] = True
             pending["hint"] = "请先点击下方「开始回放」；切换「回放会话」仅切换压测数据源，不会自动启动回放。"
@@ -4540,143 +4751,119 @@ def design_docs_html() -> str:
 def help_manual_html(config: Dict[str, Any]) -> str:
     panel_url = f"http://{HOST}:{PORT}"
     return f"""
-	<div class="page-panel" data-page="help"><section class="card toolbar-card"><div><h2>帮助</h2><p class="section-sub">操作手册：版本信息、界面用法、服务启停与常见问题。流程与参数详见「设计」页。</p></div><div class="toolbar-right"><a class="button btn-view" href="#design">查看设计文档</a></div></section><div class="help-panel doc-panel">
+	<div class="page-panel" data-page="help"><section class="card toolbar-card"><div><h2>帮助</h2><p class="section-sub">操作手册：如何启动、配置、监控、压测与排查。算法与推送规则详见「设计」页 §0–§K。</p></div><div class="toolbar-right"><a class="button btn-view" href="#design">查看设计文档</a></div></section><div class="help-panel doc-panel">
+	<section class="card help-card"><h2>快速开始</h2>
+	<ol class="help-list">
+	<li>启动 Web 控制台（安装包双击桌面图标，或运行 <code>web_control_panel.py</code>），浏览器打开 {esc(panel_url)}。</li>
+	<li>「配置」页勾选合约、填写 AI 密钥与微信 SendKey（可选），保存配置。</li>
+	<li>「监控」页点击<strong>开始监控</strong>；需要离线验证时，勾选「录制回放数据集」，停止监控后在「测试」页<strong>开始回放</strong>。</li>
+	<li>「测试」页可测 AI / 微信连通性、查看预测压测、<strong>导出诊断包</strong>反馈问题。</li>
+	</ol>
+	</section>
 	<section class="card help-card"><h2>版本与组成</h2>
 	<table class="help-table"><thead><tr><th>项</th><th>说明</th></tr></thead><tbody>
-	<tr><td>产品</td><td>{esc(APP_NAME)}</td></tr>
-	<tr><td>版本</td><td>{esc(APP_VERSION)}</td></tr>
-	<tr><td>Web 控制台</td><td><code>web_control_panel.py</code> · 默认 {esc(panel_url)}</td></tr>
-	<tr><td>监控进程</td><td><code>okx_signal_monitor.py</code> · 由 Web 页启动/停止</td></tr>
-	<tr><td>托盘启动器</td><td><code>tray_launcher.py</code> · 安装包桌面图标默认入口；管理 Web 子进程生命周期</td></tr>
-	<tr><td>支持合约</td><td>OKX USDT 永续（如 BTC-USDT-SWAP、ETH-USDT-SWAP；配置页可手动添加其他 SWAP）</td></tr>
+	<tr><td>产品</td><td>{esc(APP_NAME)} · {esc(APP_VERSION)}</td></tr>
+	<tr><td>Web 控制台</td><td><code>web_control_panel.py</code></td></tr>
+	<tr><td>监控内核</td><td><code>okx_signal_monitor.py</code> · 由 Web 启停</td></tr>
+	<tr><td>托盘入口</td><td><code>tray_launcher.py</code> · 安装包默认入口</td></tr>
+	<tr><td>合约</td><td>OKX USDT 永续；配置页可添加自定义 SWAP</td></tr>
 	</tbody></table>
-	</section>
-	<section class="card help-card"><h2>启动与停止</h2>
-	<h3>启动 Web 控制台</h3>
-	<ul class="help-list">
-	<li><strong>Windows 安装包（推荐）</strong>：双击桌面图标或 <code>launch_web_control_panel.vbs</code> → 系统托盘图标（可选任务栏小窗）→ 自动打开浏览器。首次请先完成安装向导中的 <code>setup_windows_runtime.bat</code>。</li>
-	<li><strong>Windows 终端</strong>：双击 <code>start_web_control_panel_windows.bat</code>（开发/调试常用；可见 cmd 窗口）。</li>
-	<li><strong>命令行</strong>：在项目目录执行 <code>python web_control_panel.py</code>。</li>
-	<li>浏览器未自动打开时，手动访问 {esc(panel_url)}；默认账号见 <code>config/web_console_auth.default.json</code>，可在「设置」页修改。</li>
-	</ul>
-	<h3>启动 / 停止 OKX 监控</h3>
-	<ul class="help-list">
-	<li>在「配置」页保存策略与密钥后，切到「监控」页，点击<strong>开始监控</strong>（按钮变为停止态）。</li>
-	<li>再次点击同一按钮<strong>停止监控</strong>；停止后图表可能仍显示本次会话已写入的日志数据。</li>
-	<li>修改日志容量、轮询间隔、推送分数等：先在「配置」页保存，再<strong>停止并重新启动</strong>监控后生效。</li>
-	</ul>
-	<h3>离线回放</h3>
-	<ul class="help-list">
-	<li>配置页勾选「录制回放数据集」→ 运行监控采集 → <strong>停止监控</strong> →「测试」页点击「开始回放」。</li>
-	<li>回放会按配置页<strong>启用 AI / 微信推送</strong>（与线上一致）；未启用推送时仅写入 <code>push_analysis</code> 与控制台日志，便于多次回放对比同一行情下的判断。</li>
-	<li>回放与实时监控<strong>不能同时</strong>运行；回放进行中请勿再点「开始监控」。</li>
-	<li>停止回放：测试页「停止回放」。</li>
-	</ul>
-	<h3>退出</h3>
-	<ul class="help-list">
-	<li><strong>托盘模式</strong>（安装包默认）：系统托盘「退出」，或任务栏小窗「退出」，与 Web 侧边栏<strong>关机</strong>等效 — 停止监控/回放、关闭 Web，并<strong>同步退出托盘</strong>。托盘「打开控制台」仅打开浏览器，不会停止服务。</li>
-	<li>侧边栏左下角<strong>电源按钮</strong>：<strong>重启控制台</strong> — 停止监控/回放 → 关闭当前 Web → 自动拉起新实例（登录会话尽量保持）。托盘模式下由托盘重拉 Web（不新开 cmd）；终端模式下延迟后新开 <code>start_web_control_panel_windows.bat</code>。提示「服务已恢复，请手动刷新浏览器」后请按 <strong>F5</strong> 刷新。</li>
-	<li>同一菜单：<strong>关机</strong> — 停止所有服务并关闭 Web。托盘模式下<strong>同步退出托盘</strong>；终端模式下运行 Web 的 cmd 窗口会自动关闭。</li>
-	<li>终端内 <strong>Ctrl+C</strong>：停止 Web 控制台；窗口会 pause 并提示，按任意键后关闭（便于确认已停止）。</li>
-	<li>仅关闭浏览器标签<strong>不会</strong>停止后台服务；需使用「停止监控」、电源菜单「关机」或托盘「退出」。</li>
-	</ul>
 	</section>
 	<section class="card help-card"><h2>页面导航</h2>
 	<table class="help-table"><thead><tr><th>页面</th><th>用途</th><th>常用操作</th></tr></thead><tbody>
-	<tr><td><strong>监控</strong></td><td>实时价格、Snapshot、模拟账户</td><td>开始/停止监控；切换 BTC/ETH；滚轮缩放、拖动平移、点击看 Snapshot</td></tr>
-	<tr><td><strong>配置</strong></td><td>币种、策略、AI/推送、密钥</td><td>勾选合约；保存配置；一键填入推送分数建议</td></tr>
-	<tr><td><strong>日志</strong></td><td>JSON 分析日志、控制台摘要</td><td>查看容量与分卷；刷新；另存为；打开日志目录</td></tr>
-	<tr><td><strong>测试</strong></td><td>AI 对话、微信连通性、压测、回放</td><td>AI 对话 / 测试推送；刷新压测；开始/停止回放</td></tr>
-	<tr><td><strong>设计</strong></td><td>流程与参数技术文档</td><td>按<strong>职责·计算·指标含义·输出·后续用途</strong>五维查阅全链路（§A–§K）</td></tr>
-	<tr><td><strong>帮助</strong></td><td>本操作手册</td><td>启停与界面说明</td></tr>
-	<tr><td><strong>设置</strong></td><td>Web 登录账号</td><td>修改用户名/密码</td></tr>
+	<tr><td><strong>监控</strong></td><td>实时 K 线、最新分析快照、模拟账户</td><td>开始/停止监控；切换币种与 K 线周期；右上角可关 K 线显示（不影响后台写日志）</td></tr>
+	<tr><td><strong>配置</strong></td><td>策略、轮询间隔、AI/推送、密钥</td><td>保存配置；一键填入推送分数建议；导入/导出配置文件</td></tr>
+	<tr><td><strong>日志</strong></td><td>查看 JSON 分析日志与控制台摘要</td><td>打开日志目录；另存为；开关仅控制 Web 是否读取展示</td></tr>
+	<tr><td><strong>测试</strong></td><td>AI 对话、连通性、压测、回放、诊断导出</td><td>测试推送；刷新压测；开始/停止回放；导出诊断包</td></tr>
+	<tr><td><strong>设计</strong></td><td>架构与模块技术文档</td><td>§0 总览 · §A–§K 各阶段五维说明</td></tr>
+	<tr><td><strong>设置</strong></td><td>Web 登录账号、恢复出厂</td><td>改密码须输入当前密码；恢复出厂会清空运行日志与密钥</td></tr>
 	</tbody></table>
-	<p>侧边栏底部<strong>电源按钮</strong>：重启 Web 或完整退出（托盘模式会同步退出托盘；详见「启动与停止 → 退出」）。</p>
+	<p>侧边栏<strong>电源按钮</strong>：重启 Web 或完整退出（托盘模式同步退出托盘）。</p>
 	</section>
 	<section class="card help-card"><h2>监控页</h2>
 	<ul class="help-list">
-	<li>右上角<strong>K 线开关</strong>默认开启；关闭后不再请求 OKX/日志绘图，但监控进程与磁盘日志照常运行。</li>
-	<li>未启动监控时显示<strong>虚拟行情</strong>；启动后读取本次会话写入的分析日志叠加指标。</li>
-	<li>左上角快照：未选中 K 线时显示<strong>最新分析快照</strong>（<code>final_decision</code> 方向、置信度、推送、价位与 AI 摘要）；选中 K 线时显示该根 K 线的 OHLC、涨跌与成交量。</li>
-	<li>底部<strong>模拟账户</strong>：按 <code>final_direction</code> 从 $10,000 满仓跟单，方向变才换仓；非真实成交。</li>
-	<li>图表：滚轮缩放时间轴；Shift+滚轮缩放价格；拖动平移；双击重置视图。</li>
+	<li><strong>K 线开关</strong>：关闭后不再请求 OKX/日志绘图，监控进程与磁盘日志照常运行。</li>
+	<li>未启动监控时显示虚拟行情；启动后叠加本次会话写入的分析日志指标。</li>
+	<li>快照区：未选中 K 线时显示最新 <code>final_decision</code>、置信度、推送与 AI 摘要；选中 K 线时显示 OHLC 与成交量。</li>
+	<li><strong>模拟账户</strong>：按 <code>final_direction</code> 从 $10,000 满仓跟单，方向变才换仓（非真实成交）。</li>
+	<li>图表：滚轮缩放时间轴；Shift+滚轮缩放价格；拖动平移；双击重置。</li>
 	</ul>
 	</section>
 	<section class="card help-card"><h2>配置页</h2>
 	<ul class="help-list">
-	<li><strong>策略周期</strong>：超短线 / 短线 / 中线 / 长线，决定画像参数、主方向、评分周期与预测窗口（详见「设计」附录）。</li>
-	<li><strong>确认严格度</strong>：保守 / 标准 / 激进，影响动量阈值与降级门槛。</li>
-	<li><strong>AI与推送</strong>：启用 AI、微信推送（交易信号）；<code>push_score</code>（做多）与 <code>short_push_score</code>（做空）分开配置。Server酱 SendKey 在密钥区配置。</li>
-	<li><strong>AI 异常告警</strong>：与「启用微信推送」无关；启用 AI 且配置了 SendKey 时，AI 连续异常超过约 5 分钟会自动发微信，正文含失败原因。间隔与阈值见「设计」页环境变量表（<code>AI_ABNORMAL_ALERT_*</code>）。</li>
-	<li><strong>监控进程意外退出</strong>：默认会自动尝试重启（见设计页 <code>WEB_MONITOR_*</code>）；若配置了 SendKey 会另发运维微信告警。Web 重启时仅清理已死亡子进程的 PID 文件，不会终止仍在运行的监控。</li>
-	<li><strong>日志容量</strong>：单文件默认 500MB、总容量 8GB；满则轮转并删除最旧分卷。Web 压测与监控图指标叠加依赖分析日志。</li>
-	<li>底部「另存为配置 / 导入配置」可备份 <code>trading_assistant_config.json</code>。</li>
+	<li><strong>策略周期</strong>：超短线 / 短线 / 中线 / 长线，决定画像参数、主方向周期与压测推荐验证窗口。</li>
+	<li><strong>轮询间隔</strong>：监控主循环 sleep 秒数，可独立于策略手动调整（如中线 60→180）；修改后须重启监控。</li>
+	<li><strong>确认严格度</strong>：保守 / 标准 / 激进，影响动量阈值与降级门槛；可一键填入建议推送分数。</li>
+	<li><strong>AI 与推送</strong>：启用 AI、定时 AI 间隔、静默简报、微信推送；<code>push_score</code> / <code>short_push_score</code> 分别控制做多/做空 trade 门槛。</li>
+	<li><strong>录制回放</strong>：勾选后监控会把每轮原始 snapshot 写入 <code>replay_dataset.jsonl</code>。</li>
+	<li><strong>日志容量</strong>：默认单文件 500MB、总 8GB；满则轮转删最旧分卷。</li>
+	<li><strong>AI 异常告警</strong>：启用 AI 且配置 SendKey 时，AI 连续异常约 5 分钟会发运维微信（与交易推送独立）。</li>
+	<li><strong>监控意外退出</strong>：默认自动重启（<code>WEB_MONITOR_*</code>）；有 SendKey 时另发运维告警。</li>
 	</ul>
 	</section>
 	<section class="card help-card"><h2>日志页</h2>
 	<ul class="help-list">
-	<li>右上角<strong>开关</strong>默认关闭，仅控制 Web 是否读取并展示；<strong>不影响</strong>监控进程写 {esc(MONITOR_JSON_LOG_FILE)} / {esc(MONITOR_PROCESS_LOG_FILE)}。</li>
-	<li><strong>JSON 分析日志</strong>：完整每轮记录 → {esc(MONITOR_JSON_LOG_FILE)}</li>
-	<li><strong>控制台日志</strong>：精简摘要（信号、推送结果）→ {esc(MONITOR_PROCESS_LOG_FILE)}</li>
-	<li>页面只显示<strong>本次启动监控后</strong>的内容；「打开日志目录」可查看磁盘上的完整文件。</li>
-	<li>顶部显示当前分卷占用；容量在配置页调整，变更后需<strong>重启监控</strong>。</li>
+	<li>开关默认关闭，仅控制 Web 是否展示；不影响 {esc(MONITOR_JSON_LOG_FILE)} / {esc(MONITOR_PROCESS_LOG_FILE)} 写入。</li>
+	<li>页面显示本次启动监控后的尾部；完整分卷请「打开日志目录」查看。</li>
+	<li>主要文件：分析 JSONL、控制台 log、回放数据集、校准与模拟账户等均在 <code>build/runtime_logs/</code>。</li>
 	</ul>
 	</section>
 	<section class="card help-card"><h2>测试页</h2>
-	<h3>问题排查导出</h3>
+	<h3>导出诊断包</h3>
 	<ul class="help-list">
-	<li>测试页顶部<strong>导出诊断包</strong>：压缩下载配置（密钥打码）、状态、日志、压测 JSON、回放数据与 AI 对话记录。</li>
-	<li>超大单文件仅含尾部；详见包内 <code>manifest.json</code> 与 <code>README.txt</code>。</li>
+	<li>打包配置（密钥打码）、监控/回放状态、<code>runtime_logs</code> 下全部日志、回放数据集、各范围压测 JSON 与 SVG/PNG 走势图。</li>
+	<li>超大单文件仅含尾部，详见包内 <code>manifest.json</code> 与 <code>README.txt</code>。</li>
 	</ul>
-	<h3>AI 对话</h3>
+	<h3>AI 与微信测试</h3>
 	<ul class="help-list">
-	<li>在输入框发送消息，AI 回复会显示在上方对话区；Enter 发送，Shift+Enter 换行。</li>
-	<li>发送前会先保存配置页中的 AI 密钥；对话历史仅保留在本页浏览器内存中。</li>
-	<li><strong>连通性测试</strong>会发送固定探针消息，用于快速验证 API 是否可用。</li>
-	</ul>
-	<h3>微信推送</h3>
-	<ul class="help-list">
-	<li><strong>测试微信推送</strong>：会先保存配置页中的密钥再发起请求。</li>
-	<li><strong>测试微信推送</strong>发送的是与真实监控相同结构的格式预览，不代表 AI 异常告警样式（异常告警标题为 <code>[AI异常] …</code>，正文含失败原因与排查项）。</li>
+	<li><strong>AI 对话</strong>：发送前自动保存配置；历史仅保留在本页浏览器内存。</li>
+	<li><strong>连通性测试</strong> / <strong>获取简报</strong>：验证 API 与监控同款简报逻辑（不推微信）。</li>
+	<li><strong>测试微信推送</strong>：发送格式预览；异常告警样式为 <code>[AI异常] …</code>，正文含失败原因。</li>
 	</ul>
 	<h3>实时预测压测</h3>
 	<ul class="help-list">
-	<li>右上角<strong>开关</strong>默认关闭；打开后才会读取分析日志并自动刷新压测图表（节省长期运行资源）。</li>
-	<li>选择合约、验证窗口（短线建议 15–20 分钟）、范围（本次启动后 / 全部历史 / 回放会话）。</li>
-	<li>顶部绿底卡片 + 图表<strong>绿线</strong>为 $10k 模拟账户；<strong>蓝线</strong>价格、<strong>紫线</strong>预测方向累计、<strong>黄线</strong>确认方向累计（右轴 ± 累计，非 0–100 分）。紫先黄后表示预测领先确认。</li>
-	<li>绿/红点表示该点预测是否在验证窗内合理；「已验证/日志」分母为成熟样本数。</li>
-	<li>可导出/导入图表 JSON 快照。</li>
+	<li>右上角<strong>开关</strong>默认关闭；打开后读取分析日志并自动刷新。</li>
+	<li>选择合约、验证窗口（随策略推荐，可手动改）、范围（本次启动后 / 全部历史 / 回放会话）。</li>
+	<li><strong>蓝线</strong>为价格，<strong>绿线</strong>为 $10k 模拟账户权益；绿/红/灰点表示该点方向判定（已验证合理 / 不合理 / 待验证）。</li>
+	<li>价格上方标记表示该帧<strong>应推送</strong>（◆急变 ■观察 △演变 ★结构单等），与是否实际发微信无关。</li>
+	<li>顶栏摘要含分析次数、AI 调用与 Token；可导出/导入图表 JSON 快照。</li>
 	</ul>
-	<h3>离线回放压测</h3>
+	<h3>离线回放</h3>
 	<ul class="help-list">
-	<li>数据集：{esc(REPLAY_DATASET_FILE)} · 回放结果：{esc(REPLAY_ANALYSIS_LOG_FILE)}</li>
-	<li>每行 JSON 含 <code>analysis</code>（AI 结果）与 <code>push_analysis</code>（是否应推送、阻断原因）；微信是否发送取决于配置页「启用微信推送」。</li>
-	<li>回放完成后，压测范围选「回放会话」查看曲线。</li>
+	<li>数据集 {esc(REPLAY_DATASET_FILE)} · 结果 {esc(REPLAY_ANALYSIS_LOG_FILE)}。</li>
+	<li>须先停止监控，再在测试页点「开始回放」；回放与监控不能并行。</li>
+	<li>每行含 <code>analysis</code> 与 <code>push_analysis</code>；微信是否发送取决于配置页「启用微信推送」。</li>
+	<li>回放完成后，压测范围选「回放会话」查看曲线与推送标记。</li>
 	</ul>
 	</section>
-	<section class="card help-card"><h2>设置页</h2>
-	<ul class="help-list"><li>修改登录用户名或密码时须<strong>手动输入当前密码</strong>；页面不会预填或自动填充密码。</li><li>保存后会自动停止监控与回放，并强制重新登录。</li><li><strong>恢复出厂设置</strong>须输入当前密码确认；会清除运行日志/回放/模拟账户并重置配置、密钥与登录账号为默认（admin / admin123）。</li><li>本机私密配置目录：<code>local_state/</code>（含登录信息与可选的配置副本）。</li></ul>
+	<section class="card help-card"><h2>启动、停止与退出</h2>
+	<ul class="help-list">
+	<li><strong>监控</strong>：配置页保存后，监控页「开始监控 / 停止监控」。改 interval、推送分数、日志容量等须停止后重启。</li>
+	<li><strong>回放</strong>：停止监控 → 测试页「开始回放 / 停止回放」。</li>
+	<li><strong>托盘退出</strong>：与 Web 电源「关机」等效，停止子进程并退出托盘。</li>
+	<li><strong>仅关浏览器</strong>不会停止后台；须显式停止监控或使用关机/托盘退出。</li>
+	<li>Web 重启后若页面空白，按 <strong>F5</strong> 刷新。</li>
+	</ul>
 	</section>
-	<section class="card help-card"><h2>本地文件位置</h2>
+	<section class="card help-card"><h2>本地文件</h2>
 	<ul class="help-list">
 	<li>运行日志：<code>build/runtime_logs/</code></li>
-	<li>默认配置模板：<code>config/</code></li>
-	<li>本机运行态与密钥：<code>local_state/</code>（勿提交版本库）</li>
+	<li>出厂默认模板：<code>config/</code></li>
+	<li>本机配置与密钥：<code>local_state/</code>（勿提交版本库）</li>
 	<li>当前生效配置：{esc(active_config_file())}</li>
 	</ul>
 	</section>
 	<section class="card help-card"><h2>常见问题</h2>
 	<ul class="help-list">
-	<li><strong>监控已开但图表无指标</strong>：等待几轮轮询；确认日志目录有写入且未超出总容量被回收。</li>
-	<li><strong>压测一直「待验证」</strong>：验证窗口未到期；到期后点「刷新压测」。范围选「本次启动后」时须监控曾运行过。</li>
-	<li><strong>有做空方向但没推 trade</strong>：微信推送看 confidence 是否达到 <code>short_push_score</code>；模拟账户不卡此门槛。</li>
-	<li><strong>修改配置不生效</strong>：监控进程需停止后重新启动；密钥类配置测试前也会自动保存。</li>
-	<li><strong>回放无数据</strong>：须先录制数据集并在测试页点击「开始回放」，再选压测范围「回放会话」。</li>
-	<li><strong>收到 [AI异常] 微信</strong>：表示监控仍在跑但 AI 已长时间不可用（密钥、网络、接口或熔断）。查看控制台 / JSON 日志 <code>analysis.error</code>；修复后监控会自动探活恢复，无需重启（改密钥后建议重启监控）。</li>
-	<li><strong>Web 重启后页面空白或旧数据</strong>：按提示<strong>手动刷新浏览器</strong>（F5）；若仍异常，用电源「关机」或托盘「退出」后重新打开应用。</li>
-	<li><strong>关机后托盘仍在 / cmd 仍停留</strong>：请用 Web 电源「关机」或托盘「退出」，不要只关浏览器。托盘模式关机后图标应消失；终端模式 cmd 应自动关闭。</li>
+	<li><strong>监控已开但 K 线无指标</strong>：等待几轮轮询；确认日志目录有写入且未被总容量回收。</li>
+	<li><strong>压测一直待验证</strong>：验证窗口未到期；到期后点「刷新压测」。</li>
+	<li><strong>有方向但没推 trade</strong>：微信看 confidence 是否达 <code>push_score</code> / <code>short_push_score</code>，以及冷却、AI 复核与 <code>push_analysis</code> 阻断原因。</li>
+	<li><strong>同向推送太密</strong>：同趋势 leg 有加长冷却；重复推送需更高分数或更长间隔。</li>
+	<li><strong>修改配置不生效</strong>：须停止并重启监控；密钥在测试页也会先自动保存。</li>
+	<li><strong>回放无压测点</strong>：须先录制数据集并点击「开始回放」，再选「回放会话」。</li>
+	<li><strong>收到 [AI异常] 微信</strong>：查看 JSON / 控制台 <code>analysis.error</code>；修复密钥或网络后探活恢复，改密钥建议重启监控。</li>
 	</ul>
-	<div class="help-note">流程细节、信号条件、评分层与推送推导规则见侧边栏「设计」页，不在本手册重复。</div>
+	<div class="help-note">信号条件、八层评分、AI merge、post-audit 与推送推导见「设计」页 §B–§J。</div>
 	</section></div></div>
 """
 
@@ -4733,11 +4920,16 @@ def render_page(message: str = "") -> bytes:
                     '<div class="field-group-head field-col-right">微信推送</div>'
                 )
         rows.append(field_html(key, label, kind, help_text, config.get(key), column))
-        if key == "strategy_mode":
-            interval = recommended_interval_for_strategy(config.get("strategy_mode"))
+        if key == "interval":
+            lo, hi = STRATEGY_INTERVAL_BOUNDS.get(
+                str(config.get("strategy_mode", "swing") or "swing").strip().lower(),
+                (1, 3600),
+            )
             rows.append(
-                f'<div class="field strategy-interval-field"><label>轮询间隔</label>'
-                f'<div><p id="strategyIntervalHint">当前 {interval} 秒（随策略周期自动绑定）</p></div></div>'
+                f'<p id="strategyIntervalHint" class="section-sub" '
+                f'style="grid-column:2;margin:-4px 0 0 174px;font-size:12px;color:var(--muted);">'
+                f'当前策略推荐 {recommended_interval_for_strategy(config.get("strategy_mode"))} 秒；'
+                f'可配置范围 {lo}–{hi} 秒</p>'
             )
     rows.append("</section>")
     risk = str(config.get("risk_preference", "standard"))
@@ -4816,7 +5008,7 @@ button,.button{{border:0;border-radius:12px;padding:11px 16px;background:#f1f3f8
 <form class="settings-form" method="post" action="/save-auth#settings" autocomplete="off"><input type="text" name="fake_username" autocomplete="username" tabindex="-1" aria-hidden="true" class="autofill-trap"><input type="password" name="fake_password" autocomplete="current-password" tabindex="-1" aria-hidden="true" class="autofill-trap"><section class="card page-panel" data-page="settings"><h2>登录账号</h2><div class="field"><label>用户名</label><div><input type="text" name="auth_username" autocomplete="off" value="{esc(auth.get("username","admin"))}"><p>Web 控制台登录用户名（单账户）。</p></div></div><div class="field"><label>当前密码</label><div><div class="password-wrap"><input type="password" name="auth_current_password" autocomplete="off" placeholder="请手动输入当前密码" readonly data-verify-password><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>须手动输入当前密码验证身份，不会自动填充。</p></div></div><div class="field"><label>新密码</label><div><div class="password-wrap"><input type="password" name="auth_password" autocomplete="off" placeholder="留空则不修改" readonly data-verify-password><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>留空表示保留当前密码；保存后将停止监控/回放并退出登录。</p></div></div></section><section class="card page-panel" data-page="settings"><h2>恢复出厂设置</h2><p class="section-sub">清除 <code>build/runtime_logs/</code> 下运行日志、回放数据、模拟账户与 Token 统计，并将交易配置、AI 密钥、微信 SendKey 与登录账号恢复为出厂默认。会先停止监控与回放；操作不可撤销。</p><div class="field"><label>确认密码</label><div><div class="password-wrap"><input type="password" name="factory_reset_password" autocomplete="off" placeholder="请手动输入当前密码" readonly data-verify-password><button class="eye-btn" type="button" data-toggle-password aria-label="显示或隐藏密码"></button></div><p>须验证当前登录密码后才会执行；完成后请使用默认账号 admin / admin123 重新登录。</p></div></div><div class="actions" style="padding:0;margin-top:12px;"><button class="button action-control btn-danger" type="button" id="factoryResetBtn">恢复出厂设置</button></div><p class="accuracy-note" id="factoryResetHint" style="margin-top:10px;"></p></section><div class="actions settings-actions" data-page-actions="settings"><div class="action-group"><button class="action-control btn-save" type="submit">保存账号密码</button><a class="button action-control btn-danger" href="/logout">退出登录</a></div></div></form>
 <div class="page-panel active" data-page="monitor"><section class="card toolbar-card monitor-toolbar-card"><div><h2>实时监控</h2><p class="section-sub">K 线默认显示；关闭开关后不再请求 OKX/日志绘图，<strong>监控进程照常运行</strong>。下方模拟账户按 final_direction 满仓跟单（会话 $10,000 重置）。</p></div><div class="toolbar-right"><span class="section-sub" id="monitorChartLabel" style="margin:0;white-space:nowrap;">K线显示已开启</span><label class="switch" title="仅控制 Web 是否绘制 K 线与快照，不影响后台监控"><input type="checkbox" id="monitorChartEnableToggle" checked><span></span></label><div class="coin-tabs">{monitor_tabs}</div><button class="button btn-run action-control" type="button" id="monitorToggleBtn">开始监控</button></div></section><p class="accuracy-note accuracy-off-hint monitor-chart-off-hint" id="monitorChartOffHint" hidden>K 线显示已关闭。监控进程与磁盘日志照常运行；打开右上角开关后将请求 OKX 并绘制图表。</p><section class="market-card monitor-card" id="monitorChartPanel"><div class="market-head"><div><div class="market-title" id="monitorTitle">{esc(monitor_initial or "未配置币种")} K线</div><div class="market-sub" id="monitorMeta">{esc("选择周期查看蜡烛图 · 启动监控后叠加分析指标" if monitor_initial else "请先在配置页选择监控币种")}</div><div class="bar-tabs" id="monitorBarTabs">{monitor_bar_tabs}</div></div><div class="market-price" id="monitorPrice"><strong>--</strong><span>加载中</span></div></div><div class="market-canvas-wrap"><canvas id="monitorChart"></canvas><div class="market-loading" id="monitorLoading">正在加载 K 线...</div><div class="snapshot-panel" id="snapshotPanel"><div class="snapshot-head"><strong id="snapshotPanelTitle">最新快照</strong><button type="button" class="snapshot-toggle" id="snapshotToggleBtn" title="收起或展开快照面板">收起</button></div><div class="snapshot-body" id="snapshotPanelBody"><div class="snapshot-grid"><span>状态</span><b>加载中...</b><span>提示</span><b>点击 K 线查看 OHLC</b></div></div></div></div><div class="market-time-range"><span id="monitorProcessInfo">PID -- · Token --</span><span id="monitorUptime">已监控：未启动</span><span id="monitorPaperAccount">模拟账户：--</span><span id="monitorPointCount">K线：0</span></div></section></div>
 	<div class="page-panel" data-page="logs"><section class="card toolbar-card logs-toolbar-card"><div><h2>实时日志</h2><p class="section-sub">监控进程仍会照常写入磁盘（JSON 分析 + 控制台）；本页<strong>默认不拉取显示</strong>以节省资源。配置页可设单文件/总容量上限。</p></div><div class="toolbar-right" style="align-items:center;gap:10px;flex-wrap:wrap;"><span class="section-sub" id="logsDisplayLabel" style="margin:0;white-space:nowrap;">显示已关闭</span><label class="switch" title="仅控制 Web 是否读取并展示日志，不影响磁盘写入"><input type="checkbox" id="logsDisplayToggle"><span></span></label><span class="section-sub" id="analysisLogSwitchHint" style="margin:0;">{esc(log_size_summary_text(config))} · 修改后需重启监控</span><button class="button btn-log" type="button" id="refreshLogBtn">刷新全部</button><button class="button btn-log" type="button" id="openLogDirBtn">打开日志目录</button></div></section><p class="accuracy-note accuracy-off-hint" id="logsOffHint">Web 显示已关闭。监控仍正常写日志到磁盘；打开右上角开关后可在此查看本次启动后的内容。</p><section class="card logs-card" id="logPanelBody" hidden><div class="logs-grid"><div class="log-panel"><h3>JSON 分析日志</h3><p class="log-panel-desc">Web 图表/压测依赖的完整分析记录，分卷保存：{esc(MONITOR_JSON_LOG_FILE)} 及 .jsonl.1/.2 …</p><div class="log-panel-body"><textarea class="log-window" id="logWindow" readonly>正在加载日志...</textarea></div><div class="log-panel-footer"><div class="toolbar-card"><div><p class="section-sub" id="saveLogHint">可另存为 .jsonl 文件，便于回放与统计。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveLogBtn">另存为文件</button></div></div></div></div><div class="log-panel"><h3>控制台日志</h3><p class="log-panel-desc">监控进程精简调试输出（信号摘要、推送结果、错误）；详细重试日志需设置 CONSOLE_VERBOSE=1，默认保存：{esc(MONITOR_PROCESS_LOG_FILE)}</p><div class="log-panel-body"><textarea class="log-window log-window-console" id="consoleLogWindow" readonly>正在加载控制台日志...</textarea></div><div class="log-panel-footer"><div class="toolbar-card"><div><p class="section-sub" id="saveConsoleLogHint">可另存为 .log 文件，便于快速排查信号与推送。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="clearConsoleLogBtn">清除窗口</button><button class="btn-save" type="button" id="saveConsoleLogBtn">另存为文件</button></div></div></div></div></div></section></div>
-	<div class="page-panel" data-page="tests"><section class="card diagnostic-export-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">问题排查导出</h2><p class="section-sub" style="margin:0;">一键打包配置（密钥已打码）、监控/回放状态、日志、压测图表与回放数据，便于反馈 bug 时分析。超大日志仅含尾部。</p></div><div class="toolbar-right"><button class="button action-control btn-save" type="button" id="diagnosticExportBtn">导出诊断包</button></div></div><p class="accuracy-note" id="diagnosticExportHint">将下载 ZIP 文件；包含 JSON 分析日志、控制台日志、回放数据、实时/回放压测 JSON、Token 统计与当前 AI 对话（如有）。</p></section><section class="card ai-chat-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">AI 对话测试</h2><p class="section-sub" style="margin:0;">使用配置页中的 AI 密钥与模型；发送前会先保存当前配置。对话历史仅保留在本页浏览器内存中。「获取简报」按监控同款逻辑拉取 OKX 盘面并生成 [简报]（不推送微信）。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="aiChatClearBtn">清空对话</button><button class="button action-control btn-test" type="button" id="aiChatBriefBtn">获取简报</button><button class="button action-control btn-test" type="button" id="aiChatPingBtn">连通性测试</button></div></div><div class="ai-chat-window" id="aiChatWindow"><div class="ai-chat-empty">输入下方消息开始与 AI 对话。可先点「连通性测试」验证配置是否可用。</div></div><div class="ai-chat-compose"><textarea id="aiChatInput" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea><button class="button action-control btn-test" type="button" id="aiChatSendBtn">发送</button></div></section><section class="card toolbar-card"><div><h2>微信推送测试</h2><p class="section-sub">测试 Server酱 推送是否可用。点击后会先保存配置页中的密钥，再发送与真实监控相同结构的格式预览（模拟 AI 全字段示例）。</p></div><div class="toolbar-right"><button class="button action-control btn-test" type="button" id="testPushBtn">测试微信推送</button></div></section><div id="connectivityTestNotice" class="notice" hidden></div><section class="card accuracy-card"><div class="toolbar-card" style="margin:0 0 12px;box-shadow:none;padding:0;background:transparent;border:none;align-items:flex-start;"><div><h2 style="margin:0 0 6px;">实时预测压测</h2><p class="section-sub" style="margin:0;">顶部<strong>分析次数、AI调用次数、Token总消耗</strong>按当前币种、范围和保留时长统计。模拟账户按 final_direction 从 $10,000 满仓跟单（方向变才换仓）；绿线为权益曲线。下方为分层预测准确度；<strong>AI前瞻命中率</strong>按每条 <code>forward_view</code> 的 horizon 独立验证。回放会话在价线上方标记<strong>应推送</strong>。<strong>默认关闭</strong>以节省资源，需要时再打开。</p></div><div class="toolbar-right" style="align-items:center;gap:10px;flex-shrink:0;"><span class="section-sub" id="accuracyEnableLabel" style="margin:0;white-space:nowrap;">压测已关闭</span><label class="switch" title="启用后才会读取分析日志并自动刷新压测图表"><input type="checkbox" id="accuracyEnableToggle"><span></span></label></div></div><p class="accuracy-note accuracy-off-hint" id="accuracyOffHint">压测已关闭。打开右上角开关后将读取分析日志并自动刷新图表。</p><div id="accuracyPanelBody" hidden><div class="accuracy-controls"><select id="accuracyInst">{accuracy_inst_options}</select>{accuracy_horizon_select_html}<select id="accuracyScope"><option value="session">本次启动后</option><option value="replay">回放会话</option><option value="all">全部历史日志</option></select><select id="accuracyRetentionHours" title="结合配置页轮询间隔计算图表最多保留多少点"><option value="1">保留1小时</option><option value="2">保留2小时</option><option value="4">保留4小时</option><option value="8">保留8小时</option><option value="12" selected>保留12小时</option><option value="24">保留24小时</option><option value="48">保留48小时</option></select><button class="btn-test" type="button" id="accuracyRefreshBtn">刷新压测</button><button class="btn-save" type="button" id="accuracyExportBtn">导出图表</button><button class="btn-save" type="button" id="accuracyImportBtn">导入图表</button><button class="btn-test" type="button" id="accuracyLiveBtn" style="display:none">返回实时</button><input type="file" id="accuracyImportInput" accept=".json,application/json" hidden></div><div class="accuracy-summary" id="accuracySummary"><div class="accuracy-primary"><span>分析次数</span><b>--</b></div><div class="accuracy-primary"><span>AI调用次数</span><b>--</b></div><div class="accuracy-primary"><span>Token总消耗</span><b>--</b></div></div><div class="accuracy-canvas-wrap"><canvas id="accuracyChart"></canvas><div class="accuracy-point-panel" id="accuracyPointPanel" hidden></div></div><p class="accuracy-note" id="accuracyNote">综合准确度用上方验证窗口；AI前瞻命中率用每条 forward_view 的 horizon（通常 15m）。观望：后续波动未超阈值即合理。交易：验证窗内价格朝做多/做空方向走即方向命中。</p></div></section><section class="card"><h2>历史回放生成</h2><p class="section-sub">从 OKX 拉取指定时间段的历史 K 线，并附带 OI / 资金费率 / 多空比，生成 <code>replay_dataset_historical.jsonl</code>。盘口为占位，盘口失衡类信号不会触发。合约默认与上方压测区所选一致。</p><div class="field"><label>开始时间</label><div><input type="datetime-local" id="replayBuildStart"><p>本地时间，建议不超过 48 小时跨度。</p></div></div><div class="field"><label>结束时间</label><div><input type="datetime-local" id="replayBuildEnd"></div></div><div class="field"><label>帧步长(秒)</label><div><input type="number" id="replayBuildStep" value="60" min="5" max="3600" step="1"><p>与策略轮询间隔接近即可（swing 建议 60，short/scalp 建议 5）。</p></div></div><div class="field"><label>操作</label><div><div class="toolbar-right" style="justify-content:flex-start;gap:8px;"><button class="button action-control btn-save" type="button" id="replayBuildBtn">生成回放数据</button></div><p class="accuracy-note" id="replayBuildStatus">尚未生成</p></div></div></section><section class="card"><h2>离线回放压测</h2><p class="section-sub">配置页勾选「录制回放数据集」并运行监控，每轮原始输入写入 {esc(REPLAY_DATASET_FILE)}；停止监控后点击下方「开始回放」。回放按配置启用 AI 与微信推送（未开推送则只写日志），结论写入 {esc(REPLAY_ANALYSIS_LOG_FILE)} 的 <code>push_analysis</code> 与 <code>analysis</code> 字段，便于同一数据集多次回放对比；再选上方「回放会话」查看压测曲线。</p><div class="replay-status" id="replayDatasetInfo">正在加载数据集状态...</div><div class="field"><label>回放间隔(秒)</label><div><input type="number" id="replayInterval" value="0" min="0" max="120" step="0.1"><p>0 表示尽快跑完；大于 0 可在回放过程中观察压测曲线刷新。</p></div></div><div class="field"><label>控制</label><div><div class="toolbar-right" style="justify-content:flex-start;gap:8px;"><button class="btn-test" type="button" id="replayStartBtn">开始回放</button><button class="btn-danger action-control" type="button" id="replayStopBtn">停止回放</button><button class="button btn-log" type="button" id="replayRefreshBtn">刷新状态</button></div><p id="replayStatusText">等待加载...</p></div></div></section></div>
+	<div class="page-panel" data-page="tests"><section class="card diagnostic-export-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">问题排查导出</h2><p class="section-sub" style="margin:0;">一键打包配置（密钥已打码）、监控/回放状态、运行时近期日志与回放数据、实时/回放压测走势图（SVG/PNG）与 JSON，便于反馈 bug 时分析。超大单文件仅含尾部。</p></div><div class="toolbar-right"><button class="button action-control btn-save" type="button" id="diagnosticExportBtn">导出诊断包</button></div></div><p class="accuracy-note" id="diagnosticExportHint">将下载 ZIP；含 runtime_logs 下全部日志、回放数据集尾部、各币种 session/replay/all 压测 JSON+SVG 图，以及当前浏览器压测/监控 K 线 PNG（如有）。</p></section><section class="card ai-chat-card"><div class="ai-chat-head"><div><h2 style="margin:0 0 6px;">AI 对话测试</h2><p class="section-sub" style="margin:0;">使用配置页中的 AI 密钥与模型；发送前会先保存当前配置。对话历史仅保留在本页浏览器内存中。「获取简报」按监控同款逻辑拉取 OKX 盘面并生成 [简报]（不推送微信）。</p></div><div class="toolbar-right"><button class="button btn-log" type="button" id="aiChatClearBtn">清空对话</button><button class="button action-control btn-test" type="button" id="aiChatBriefBtn">获取简报</button><button class="button action-control btn-test" type="button" id="aiChatPingBtn">连通性测试</button></div></div><div class="ai-chat-window" id="aiChatWindow"><div class="ai-chat-empty">输入下方消息开始与 AI 对话。可先点「连通性测试」验证配置是否可用。</div></div><div class="ai-chat-compose"><textarea id="aiChatInput" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea><button class="button action-control btn-test" type="button" id="aiChatSendBtn">发送</button></div></section><section class="card toolbar-card"><div><h2>微信推送测试</h2><p class="section-sub">测试 Server酱 推送是否可用。点击后会先保存配置页中的密钥，再发送与真实监控相同结构的格式预览（模拟 AI 全字段示例）。</p></div><div class="toolbar-right"><button class="button action-control btn-test" type="button" id="testPushBtn">测试微信推送</button></div></section><div id="connectivityTestNotice" class="notice" hidden></div><section class="card accuracy-card"><div class="toolbar-card" style="margin:0 0 12px;box-shadow:none;padding:0;background:transparent;border:none;align-items:flex-start;"><div><h2 style="margin:0 0 6px;">实时预测压测</h2><p class="section-sub" style="margin:0;">顶部<strong>分析次数、AI调用次数、Token总消耗</strong>按当前币种、范围和保留时长统计。模拟账户按 final_direction 从 $10,000 满仓跟单（方向变才换仓）；绿线为权益曲线。下方为分层预测准确度；<strong>AI前瞻命中率</strong>按每条 <code>forward_view</code> 的 horizon 独立验证。回放会话在价线上方标记<strong>应推送</strong>。<strong>默认关闭</strong>以节省资源，需要时再打开。</p></div><div class="toolbar-right" style="align-items:center;gap:10px;flex-shrink:0;"><span class="section-sub" id="accuracyEnableLabel" style="margin:0;white-space:nowrap;">压测已关闭</span><label class="switch" title="启用后才会读取分析日志并自动刷新压测图表"><input type="checkbox" id="accuracyEnableToggle"><span></span></label></div></div><p class="accuracy-note accuracy-off-hint" id="accuracyOffHint">压测已关闭。打开右上角开关后将读取分析日志并自动刷新图表。</p><div id="accuracyPanelBody" hidden><div class="accuracy-controls"><select id="accuracyInst">{accuracy_inst_options}</select>{accuracy_horizon_select_html}<select id="accuracyScope"><option value="session">本次启动后</option><option value="replay">回放会话</option><option value="all">全部历史日志</option></select><select id="accuracyRetentionHours" title="结合配置页轮询间隔计算图表最多保留多少点"><option value="1">保留1小时</option><option value="2">保留2小时</option><option value="4">保留4小时</option><option value="8">保留8小时</option><option value="12">保留12小时</option><option value="24" selected>保留24小时</option><option value="48">保留48小时</option></select><button class="btn-test" type="button" id="accuracyRefreshBtn">刷新压测</button><button class="btn-save" type="button" id="accuracyExportBtn">导出图表</button><button class="btn-save" type="button" id="accuracyImportBtn">导入图表</button><button class="btn-test" type="button" id="accuracyLiveBtn" style="display:none">返回实时</button><input type="file" id="accuracyImportInput" accept=".json,application/json" hidden></div><div class="accuracy-summary" id="accuracySummary"><div class="accuracy-primary"><span>分析次数</span><b>--</b></div><div class="accuracy-primary"><span>AI调用次数</span><b>--</b></div><div class="accuracy-primary"><span>Token总消耗</span><b>--</b></div></div><div class="accuracy-canvas-wrap"><canvas id="accuracyChart"></canvas><div class="accuracy-point-panel" id="accuracyPointPanel" hidden></div></div><p class="accuracy-note" id="accuracyNote">综合准确度用上方验证窗口；AI前瞻命中率用每条 forward_view 的 horizon（通常 15m）。观望：后续波动未超阈值即合理。交易：验证窗内价格朝做多/做空方向走即方向命中。</p></div></section><section class="card"><h2>历史回放生成</h2><p class="section-sub">从 OKX 拉取指定时间段的历史 K 线，并附带 OI / 资金费率 / 多空比，生成 <code>replay_dataset_historical.jsonl</code>。盘口为占位，盘口失衡类信号不会触发。合约默认与上方压测区所选一致。</p><div class="field"><label>开始时间</label><div><input type="datetime-local" id="replayBuildStart"><p>本地时间，建议不超过 48 小时跨度。</p></div></div><div class="field"><label>结束时间</label><div><input type="datetime-local" id="replayBuildEnd"></div></div><div class="field"><label>帧步长(秒)</label><div><input type="number" id="replayBuildStep" value="60" min="5" max="3600" step="1"><p>与策略轮询间隔接近即可（swing 建议 60，short/scalp 建议 5）。</p></div></div><div class="field"><label>操作</label><div><div class="toolbar-right" style="justify-content:flex-start;gap:8px;"><button class="button action-control btn-save" type="button" id="replayBuildBtn">生成回放数据</button></div><p class="accuracy-note" id="replayBuildStatus">尚未生成</p></div></div></section><section class="card"><h2>离线回放压测</h2><p class="section-sub">配置页勾选「录制回放数据集」并运行监控，每轮原始输入写入 {esc(REPLAY_DATASET_FILE)}；停止监控后点击下方「开始回放」。回放按配置启用 AI 与微信推送（未开推送则只写日志），结论写入 {esc(REPLAY_ANALYSIS_LOG_FILE)} 的 <code>push_analysis</code> 与 <code>analysis</code> 字段，便于同一数据集多次回放对比；再选上方「回放会话」查看压测曲线。</p><div class="replay-status" id="replayDatasetInfo">正在加载数据集状态...</div><div class="field"><label>回放间隔(秒)</label><div><input type="number" id="replayInterval" value="0" min="0" max="120" step="0.1"><p>0 表示尽快跑完；大于 0 可在回放过程中观察压测曲线刷新。</p></div></div><div class="field"><label>控制</label><div><div class="toolbar-right" style="justify-content:flex-start;gap:8px;"><button class="btn-test" type="button" id="replayStartBtn">开始回放</button><button class="btn-danger action-control" type="button" id="replayStopBtn">停止回放</button><button class="button btn-log" type="button" id="replayRefreshBtn">刷新状态</button></div><p id="replayStatusText">等待加载...</p></div></div></section></div>
 	{help_manual_html(config)}
 	{design_docs_html()}
 	</main></div></div>
@@ -4824,6 +5016,7 @@ button,.button{{border:0;border-radius:12px;padding:11px 16px;background:#f1f3f8
 const SUGGESTED_PUSH_SCORES = {json.dumps(SUGGESTED_PUSH_SCORES, ensure_ascii=False)};
 const RISK_PREFERENCE_LABELS = {json.dumps(RISK_PREFERENCE_LABELS, ensure_ascii=False)};
 const STRATEGY_INTERVAL_SECONDS = {json.dumps(STRATEGY_DEFAULT_INTERVAL_SECONDS, ensure_ascii=False)};
+const STRATEGY_INTERVAL_BOUNDS = {json.dumps(STRATEGY_INTERVAL_BOUNDS, ensure_ascii=False)};
 const STRATEGY_ACCURACY_HORIZON_SECONDS = {json.dumps(STRATEGY_DEFAULT_ACCURACY_HORIZON_SECONDS, ensure_ascii=False)};
 const STRATEGY_ACCURACY_HORIZON_HINTS = {json.dumps(STRATEGY_ACCURACY_HORIZON_HINTS, ensure_ascii=False)};
 const LAUNCHED_BY_TRAY = {json.dumps(tray_mode)};
@@ -4840,16 +5033,19 @@ function currentStrategyMode() {{
 }}
 function syncStrategyIntervalHint() {{
   const mode = currentStrategyMode();
-  const seconds = Number(STRATEGY_INTERVAL_SECONDS[mode]);
-  if (Number.isFinite(seconds) && seconds >= 1) {{
-    monitorIntervalSeconds = seconds;
-  }}
+  const recommended = Number(STRATEGY_INTERVAL_SECONDS[mode]);
+  const bounds = STRATEGY_INTERVAL_BOUNDS[mode] || [1, 3600];
   const hint = document.getElementById('strategyIntervalHint');
-  if (hint) {{
-    hint.textContent = '当前 ' + monitorIntervalSeconds + ' 秒（随策略周期自动绑定）';
+  if (hint && Number.isFinite(recommended)) {{
+    hint.textContent = '当前策略推荐 ' + recommended + ' 秒；可配置范围 ' + bounds[0] + '–' + bounds[1] + ' 秒';
   }}
 }}
 function configuredMonitorInterval() {{
+  const el = document.querySelector('.config-form input[name="interval"]');
+  if (el && el.value) {{
+    const n = Number(el.value);
+    if (Number.isFinite(n) && n >= 1) return n;
+  }}
   const mapped = Number(STRATEGY_INTERVAL_SECONDS[currentStrategyMode()]);
   return Number.isFinite(mapped) && mapped >= 1 ? mapped : monitorIntervalSeconds;
 }}
@@ -5122,10 +5318,13 @@ if (configForm) {{
     }}, 450);
   }});
   configForm.addEventListener('change', function(event) {{
-    if (event.target && (event.target.name === 'inst_ids' || event.target.name === 'strategy_mode')) {{
+    if (event.target && (event.target.name === 'inst_ids' || event.target.name === 'strategy_mode' || event.target.name === 'interval')) {{
       if (event.target.name === 'strategy_mode') {{
         syncStrategyIntervalHint();
         syncStrategyAccuracyHorizon({{ forceSelect: true }});
+      }}
+      if (event.target.name === 'interval') {{
+        monitorIntervalSeconds = configuredMonitorInterval();
       }}
       clearTimeout(autoSaveTimer);
       autoSaveTimer = setTimeout(function() {{
@@ -5372,7 +5571,7 @@ if (factoryResetBtn) {{
 	function updateAccuracyEnableUI(fetchNow){{const enabled=isAccuracyEnabled(),body=document.getElementById('accuracyPanelBody'),label=document.getElementById('accuracyEnableLabel'),offHint=document.getElementById('accuracyOffHint');if(body)body.hidden=!enabled;if(offHint)offHint.hidden=enabled;if(label)label.textContent=enabled?'压测已开启 · 自动刷新':'压测已关闭 · 按需打开';try{{localStorage.setItem(ACCURACY_ENABLE_KEY,enabled?'1':'0');}}catch(e){{}}if(!enabled)return;if(fetchNow)fetchAccuracy({{resetView:true}});}}
 	function initAccuracyEnableToggle(){{const toggle=document.getElementById('accuracyEnableToggle');if(!toggle)return;try{{toggle.checked=localStorage.getItem(ACCURACY_ENABLE_KEY)==='1';}}catch(e){{}}updateAccuracyEnableUI(false);toggle.addEventListener('change',function(){{updateAccuracyEnableUI(true);syncReplayAccuracyPoll();}});}}
 	initAccuracyEnableToggle();
-	let monitorIntervalSeconds={int(recommended_interval_for_strategy(config.get("strategy_mode", "swing")))};
+	let monitorIntervalSeconds={int(config.get("interval", recommended_interval_for_strategy(config.get("strategy_mode", "swing"))))};
 	const accuracyView={{points:[],start:0,end:1,yZoom:1,yPan:0,priceRg:1,drag:null,followLatest:true,selectedKey:''}};
 	let accuracyPlotPoints=[];
 	let accuracyQueryKey='',accuracyLivePayload=null,accuracyImportedMode=false,accuracyImportedLabel='',accuracyScopeSyncing=false,replayAccuracyPollTimer=null;
@@ -5381,7 +5580,7 @@ if (factoryResetBtn) {{
 	function syncReplayAccuracyPoll(){{const scopeEl=document.getElementById('accuracyScope');if(!scopeEl||scopeEl.value!=='replay'||currentPage()!=='tests'){{stopReplayProgress();return;}}isReplayRunning().then(function(running){{if(running)startReplayProgress();else stopReplayProgress();}});}}
 	syncStrategyIntervalHint();
 	syncStrategyAccuracyHorizon({{ forceSelect: false }});
-	function accuracyRetentionHours(){{const n=Number((document.getElementById('accuracyRetentionHours')||{{}}).value);return Number.isFinite(n)&&n>0?n:12;}}
+	function accuracyRetentionHours(){{const n=Number((document.getElementById('accuracyRetentionHours')||{{}}).value);return Number.isFinite(n)&&n>0?n:{int(DEFAULT_ACCURACY_RETENTION_HOURS)};}}
 	function accuracyQuerySignature(){{return [(document.getElementById('accuracyInst')||{{}}).value||'BTC-USDT-SWAP',String(configuredAccuracyHorizon()),(document.getElementById('accuracyScope')||{{}}).value||'session',accuracyRetentionHours(),configuredMonitorInterval()].join('|');}}
 	function setAccuracyImportedMode(active,label){{accuracyImportedMode=!!active;accuracyImportedLabel=label||'';const liveBtn=document.getElementById('accuracyLiveBtn');if(liveBtn)liveBtn.style.display=active?'inline-flex':'none';}}
 	function normalizeAccuracyBundle(raw){{if(!raw||typeof raw!=='object')throw new Error('无效JSON文件');const points=Array.isArray(raw.points)?raw.points:[];const clean=points.filter(o=>Number.isFinite(Number(o&&o.price))),pushMarkers=Array.isArray(raw.push_markers)?raw.push_markers.filter(o=>o&&o.time&&Number.isFinite(Number(o.price))):[];if(!clean.length)throw new Error('文件中没有可用的图表点位');return{{name:raw.name||'OKX_Accuracy_Chart',version:raw.version||'1.0',exported_at:raw.exported_at||'',inst_id:raw.inst_id||'',horizon_seconds:Number(raw.horizon_seconds)||configuredAccuracyHorizon(),scope:raw.scope||'imported',retention_hours:Number(raw.retention_hours)||accuracyRetentionHours(),interval_seconds:Number(raw.interval_seconds)||configuredMonitorInterval(),max_points:Number(raw.max_points)||clean.length,start_at:raw.start_at||'',summary:(raw.summary&&typeof raw.summary==='object')?raw.summary:{{}},points:clean,push_markers:pushMarkers}};}}
@@ -5743,12 +5942,78 @@ function parseDownloadFilename(disposition, fallback) {{
   if (!match) return fallback;
   try {{ return decodeURIComponent(match[1].replace(/"/g, '').trim()); }} catch (e) {{ return match[1].replace(/"/g, '').trim(); }}
 }}
+async function fetchAccuracyPayloadForExport(scope, inst, horizon, retention, interval) {{
+  const qs='inst_id='+encodeURIComponent(inst)+'&horizon='+encodeURIComponent(String(horizon))+'&scope='+encodeURIComponent(scope)+'&retention_hours='+encodeURIComponent(String(retention))+'&interval_seconds='+encodeURIComponent(String(interval))+'&for_diagnostic=1';
+  const r=await fetch('/api/accuracy-data?'+qs,{{cache:'no-store'}});
+  const p=await r.json();
+  if(!r.ok||p.ok===false||!(Array.isArray(p.points)&&p.points.length))return null;
+  return p;
+}}
+async function captureAccuracyChartPng(payload) {{
+  const canvas=document.getElementById('accuracyChart');
+  if(!canvas||!payload||!Array.isArray(payload.points)||!payload.points.length)return null;
+  const saved={{payload:accuracyLivePayload,points:accuracyView.points.slice(),start:accuracyView.start,end:accuracyView.end,yZoom:accuracyView.yZoom,yPan:accuracyView.yPan,selectedKey:accuracyView.selectedKey,followLatest:accuracyView.followLatest,imported:accuracyImportedMode,importedLabel:accuracyImportedLabel,queryKey:accuracyQueryKey}};
+  try {{
+    setAccuracyImportedMode(false,'');
+    accuracyLivePayload=Object.assign({{ok:true}},payload);
+    resetAccuracyView();
+    syncAccuracyPoints(payload.points,{{resetView:true}});
+    drawAccuracyChart();
+    return canvas.toDataURL('image/png');
+  }} finally {{
+    accuracyLivePayload=saved.payload;
+    accuracyView.points=saved.points.slice();
+    accuracyView.start=saved.start;
+    accuracyView.end=saved.end;
+    accuracyView.yZoom=saved.yZoom;
+    accuracyView.yPan=saved.yPan;
+    accuracyView.selectedKey=saved.selectedKey;
+    accuracyView.followLatest=saved.followLatest;
+    accuracyQueryKey=saved.queryKey;
+    setAccuracyImportedMode(saved.imported,saved.importedLabel);
+    drawAccuracyChart();
+  }}
+}}
+async function collectDiagnosticAccuracyImages() {{
+  const insts=(Array.isArray(configuredMonitorInsts)&&configuredMonitorInsts.length)?configuredMonitorInsts.slice():((monitorInst&&String(monitorInst).trim())?[monitorInst]:[]);
+  if(!insts.length)return [];
+  const horizon=configuredAccuracyHorizon();
+  const retention=(typeof accuracyRetentionHours==='function')?accuracyRetentionHours():{int(DEFAULT_ACCURACY_RETENTION_HOURS)};
+  const interval=configuredMonitorInterval();
+  const scopes=['session','all'];
+  try {{
+    const replayInfo=await fetch('/api/replay-status',{{cache:'no-store'}}).then(r=>r.json());
+    if(replayInfo&&Number(replayInfo.analysis_log_bytes||0)>0)scopes.push('replay');
+  }} catch(e) {{}}
+  const images=[];
+  for(const inst of insts) {{
+    for(const scope of scopes) {{
+      try {{
+        const payload=await fetchAccuracyPayloadForExport(scope,inst,horizon,retention,interval);
+        if(!payload)continue;
+        const png=await captureAccuracyChartPng(payload);
+        if(!png)continue;
+        images.push({{name:scope+'_'+String(inst).replace(/\\//g,'_')+'_h'+horizon+'.png',data:png}});
+      }} catch(e) {{}}
+    }}
+  }}
+  return images;
+}}
+function captureMonitorChartPng() {{
+  const canvas=document.getElementById('monitorChart');
+  if(!canvas||!isMonitorChartEnabled())return '';
+  try {{
+    const series=currentMonitorSeries();
+    if(!Array.isArray(series)||!series.length)return '';
+    return canvas.toDataURL('image/png');
+  }} catch(e) {{ return ''; }}
+}}
 async function exportDiagnosticBundle() {{
   const btn = document.getElementById('diagnosticExportBtn');
   const hint = document.getElementById('diagnosticExportHint');
   const label = '导出诊断包';
   if (btn) {{ btn.disabled = true; btn.textContent = '打包中...'; }}
-  if (hint) hint.textContent = '正在收集日志与压测数据，请稍候...';
+  if (hint) hint.textContent = '正在收集日志、回放数据与压测走势图，请稍候...';
   const body = {{}};
   const chat = aiChatMessages.filter(function(item) {{
     return !item.pending && (item.role === 'user' || item.role === 'assistant');
@@ -5760,6 +6025,14 @@ async function exportDiagnosticBundle() {{
     if (typeof buildAccuracyExportBundle === 'function' && accuracyLivePayload && accuracyView.points && accuracyView.points.length) {{
       body.accuracy_snapshot = buildAccuracyExportBundle();
     }}
+  }} catch (e) {{}}
+  try {{
+    const images = await collectDiagnosticAccuracyImages();
+    if (images.length) body.accuracy_images = images;
+  }} catch (e) {{}}
+  try {{
+    const monitorPng = captureMonitorChartPng();
+    if (monitorPng) body.monitor_chart_png = monitorPng;
   }} catch (e) {{}}
   try {{
     const response = await fetch('/api/diagnostic-export', {{
@@ -6113,18 +6386,20 @@ class Handler(BaseHTTPRequestHandler):
             inst_id = params.get("inst_id", ["BTC-USDT-SWAP"])[0]
             horizon = int(params.get("horizon", ["5"])[0])
             scope = params.get("scope", ["session"])[0]
-            retention_hours = float(params.get("retention_hours", ["12"])[0])
+            retention_hours = float(params.get("retention_hours", [str(int(DEFAULT_ACCURACY_RETENTION_HOURS))])[0])
             interval_seconds = int(params.get("interval_seconds", [str(load_config().get("interval", 5))])[0])
             max_points = accuracy_chart_max_points(retention_hours, interval_seconds)
             if "max_points" in params:
                 max_points = max(100, min(50000, int(params.get("max_points", [str(max_points)])[0])))
+            for_diagnostic = params.get("for_diagnostic", ["0"])[0] in ("1", "true", "yes")
             try:
                 accuracy_log_path = REPLAY_ANALYSIS_LOG_FILE if scope == "replay" else MONITOR_JSON_LOG_FILE
                 cache_key = (
                     f"accuracy:{inst_id}:{horizon}:{scope}:{retention_hours}:"
                     f"{interval_seconds}:{max_points}:"
                     f"{MONITOR_LOG_START_AT}:{REPLAY_LOG_START_AT}:"
-                    f"{log_file_cache_token(accuracy_log_path)}"
+                    f"{log_file_cache_token(accuracy_log_path)}:"
+                    f"diag:{for_diagnostic}"
                 )
                 self.send_json(
                     cached_api_response(
@@ -6136,6 +6411,7 @@ class Handler(BaseHTTPRequestHandler):
                             scope=scope,
                             retention_hours=retention_hours,
                             interval_seconds=interval_seconds,
+                            for_diagnostic=for_diagnostic,
                         ),
                     )
                 )
@@ -6395,6 +6671,10 @@ class Handler(BaseHTTPRequestHandler):
                     extras["ai_chat"] = payload["ai_chat"]
                 if isinstance(payload.get("accuracy_snapshot"), dict):
                     extras["accuracy_snapshot"] = payload["accuracy_snapshot"]
+                if isinstance(payload.get("accuracy_images"), list):
+                    extras["accuracy_images"] = payload["accuracy_images"]
+                if isinstance(payload.get("monitor_chart_png"), str):
+                    extras["monitor_chart_png"] = payload["monitor_chart_png"]
                 content, filename, manifest = create_diagnostic_zip(extras)
                 self.send_bytes(content, "application/zip", filename=filename)
             except Exception as exc:

@@ -2,11 +2,18 @@
   "inst_ids": [
     "ETH-USDT-SWAP"
   ],
-  "record_replay_enabled": false,
+  "custom_inst_ids": [],
+  "removed_inst_ids": [],
+  "interval": 60,
+  "log_max_mb": 500,
+  "log_total_max_mb": 8192,
+  "record_replay_enabled": true,
   "strategy_mode": "swing",
   "risk_preference": "aggressive",
-  "ai_enabled": false,
-  "push_enabled": false,
-  "push_score": 70,
-  "short_push_score": 68
+  "ai_enabled": true,
+  "ai_periodic_interval_minutes": 30,
+  "wechat_silence_brief_minutes": 120,
+  "push_enabled": true,
+  "push_score": 65,
+  "short_push_score": 65
 }

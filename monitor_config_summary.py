@@ -12,18 +12,42 @@ SWING_AI_CALL_MIN_INTERVAL_SECONDS = 300
 LONG_AI_CALL_MIN_INTERVAL_SECONDS = 600
 SWING_AI_SUSTAINED_REVIEW_INTERVAL_SECONDS = 300
 
-# 轮询间隔与策略周期绑定：更慢周期不必高频 REST 轮询。
+# 轮询间隔：各策略推荐默认值与可配置范围（秒）。
 STRATEGY_DEFAULT_INTERVAL_SECONDS: Dict[str, int] = {
     "scalp": 5,
     "short": 5,
     "swing": 60,
     "long": 180,
 }
+STRATEGY_INTERVAL_BOUNDS: Dict[str, Tuple[int, int]] = {
+    "scalp": (3, 30),
+    "short": (3, 60),
+    "swing": (15, 900),
+    "long": (60, 3600),
+}
 
 
 def recommended_interval_for_strategy(strategy_mode: str) -> int:
     mode = str(strategy_mode or "short").strip().lower()
     return max(1, int(STRATEGY_DEFAULT_INTERVAL_SECONDS.get(mode, STRATEGY_DEFAULT_INTERVAL_SECONDS["short"])))
+
+
+def normalize_interval_for_strategy(
+    strategy_mode: str,
+    interval: Any,
+    *,
+    interval_explicit: bool = False,
+) -> int:
+    mode = str(strategy_mode or "short").strip().lower()
+    default = recommended_interval_for_strategy(mode)
+    lo, hi = STRATEGY_INTERVAL_BOUNDS.get(mode, (1, 3600))
+    if not interval_explicit:
+        return default
+    try:
+        value = int(interval)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, value))
 
 # 压测验证窗口与策略周期绑定：与主周期/前瞻 horizon 对齐。
 STRATEGY_DEFAULT_ACCURACY_HORIZON_SECONDS: Dict[str, int] = {
@@ -55,14 +79,15 @@ def recommended_accuracy_horizon_for_strategy(strategy_mode: str) -> int:
 
 # Single source for monitor/Web CLI behavior defaults (must match SignalConfig + default_config).
 MONITOR_BEHAVIOR_DEFAULTS: Dict[str, Any] = {
-    "interval": 5,
-    "push_score": 70,
-    "short_push_score": 68,
+    "interval": 60,
+    "push_score": 65,
+    "short_push_score": 65,
     "watch_push_score": 65,
     "spike_push_score": 62,
     "forecast_push_score": 58,
     "forecast_horizon_minutes": 240,
     "push_cooldown_seconds": 1800,
+    "same_trend_push_cooldown_seconds": 7200,
     "spike_push_cooldown_seconds": 1200,
     "watch_push_cooldown_seconds": 1800,
     "reverse_trade_cooldown_seconds": 600,
@@ -77,12 +102,17 @@ MONITOR_BEHAVIOR_DEFAULTS: Dict[str, Any] = {
     "l3_local_spike_push": False,
     "l2_require_volume_or_structure": True,
     "calibration_enabled": True,
+    "late_long_entry_guard": True,
+    "pullback_long_entry_guard": True,
+    "post_peak_long_entry_guard": True,
+    "post_peak_short_entry_favor": True,
+    "ai_trade_push_persist_seconds": 1800,
     "paper_follow_ai_only": True,
     "paper_fee_bps": 5.0,
     "forward_require_forecast_alignment": True,
     "replay_ai_cache_enabled": True,
     "wechat_require_ai_review": True,
-    "wechat_silence_brief_minutes": 0,
+    "wechat_silence_brief_minutes": 120,
     "volume_multiplier": 2.0,
     "oi_change_pct_15m": 5.0,
     "funding_abs_threshold": 0.0008,
@@ -127,6 +157,11 @@ MONITOR_RESTART_KEYS: Set[str] = frozenset(
         "calibration_min_samples",
         "calibration_blend_weight",
         "calibration_disable_below_hit_rate",
+        "late_long_entry_guard",
+        "pullback_long_entry_guard",
+        "post_peak_long_entry_guard",
+        "post_peak_short_entry_favor",
+        "ai_trade_push_persist_seconds",
         "paper_follow_ai_only",
         "paper_fee_bps",
         "forward_require_forecast_alignment",
@@ -165,6 +200,11 @@ FIXED_BEHAVIOR_KEYS: frozenset = frozenset(
         "calibration_min_samples",
         "calibration_blend_weight",
         "calibration_disable_below_hit_rate",
+        "late_long_entry_guard",
+        "pullback_long_entry_guard",
+        "post_peak_long_entry_guard",
+        "post_peak_short_entry_favor",
+        "ai_trade_push_persist_seconds",
         "paper_follow_ai_only",
         "paper_fee_bps",
         "forward_require_forecast_alignment",
@@ -183,7 +223,12 @@ def apply_fixed_behavior_defaults(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def sync_strategy_bound_config(config: Dict[str, Any]) -> Dict[str, Any]:
     merged = apply_fixed_behavior_defaults(config)
-    merged["interval"] = recommended_interval_for_strategy(merged.get("strategy_mode"))
+    merged["interval"] = normalize_interval_for_strategy(
+        merged.get("strategy_mode"),
+        merged.get("interval"),
+        interval_explicit=bool(config.get("_interval_explicit")),
+    )
+    merged.pop("_interval_explicit", None)
     return merged
 
 

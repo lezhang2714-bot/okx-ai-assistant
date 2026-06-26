@@ -1209,6 +1209,171 @@ class DecisionPipelineTests(unittest.TestCase):
         self.assertIn("strategy_spike_score", reason)
         self.assertEqual(assistant._push_cooldown_seconds("spike"), 1800)
 
+
+class PushCooldownTests(unittest.TestCase):
+    def _snapshot(self, price: float = 100.0) -> dict:
+        return {"inst_id": "BTC-USDT-SWAP", "price": price, "time": "2026-06-26 00:54:00"}
+
+    def test_same_direction_short_not_bypassed_when_price_drops(self):
+        assistant = make_assistant()
+        assistant._set_replay_clock("2026-06-26 00:54:00")
+        snapshot = self._snapshot(100.0)
+        push_key = assistant._push_key(snapshot, "trade", SHORT)
+        assistant._mark_wechat_push_sent(
+            snapshot["inst_id"],
+            push_key,
+            "trade",
+            {"direction": SHORT, "confidence": 78},
+            snapshot,
+        )
+        blocked = assistant._in_push_cooldown(
+            push_key,
+            "trade",
+            self._snapshot(97.0),
+            80,
+            SHORT,
+        )
+        self.assertTrue(blocked)
+
+    def test_same_trend_cooldown_blocks_repeat_within_two_hours(self):
+        assistant = make_assistant()
+        assistant._set_replay_clock("2026-06-26 00:16:00")
+        snapshot = self._snapshot(1574.81)
+        push_key = assistant._push_key(snapshot, "spike", SHORT)
+        assistant._mark_wechat_push_sent(
+            snapshot["inst_id"],
+            push_key,
+            "spike",
+            {"direction": SHORT, "confidence": 85},
+            snapshot,
+        )
+        assistant._set_replay_clock("2026-06-26 00:47:35")
+        blocked = assistant._in_push_cooldown(
+            push_key,
+            "spike",
+            self._snapshot(1559.64),
+            77,
+            SHORT,
+        )
+        self.assertTrue(blocked)
+        reason = assistant._push_cooldown_block_reason(
+            push_key, "spike", self._snapshot(1559.64), 77, SHORT
+        )
+        self.assertEqual(reason, "same_trend_cooldown")
+
+    def test_same_direction_repushed_after_trend_cooldown_elapsed(self):
+        assistant = make_assistant()
+        assistant._set_replay_clock("2026-06-26 00:16:00")
+        snapshot = self._snapshot(100.0)
+        push_key = assistant._push_key(snapshot, "trade", SHORT)
+        assistant._mark_wechat_push_sent(
+            snapshot["inst_id"],
+            push_key,
+            "trade",
+            {"direction": SHORT, "confidence": 78},
+            snapshot,
+        )
+        assistant._set_replay_clock("2026-06-26 02:30:00")
+        blocked = assistant._in_push_cooldown(
+            push_key,
+            "trade",
+            self._snapshot(97.0),
+            80,
+            SHORT,
+        )
+        self.assertFalse(blocked)
+
+    def test_trend_leg_bounce_reset_allows_earlier_same_direction_push(self):
+        assistant = make_assistant()
+        assistant._set_replay_clock("2026-06-26 00:16:00")
+        snapshot = self._snapshot(100.0)
+        push_key = assistant._push_key(snapshot, "trade", SHORT)
+        assistant._mark_wechat_push_sent(
+            snapshot["inst_id"],
+            push_key,
+            "trade",
+            {"direction": SHORT, "confidence": 80},
+            snapshot,
+        )
+        assistant._set_replay_clock("2026-06-26 00:40:00")
+        blocked = assistant._in_push_cooldown(
+            push_key,
+            "trade",
+            self._snapshot(101.0),
+            82,
+            SHORT,
+        )
+        self.assertFalse(blocked)
+
+    def test_repeat_short_near_local_low_blocked(self):
+        assistant = make_assistant()
+        assistant._set_replay_clock("2026-06-26 00:16:00")
+        snapshot = {
+            **self._snapshot(100.0),
+            "trend_profiles": {
+                "1H": {"recent_high": 110.0, "recent_low": 99.8},
+                "4H": {"recent_high": 110.0, "recent_low": 99.8},
+            },
+        }
+        push_key = assistant._push_key(snapshot, "spike", SHORT)
+        assistant._mark_wechat_push_sent(
+            snapshot["inst_id"],
+            push_key,
+            "spike",
+            {"direction": SHORT, "confidence": 85},
+            snapshot,
+        )
+        reason = assistant._repeat_direction_entry_block(
+            {**snapshot, "price": 99.9},
+            snapshot["inst_id"],
+            SHORT,
+            "spike",
+        )
+        self.assertEqual(reason, "repeat_short_near_local_low")
+
+    def test_direction_change_not_blocked_by_same_direction_cooldown(self):
+        assistant = make_assistant()
+        assistant._set_replay_clock("2026-06-26 00:54:00")
+        snapshot = self._snapshot(100.0)
+        short_key = assistant._push_key(snapshot, "trade", SHORT)
+        assistant._mark_wechat_push_sent(
+            snapshot["inst_id"],
+            short_key,
+            "trade",
+            {"direction": SHORT, "confidence": 80},
+            snapshot,
+        )
+        long_key = assistant._push_key(snapshot, "trade", LONG)
+        blocked = assistant._in_push_cooldown(long_key, "trade", snapshot, 82, LONG)
+        self.assertFalse(blocked)
+
+    def test_trade_and_spike_share_direction_cooldown(self):
+        assistant = make_assistant()
+        assistant._set_replay_clock("2026-06-26 00:54:00")
+        snapshot = self._snapshot(100.0)
+        trade_key = assistant._push_key(snapshot, "trade", SHORT)
+        assistant._mark_wechat_push_sent(
+            snapshot["inst_id"],
+            trade_key,
+            "trade",
+            {"direction": SHORT, "confidence": 80},
+            snapshot,
+        )
+        spike_key = assistant._push_key(snapshot, "spike", SHORT)
+        blocked = assistant._in_push_cooldown(spike_key, "spike", snapshot, 81, SHORT)
+        self.assertTrue(blocked)
+
+    def test_direction_change_bypasses_inst_wechat_cooldown(self):
+        assistant = make_assistant()
+        assistant._set_replay_clock("2026-06-26 00:54:00")
+        inst = "BTC-USDT-SWAP"
+        assistant.last_wechat_push_at[inst] = assistant._now_ts()
+        assistant.last_trade_push_at[inst] = (SHORT, assistant._now_ts())
+        self.assertFalse(assistant._in_inst_wechat_cooldown(inst, LONG))
+        self.assertTrue(assistant._in_inst_wechat_cooldown(inst, SHORT))
+
+
+class SentimentSignalTests(unittest.TestCase):
     def test_sentiment_signals_single_high_strength_qualifies(self):
         assistant = make_assistant()
         qualified = assistant._l2_qualifies_ai_call(
@@ -1472,6 +1637,522 @@ class AiForwardStatsTests(unittest.TestCase):
         direction, source = prediction_direction_from_log_item(item)
         self.assertEqual(direction, LONG)
         self.assertEqual(source, "raw_direction")
+
+    def _seed_decision_calibration_bucket(
+        self,
+        assistant: OkxAiShortTermAssistant,
+        *,
+        inst_id: str = "BTC-USDT-SWAP",
+        direction: str = LONG,
+        push_kind: str = "trade",
+        regime: str = "high_volatility",
+        total: int = 16,
+        hits: int = 4,
+    ) -> str:
+        key = assistant._decision_calibration_key(inst_id, "ai", push_kind, direction, regime)
+        assistant.calibration_state.setdefault("buckets", {})[key] = {
+            "total": total,
+            "hits": hits,
+        }
+        return key
+
+    def test_calibration_keeps_trend_aligned_trade_when_confidence_meets_raised_threshold(self):
+        assistant = make_assistant(strategy_mode="swing", push_score=65, calibration_min_samples=8)
+        self._seed_decision_calibration_bucket(assistant, total=16, hits=4)
+        final_decision = {
+            "direction": LONG,
+            "confidence": 68,
+            "push_recommendation": "trade",
+            "decision_source": "ai",
+            "local_bias": LONG,
+            "forward_view": {"direction": LONG, "probability": 68},
+        }
+        score = {"strategy_views": {"scalp": {}}, "final_direction": LONG}
+        snapshot = {
+            "inst_id": "BTC-USDT-SWAP",
+            "market_context": {
+                "regime": "high_volatility",
+                "recent_price_pressure": "up",
+                "bias": "long",
+            },
+        }
+        audited = assistant._apply_ai_calibration_audit(final_decision, snapshot, score)
+        self.assertEqual(audited.get("push_recommendation"), "trade")
+        self.assertGreaterEqual(int(audited.get("calibration_effective_threshold", 0) or 0), 65)
+
+    def test_calibration_downgrades_trade_when_confidence_below_raised_threshold(self):
+        assistant = make_assistant(strategy_mode="swing", push_score=65, calibration_min_samples=8)
+        self._seed_decision_calibration_bucket(assistant, total=16, hits=2)
+        final_decision = {
+            "direction": LONG,
+            "confidence": 66,
+            "push_recommendation": "trade",
+            "decision_source": "ai",
+            "forward_view": {"direction": LONG, "probability": 66},
+        }
+        score = {"strategy_views": {"scalp": {}}}
+        snapshot = {
+            "inst_id": "BTC-USDT-SWAP",
+            "market_context": {
+                "regime": "range",
+                "recent_price_pressure": "neutral",
+                "bias": "neutral",
+            },
+        }
+        audited = assistant._apply_ai_calibration_audit(final_decision, snapshot, score)
+        self.assertEqual(audited.get("push_recommendation"), "none")
+        self.assertIn("calibration_shadow_track", audited)
+
+    def test_replay_reset_clears_decision_calibration_buckets(self):
+        assistant = make_assistant(strategy_mode="swing")
+        key = self._seed_decision_calibration_bucket(assistant)
+        assistant.pending_decision_reviews.append({"inst_id": "BTC-USDT-SWAP", "kind": "decision"})
+        assistant._reset_replay_calibration_state(["BTC-USDT-SWAP"])
+        self.assertNotIn(key, assistant.calibration_state.get("buckets", {}))
+        self.assertEqual(assistant.pending_decision_reviews, [])
+
+    def test_confidence_hug_skipped_for_trend_aligned_high_volatility(self):
+        assistant = make_assistant(strategy_mode="swing", push_score=65, ai_conflict_guard=True)
+        final_decision = {
+            "direction": LONG,
+            "confidence": 66,
+            "push_recommendation": "trade",
+            "decision_source": "ai",
+            "local_bias": LONG,
+            "forward_view": {"direction": LONG, "probability": 66},
+        }
+        score = {
+            "structure_forecast": {"active": False},
+            "strategy_views": {"scalp": {}},
+            "final_direction": LONG,
+        }
+        audited = assistant._apply_decision_post_audit(
+            final_decision,
+            score,
+            [{"type": "volume_spike"}],
+            {"level": "L2", "reasons": ["multi_signal"]},
+            {
+                "inst_id": "BTC-USDT-SWAP",
+                "market_context": {
+                    "regime": "mixed",
+                    "recent_price_pressure": "up",
+                    "bias": "long",
+                },
+            },
+        )
+        self.assertEqual(audited.get("push_recommendation"), "trade")
+
+    def test_pressure_up_allows_short_trade_during_pullback(self):
+        assistant = make_assistant(strategy_mode="swing", short_push_score=65, ai_conflict_guard=True)
+        final_decision = {
+            "direction": SHORT,
+            "confidence": 70,
+            "push_recommendation": "trade",
+            "decision_source": "ai",
+            "forward_view": {"direction": SHORT, "probability": 70},
+        }
+        score = {
+            "structure_forecast": {"active": False},
+            "strategy_views": {"scalp": {}},
+            "final_direction": SHORT,
+        }
+        audited = assistant._apply_decision_post_audit(
+            final_decision,
+            score,
+            [{"type": "structure_break"}],
+            {"level": "L2", "reasons": ["multi_signal"]},
+            {
+                "inst_id": "BTC-USDT-SWAP",
+                "market_context": {
+                    "regime": "trend_down",
+                    "recent_price_pressure": "up",
+                    "bias": "short",
+                    "trade_down": 3,
+                    "trade_up": 1,
+                },
+            },
+        )
+        self.assertEqual(audited.get("push_recommendation"), "trade")
+
+    def test_late_long_entry_guard_blocks_chase_near_structural_high(self):
+        assistant = make_assistant(strategy_mode="swing", late_long_entry_guard=True)
+        final_decision = {
+            "direction": LONG,
+            "confidence": 68,
+            "push_recommendation": "trade",
+            "decision_source": "ai",
+            "forward_view": {"direction": LONG, "probability": 68},
+        }
+        score = {
+            "structure_forecast": {"active": False},
+            "strategy_views": {"scalp": {}},
+        }
+        snapshot = {
+            "inst_id": "ETH-USDT-SWAP",
+            "price": 1840.0,
+            "volatility": {"atr_pct_15m": 0.55},
+            "trend_profiles": {
+                "15m": {"recent_high": 1846.0},
+                "1H": {"recent_high": 1848.16, "recent_low": 1712.9, "rsi": {"14": 72.0}},
+                "4H": {"recent_high": 1848.16, "recent_low": 1712.9},
+            },
+            "candles": {"1m": []},
+            "market_context": {},
+        }
+        audited = assistant._apply_decision_post_audit(
+            final_decision,
+            score,
+            [{"type": "volume_spike"}],
+            {"level": "L2", "reasons": ["periodic_review"]},
+            {
+                **snapshot,
+                "market_context": {
+                    "regime": "high_volatility",
+                    "recent_price_pressure": "neutral",
+                    "bias": "long",
+                    "trend_phase": "transition",
+                    "price_change_strategy": 0.73,
+                    "recent_move_pct": {"20m": 0.12},
+                },
+            },
+        )
+        self.assertEqual(audited.get("push_recommendation"), "none")
+        self.assertIn("late_long_entry_near_structural_high", audited.get("post_audit", {}).get("reasons", []))
+
+    def test_late_long_entry_guard_allows_pullback_long(self):
+        assistant = make_assistant(strategy_mode="swing", late_long_entry_guard=True)
+        final_decision = {
+            "direction": LONG,
+            "confidence": 68,
+            "push_recommendation": "trade",
+            "decision_source": "ai",
+            "local_bias": LONG,
+            "forward_view": {"direction": LONG, "probability": 68},
+        }
+        score = {
+            "structure_forecast": {"active": False},
+            "strategy_views": {"scalp": {}},
+            "final_direction": LONG,
+        }
+        audited = assistant._apply_decision_post_audit(
+            final_decision,
+            score,
+            [{"type": "volume_spike"}],
+            {"level": "L2", "reasons": ["multi_signal"]},
+            {
+                "inst_id": "ETH-USDT-SWAP",
+                "price": 1840.0,
+                "volatility": {"atr_pct_15m": 0.55},
+                "trend_profiles": {
+                    "1H": {"recent_high": 1848.16, "rsi": {"14": 58.0}},
+                    "4H": {"recent_high": 1848.16},
+                },
+                "candles": {"1m": []},
+                "market_context": {
+                    "regime": "high_volatility",
+                    "recent_price_pressure": "down",
+                    "bias": "long",
+                    "trend_phase": "pullback_in_uptrend",
+                    "price_change_strategy": 2.4,
+                    "recent_move_pct": {"20m": -0.45},
+                },
+            },
+        )
+        self.assertEqual(audited.get("push_recommendation"), "trade")
+
+    def test_late_long_entry_guard_allows_fresh_breakout(self):
+        assistant = make_assistant(strategy_mode="swing", late_long_entry_guard=True)
+        reason = assistant._late_long_entry_block_reason(
+            {
+                "price": 1763.0,
+                "volatility": {"atr_pct_15m": 0.45},
+                "trend_profiles": {"1H": {"recent_high": 1765.0, "rsi": {"14": 62.0}}},
+                "candles": {"1m": []},
+            },
+            {
+                "recent_price_pressure": "up",
+                "trend_phase": "breakout_attempt_up",
+                "price_change_strategy": 1.2,
+                "recent_move_pct": {"20m": 0.8},
+            },
+            {},
+            {"direction": LONG},
+            "spike",
+        )
+        self.assertEqual(reason, "")
+
+    def test_late_long_entry_guard_exempts_early_rally(self):
+        assistant = make_assistant(strategy_mode="swing", late_long_entry_guard=True)
+        reason = assistant._late_long_entry_block_reason(
+            {
+                "price": 1749.13,
+                "volatility": {"atr_pct_15m": 0.45},
+                "trend_profiles": {
+                    "1H": {"recent_high": 1752.0, "recent_low": 1712.9, "rsi": {"14": 66.0}},
+                    "4H": {"recent_high": 1752.0, "recent_low": 1712.9},
+                },
+                "candles": {"1m": []},
+            },
+            {
+                "recent_price_pressure": "up",
+                "trend_phase": "trend_accelerating_up",
+                "price_change_strategy": 1.8,
+                "recent_move_pct": {"20m": 0.9},
+            },
+            {},
+            {"direction": LONG},
+            "trade",
+        )
+        self.assertEqual(reason, "")
+
+    def test_pullback_blocks_long_trade_during_downtrend(self):
+        assistant = make_assistant(strategy_mode="swing", pullback_long_entry_guard=True)
+        final_decision = {
+            "direction": LONG,
+            "confidence": 68,
+            "push_recommendation": "trade",
+            "decision_source": "ai",
+            "forward_view": {"direction": LONG, "probability": 68},
+        }
+        score = {
+            "structure_forecast": {"active": False},
+            "strategy_views": {"scalp": {}},
+        }
+        audited = assistant._apply_decision_post_audit(
+            final_decision,
+            score,
+            [{"type": "volume_spike"}],
+            {"level": "L2", "reasons": ["multi_signal"]},
+            {
+                "inst_id": "ETH-USDT-SWAP",
+                "price": 1787.96,
+                "volatility": {"atr_pct_15m": 0.45},
+                "trend_profiles": {
+                    "15m": {"trend": "down"},
+                    "1H": {"trend": "down", "recent_high": 1848.16, "recent_low": 1712.9},
+                    "4H": {"recent_high": 1848.16, "recent_low": 1712.9},
+                },
+                "candles": {"1m": []},
+                "market_context": {
+                    "regime": "high_volatility",
+                    "recent_price_pressure": "down",
+                    "bias": "neutral",
+                    "trend_phase": "transition",
+                    "trade_down": 3,
+                    "trade_up": 1,
+                    "price_change_strategy": -0.8,
+                    "recent_move_pct": {"20m": -0.6},
+                },
+            },
+        )
+        self.assertEqual(audited.get("push_recommendation"), "none")
+        self.assertIn("pullback_downtrend_blocks_long_trade", audited.get("post_audit", {}).get("reasons", []))
+
+    def test_trade_push_confidence_uses_forward_probability_cap(self):
+        assistant = make_assistant(strategy_mode="swing", push_score=65)
+        final_decision = {
+            "decision_source": "ai",
+            "direction": LONG,
+            "confidence": 79,
+            "forward_view": {"direction": LONG, "probability": 62},
+            "push_recommendation": "trade",
+        }
+        self.assertEqual(assistant._trade_push_confidence(final_decision, {}), 62)
+        self.assertEqual(assistant.push_gate(final_decision, [{"type": "volume_spike"}], {}), "")
+
+    def test_post_peak_blocks_long_after_session_rally(self):
+        assistant = make_assistant(strategy_mode="swing", post_peak_long_entry_guard=True)
+        eval_result = assistant._post_peak_long_entry_eval(
+            {
+                "price": 1830.0,
+                "trend_profiles": {
+                    "1H": {"recent_high": 1848.16, "recent_low": 1712.9},
+                    "4H": {"recent_high": 1848.16, "recent_low": 1712.9},
+                },
+            },
+            {
+                "recent_price_pressure": "neutral",
+                "trend_phase": "transition",
+            },
+            {"direction": LONG, "push_recommendation": "trade"},
+            "trade",
+        )
+        self.assertTrue(eval_result.get("blocked"))
+        self.assertEqual(eval_result.get("reason"), "post_peak_blocks_long_trade")
+
+    def test_deep_pullback_blocks_long_using_session_high(self):
+        assistant = make_assistant(strategy_mode="swing", pullback_long_entry_guard=True, push_score=65)
+        final_decision = {
+            "direction": LONG,
+            "confidence": 68,
+            "push_recommendation": "trade",
+            "decision_source": "ai",
+            "forward_view": {"direction": LONG, "probability": 68},
+        }
+        score = {
+            "structure_forecast": {"active": False},
+            "strategy_views": {"scalp": {}},
+        }
+        audited = assistant._apply_decision_post_audit(
+            final_decision,
+            score,
+            [{"type": "volume_spike"}],
+            {"level": "L2", "reasons": ["multi_signal"]},
+            {
+                "inst_id": "ETH-USDT-SWAP",
+                "price": 1758.0,
+                "volatility": {"atr_pct_15m": 0.45},
+                "trend_profiles": {
+                    "15m": {"trend": "down"},
+                    "1H": {"trend": "down", "recent_high": 1848.16, "recent_low": 1750.0},
+                    "4H": {"recent_high": 1848.16, "recent_low": 1712.9},
+                },
+                "candles": {"1m": []},
+                "market_context": {
+                    "regime": "mixed",
+                    "recent_price_pressure": "down",
+                    "bias": "neutral",
+                    "trend_phase": "transition",
+                    "trade_down": 2,
+                    "trade_up": 1,
+                    "price_change_strategy": -0.5,
+                    "recent_move_pct": {"20m": -0.4},
+                },
+            },
+        )
+        self.assertEqual(audited.get("push_recommendation"), "none")
+        self.assertIn("pullback_downtrend_blocks_long_trade", audited.get("post_audit", {}).get("reasons", []))
+        self.assertGreaterEqual(float(audited.get("drawdown_from_high_pct", 0) or 0), 2.5)
+
+    def test_l3_promotes_spike_from_ai_watch(self):
+        assistant = make_assistant(strategy_mode="scalp", spike_push_score=70)
+        final_decision = {
+            "direction": LONG,
+            "confidence": 72,
+            "push_recommendation": "watch",
+            "decision_source": "ai",
+        }
+        score = {
+            "structure_forecast": {"active": False},
+            "strategy_views": {
+                "scalp": {
+                    "action_level": "急速异动",
+                    "direction": LONG,
+                    "score": 78,
+                }
+            },
+        }
+        audited = assistant._apply_decision_post_audit(
+            final_decision,
+            score,
+            [{"type": "volume_spike"}],
+            {"level": "L3", "reasons": ["scalp_spike"]},
+            {
+                "inst_id": "ETH-USDT-SWAP",
+                "price": 1763.0,
+                "volatility": {"atr_pct_15m": 0.45},
+                "trend_profiles": {"1H": {"recent_high": 1765.0, "recent_low": 1712.9}},
+                "candles": {"1m": []},
+                "market_context": {
+                    "regime": "high_volatility",
+                    "recent_price_pressure": "up",
+                    "bias": "long",
+                    "trend_phase": "breakout_attempt_up",
+                },
+            },
+        )
+        self.assertEqual(audited.get("push_recommendation"), "spike")
+        self.assertIn("l3_scalp_spike_from_ai_watch", audited.get("post_audit", {}).get("reasons", []))
+
+    def test_post_peak_short_favor_promotes_local_short(self):
+        assistant = make_assistant(strategy_mode="swing", post_peak_short_entry_favor=True, push_score=65)
+        score = {
+            "final_direction": SHORT,
+            "direction": SHORT,
+            "final_trade_score": 40,
+            "raw_total_score": 40,
+            "structure_forecast": {"active": False},
+            "strategy_views": {"scalp": {}},
+        }
+        audited = assistant._apply_decision_post_audit(
+            {
+                "direction": WATCH,
+                "confidence": 40,
+                "push_recommendation": "none",
+                "decision_source": "local_screening",
+            },
+            score,
+            [],
+            {"level": "L0", "reasons": []},
+            {
+                "inst_id": "ETH-USDT-SWAP",
+                "price": 1790.0,
+                "volatility": {"atr_pct_15m": 0.45},
+                "trend_profiles": {
+                    "15m": {"trend": "down"},
+                    "1H": {"trend": "down", "recent_high": 1848.16, "recent_low": 1712.9},
+                    "4H": {"recent_high": 1848.16, "recent_low": 1712.9},
+                },
+                "candles": {"1m": []},
+                "market_context": {
+                    "regime": "mixed",
+                    "recent_price_pressure": "down",
+                    "trade_down": 3,
+                    "trade_up": 1,
+                },
+            },
+        )
+        self.assertEqual(audited.get("direction"), SHORT)
+        self.assertEqual(audited.get("push_recommendation"), "trade")
+        self.assertIn("post_peak_local_short_promote", audited.get("post_audit", {}).get("reasons", []))
+        self.assertTrue((audited.get("post_peak_short_favor") or {}).get("active"))
+
+    def test_ai_trade_persist_exempts_no_signals(self):
+        assistant = make_assistant(strategy_mode="swing", push_score=65)
+        final_decision = {
+            "direction": SHORT,
+            "confidence": 66,
+            "push_recommendation": "trade",
+            "decision_source": "ai_persisted",
+            "ai_trade_persisted": True,
+            "forward_view": {"direction": SHORT, "probability": 66},
+        }
+        self.assertTrue(assistant._confirmed_push_exempt_no_signals(final_decision))
+        track = assistant._confirmed_push_eval(
+            {"inst_id": "ETH-USDT-SWAP", "price": 1765.0},
+            [],
+            final_decision,
+            {},
+        )
+        self.assertNotEqual(track.get("reason"), "no_signals")
+        self.assertEqual(assistant.push_gate(final_decision, [], {}), "trade")
+
+    def test_ai_trade_decision_persists_across_local_frames(self):
+        assistant = make_assistant(strategy_mode="swing", push_score=65, ai_trade_push_persist_seconds=1800)
+        assistant.last_ai_trade_decision["ETH-USDT-SWAP"] = {
+            "direction": SHORT,
+            "push_recommendation": "trade",
+            "confidence": 66,
+            "forward_view": {"direction": SHORT, "probability": 66},
+            "ts": assistant._now_ts(),
+        }
+        score = {
+            "final_direction": WATCH,
+            "direction": WATCH,
+            "raw_total_score": 30,
+            "structure_forecast": {"active": False},
+            "strategy_views": {"scalp": {}},
+        }
+        merged = assistant.merge_final_decision(
+            None,
+            score,
+            [],
+            {"level": "L0", "reasons": []},
+            {"inst_id": "ETH-USDT-SWAP", "price": 1765.0},
+        )
+        self.assertEqual(merged.get("direction"), SHORT)
+        self.assertEqual(merged.get("push_recommendation"), "trade")
+        self.assertEqual(merged.get("decision_source"), "ai_persisted")
 
 
 if __name__ == "__main__":
