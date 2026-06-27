@@ -1066,6 +1066,70 @@ class DecisionPipelineTests(unittest.TestCase):
         self.assertEqual(track.get("status"), "would_push")
         self.assertEqual(track.get("kind"), "brief")
 
+    def _silence_brief_ready_fixture(self, assistant, inst="BTC-USDT-SWAP"):
+        assistant.push_enabled = True
+        assistant.last_silence_brief_at[inst] = assistant._now_ts() - 70 * 60
+        cycle = assistant._silence_brief_cycle(inst)
+        assistant._silence_brief_ai_epoch_done[inst] = cycle
+        analysis = {
+            "valid_json": True,
+            "parsed": {
+                "direction": WATCH,
+                "confidence": 55,
+                "risk_level": "\u4e2d",
+                "push_recommendation": "none",
+                "analysis_note": "4H\u504f\u7a7a\u30011H\u6574\u7406\uff0c\u672a\u8fbe\u7ed3\u6784\u5355\u95e8\u69db",
+                "forward_view": {
+                    "direction": WATCH,
+                    "probability": 55,
+                    "horizon_minutes": 240,
+                    "summary": "震荡等待方向选择",
+                    "invalidation": "突破1720或跌破1655",
+                },
+                "suggestion": "操作态度：观望等待\n等待条件：突破1720或跌破1655\n价位计划：暂不给入场位\n失效条件：-",
+                "data_quality": {"overall": "\u5145\u8db3", "warnings": []},
+            },
+        }
+        assistant._silence_brief_analysis_cache[inst] = (cycle, analysis)
+        snapshot = {"inst_id": inst, "price": 1668.0, "time": "t"}
+        trigger = {"level": "L2", "reasons": ["silence_brief"], "ai_invoked": True}
+        final_decision = {"direction": WATCH, "push_recommendation": "none", "confidence": 55}
+        score = {"strategy_views": {"scalp": {}}}
+        return snapshot, trigger, final_decision, score, analysis
+
+    def test_silence_brief_included_in_push_analysis(self):
+        assistant = make_assistant(wechat_silence_brief_minutes=60)
+        snapshot, trigger, final_decision, score, analysis = self._silence_brief_ready_fixture(assistant)
+        push_analysis = assistant._build_push_analysis(
+            snapshot, [], final_decision, score, analysis, trigger
+        )
+        self.assertTrue(push_analysis["would_push"])
+        brief_tracks = [t for t in push_analysis["tracks"] if t.get("track") == "silence_brief"]
+        self.assertEqual(len(brief_tracks), 1)
+        self.assertEqual(brief_tracks[0]["status"], "would_push")
+        self.assertEqual(brief_tracks[0]["kind"], "brief")
+
+    def test_silence_brief_dispatches_via_push_analysis(self):
+        assistant = make_assistant(wechat_silence_brief_minutes=60)
+        snapshot, trigger, final_decision, score, analysis = self._silence_brief_ready_fixture(assistant)
+        push_analysis = assistant._build_push_analysis(
+            snapshot, [], final_decision, score, analysis, trigger
+        )
+        with patch.object(assistant, "_execute_wechat_push") as mock_push:
+            assistant.dispatch_wechat_push_if_needed(
+                snapshot,
+                [],
+                final_decision,
+                analysis,
+                score,
+                trigger,
+                push_analysis=push_analysis,
+            )
+            mock_push.assert_called_once()
+            selected = mock_push.call_args[0][6]
+            self.assertEqual(selected["kind"], "brief")
+            self.assertEqual(selected["decision"]["push_recommendation"], "brief")
+
     def test_lifecycle_brief_enabled_requires_silence_minutes(self):
         disabled = make_assistant(wechat_silence_brief_minutes=0)
         disabled.push_enabled = True

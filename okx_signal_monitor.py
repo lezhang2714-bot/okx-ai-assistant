@@ -9607,6 +9607,49 @@ class OkxAiShortTermAssistant:
         )
         self._mark_wechat_push_sent(inst_id, push_key, push_kind, decision, snapshot)
 
+    def _decision_for_push_track(
+        self,
+        track: Dict[str, Any],
+        final_decision: Dict[str, Any],
+        score: Dict[str, Any],
+        trigger: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        kind = str(track.get("kind", "") or "")
+        if kind == "brief" and isinstance(track.get("decision"), dict):
+            return track["decision"]
+        if kind == "forecast":
+            forecast = (
+                score.get("structure_forecast")
+                if isinstance(score.get("structure_forecast"), dict)
+                else {}
+            )
+            return self._forecast_push_decision(forecast, final_decision, trigger)
+        return final_decision
+
+    def _select_wechat_push_track(
+        self,
+        snapshot: Dict[str, Any],
+        signals: List[Dict[str, Any]],
+        final_decision: Dict[str, Any],
+        score: Dict[str, Any],
+        trigger: Dict[str, Any],
+        analysis: Optional[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        tracks = [
+            self._confirmed_push_eval(snapshot, signals, final_decision, score),
+            self._forecast_push_eval(snapshot, signals, final_decision, score),
+        ]
+        tracks, selected = self._refine_wechat_push_tracks(
+            tracks, snapshot, signals, final_decision, score, trigger, analysis
+        )
+        brief_track = self._silence_brief_push_eval(
+            snapshot, signals, final_decision, score, analysis, trigger
+        )
+        tracks.append(brief_track)
+        if not selected and brief_track.get("status") == "would_push":
+            selected = brief_track
+        return tracks, selected
+
     def dispatch_wechat_push_if_needed(
         self,
         snapshot: Dict[str, Any],
@@ -9623,31 +9666,20 @@ class OkxAiShortTermAssistant:
             would = [track for track in push_analysis.get("tracks", []) if track.get("status") == "would_push"]
             if len(would) == 1:
                 track = would[0]
-                forecast = (
-                    score.get("structure_forecast")
-                    if isinstance(score.get("structure_forecast"), dict)
-                    else {}
-                )
-                decision = (
-                    self._forecast_push_decision(forecast, final_decision, trigger)
-                    if track.get("kind") == "forecast"
-                    else final_decision
-                )
-                selected = {**track, "decision": decision}
-        else:
-            tracks = [
-                self._confirmed_push_eval(snapshot, signals, final_decision, score),
-                self._forecast_push_eval(snapshot, signals, final_decision, score),
-            ]
-            _, selected = self._refine_wechat_push_tracks(
-                tracks, snapshot, signals, final_decision, score, trigger, analysis
-            )
-            if not selected:
+                selected = {
+                    **track,
+                    "decision": self._decision_for_push_track(track, final_decision, score, trigger),
+                }
+            elif not would:
                 brief_track = self._silence_brief_push_eval(
                     snapshot, signals, final_decision, score, analysis, trigger
                 )
                 if brief_track.get("status") == "would_push":
                     selected = brief_track
+        else:
+            _, selected = self._select_wechat_push_track(
+                snapshot, signals, final_decision, score, trigger, analysis
+            )
 
         if not selected:
             return
@@ -9774,12 +9806,8 @@ class OkxAiShortTermAssistant:
         analysis: Optional[Dict[str, Any]],
         trigger: Dict[str, Any],
     ) -> Dict[str, Any]:
-        tracks = [
-            self._confirmed_push_eval(snapshot, signals, final_decision, score),
-            self._forecast_push_eval(snapshot, signals, final_decision, score),
-        ]
-        tracks, selected = self._refine_wechat_push_tracks(
-            tracks, snapshot, signals, final_decision, score, trigger, analysis
+        tracks, selected = self._select_wechat_push_track(
+            snapshot, signals, final_decision, score, trigger, analysis
         )
         would_push = selected is not None
         wechat_mode = "enabled" if self.push_enabled else "log_only"
