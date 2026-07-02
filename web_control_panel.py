@@ -146,7 +146,7 @@ REPLAY_PROCESS_LOG_FILE = LOG_DIR / "replay_console.log"
 HISTORICAL_REPLAY_DATASET_FILE = LOG_DIR / "replay_dataset_historical.jsonl"
 HOST = os.getenv("WEB_CONTROL_PANEL_HOST", "127.0.0.1")
 PORT = int(os.getenv("WEB_CONTROL_PANEL_PORT", "8765"))
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 APP_NAME = "OKX AI Assistant"
 PRESET_INSTRUMENTS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
 DEFAULT_MONITOR_INSTRUMENTS = ("ETH-USDT-SWAP",)
@@ -294,6 +294,7 @@ CONFIG_FIELDS = [
 ENV_DEFAULTS = {
     "AI_MODEL": "",
     "AI_BASE_URL": "",
+    "AI_REQUEST_TIMEOUT": "90",
 }
 
 ENV_FIELDS = [
@@ -301,6 +302,15 @@ ENV_FIELDS = [
     ("AI_MODEL", "AI模型", "须与接口匹配，如 DeepSeek 用 deepseek-chat；留空则须自行填写。"),
     ("AI_BASE_URL", "AI Base URL", "OpenAI 兼容 Base URL；DeepSeek 填 https://api.deepseek.com。"),
     ("WECHAT_SEND_KEY", "微信推送 SendKey", "Server酱 SendKey，用于推送到个人微信。在 https://sct.ftqq.com 获取。"),
+]
+
+ENV_NUMBER_FIELDS = [
+    (
+        "AI_REQUEST_TIMEOUT",
+        "AI 请求超时(秒)",
+        "单次 AI 分析请求超时；超时后会重试，仍失败则走本地兜底。修改后需重启监控。",
+        "90",
+    ),
 ]
 SAVED_AI_ENV_KEYS = ("OPENAI_API_KEY", "AI_API_KEY", "AI_BASE_URL", "AI_MODEL")
 
@@ -1238,6 +1248,8 @@ def load_env() -> Dict[str, str]:
             env[key.strip()] = value.strip().strip('"').strip("'")
     if not env.get("WECHAT_SEND_KEY") and env.get("WECHAT_WEBHOOK_URL"):
         env["WECHAT_SEND_KEY"] = env["WECHAT_WEBHOOK_URL"]
+    if not str(env.get("AI_REQUEST_TIMEOUT", "")).strip():
+        env["AI_REQUEST_TIMEOUT"] = ENV_DEFAULTS["AI_REQUEST_TIMEOUT"]
     return env
 
 
@@ -1249,6 +1261,7 @@ def save_env(env: Dict[str, str]) -> Path:
         f'AI_MODEL="{env.get("AI_MODEL", ENV_DEFAULTS["AI_MODEL"])}"',
         f'AI_BASE_URL="{env.get("AI_BASE_URL", ENV_DEFAULTS["AI_BASE_URL"])}"',
         f'WECHAT_SEND_KEY="{env.get("WECHAT_SEND_KEY", "")}"',
+        f'AI_REQUEST_TIMEOUT="{env.get("AI_REQUEST_TIMEOUT", ENV_DEFAULTS["AI_REQUEST_TIMEOUT"])}"',
         "",
     ]
     text = "\n".join(lines)
@@ -1302,6 +1315,12 @@ def update_from_form(form: Dict[str, Any]) -> Tuple[Path, Path, bool]:
 
     for key, _, _ in ENV_FIELDS:
         env[key] = str(form.get(f"env_{key}", "")).strip()
+    for key, _, _, default in ENV_NUMBER_FIELDS:
+        raw = str(form.get(f"env_{key}", "")).strip()
+        try:
+            env[key] = str(max(5, min(300, int(float(raw or default)))))
+        except (TypeError, ValueError):
+            env[key] = str(default)
     saved_path, requires_restart = save_config(config)
     env_path = save_env(env)
     return saved_path, env_path, requires_restart
@@ -1371,6 +1390,7 @@ def restore_default_env() -> Path:
     env = {key: "" for key, _, _ in ENV_FIELDS}
     env["AI_MODEL"] = ENV_DEFAULTS.get("AI_MODEL", "")
     env["AI_BASE_URL"] = ENV_DEFAULTS.get("AI_BASE_URL", "")
+    env["AI_REQUEST_TIMEOUT"] = ENV_DEFAULTS.get("AI_REQUEST_TIMEOUT", "90")
     lines = [
         "# OKX AI短线助手环境变量配置",
         "",
@@ -1378,6 +1398,7 @@ def restore_default_env() -> Path:
         f'AI_MODEL="{env.get("AI_MODEL", ENV_DEFAULTS["AI_MODEL"])}"',
         f'AI_BASE_URL="{env.get("AI_BASE_URL", ENV_DEFAULTS["AI_BASE_URL"])}"',
         f'WECHAT_SEND_KEY="{env.get("WECHAT_SEND_KEY", "")}"',
+        f'AI_REQUEST_TIMEOUT="{env.get("AI_REQUEST_TIMEOUT", ENV_DEFAULTS["AI_REQUEST_TIMEOUT"])}"',
         "",
     ]
     text = "\n".join(lines)
@@ -4955,6 +4976,13 @@ def render_page(message: str = "") -> bytes:
         value = env.get(key, ENV_DEFAULTS.get(key, ""))
         input_html = masked_input_html(f"env_{key}", value, masked="KEY" in key)
         rows.append(f'<div class="field"><label>{esc(label)}</label><div>{input_html}<p>{esc(help_text)}</p></div></div>')
+    for key, label, help_text, default in ENV_NUMBER_FIELDS:
+        value = env.get(key, ENV_DEFAULTS.get(key, default))
+        rows.append(
+            f'<div class="field"><label>{esc(label)}</label><div>'
+            f'<input type="number" step="1" min="5" max="300" name="env_{esc(key)}" value="{esc(value)}">'
+            f'<p>{esc(help_text)}</p></div></div>'
+        )
     rows.append("</section>")
 
     notice_html = ""
