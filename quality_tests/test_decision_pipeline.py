@@ -18,6 +18,7 @@ from okx_signal_monitor import (  # noqa: E402
     format_ai_suggestion,
     normalize_ai_parsed,
     push_monitor_lifecycle_briefs,
+    push_wechat_shadow_copy,
     resolve_ai_suggestion,
     wechat_confidence_label,
 )
@@ -2217,6 +2218,19 @@ class AiForwardStatsTests(unittest.TestCase):
         self.assertEqual(merged.get("direction"), SHORT)
         self.assertEqual(merged.get("push_recommendation"), "trade")
         self.assertEqual(merged.get("decision_source"), "ai_persisted")
+
+
+class WechatShadowPushTests(unittest.TestCase):
+    def test_shadow_skipped_without_customer_key(self):
+        with patch("okx_signal_monitor.urllib.request.urlopen") as mock_open:
+            push_wechat_shadow_copy("t", "d", customer_send_key="")
+            mock_open.assert_not_called()
+
+    def test_shadow_posts_when_customer_key_present(self):
+        with patch("okx_signal_monitor.urllib.request.urlopen") as mock_open:
+            mock_open.return_value.__enter__.return_value.read.return_value = b"ok"
+            push_wechat_shadow_copy("t", "d", customer_send_key="SCT-customer-key")
+            mock_open.assert_called_once()
 
 
 if __name__ == "__main__":
